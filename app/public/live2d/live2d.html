@@ -47,7 +47,8 @@
 
     let model;
     let app;
-    const MODEL_SCALE_MULTIPLIER = 1.2;
+    const isCallMode = new URLSearchParams(window.location.search).get('mode') === 'call';
+    const MODEL_SCALE_MULTIPLIER = isCallMode ? 1.45 : 1.2;
     const FOCUS_Y_OFFSET_RATIO = 0.0;
     const MODEL_SETTINGS_URL = './models/luo/model.model3.json';
 
@@ -342,11 +343,21 @@
     };
 
     let nextStartTime = 0;
-    let isWaitingForEnd = false;
     let isPlaying = false;
+    let currentAudioId = null;
+    const activeSources = new Set();
+    const audioEndTimes = new Map();
+    const finalAudioIds = new Set();
+    const audioResponseIds = new Map();
+    const knownAudioIds = new Set();
 
-    window.feedAudioChunk = async (base64Audio, isFinal) => {
+    window.feedAudioChunk = async (base64Audio, isFinal, audioId, responseId) => {
       if (audioCtx.state === 'suspended') await audioCtx.resume();
+      currentAudioId = audioId || currentAudioId;
+      if (audioId) {
+        knownAudioIds.add(audioId);
+        if (responseId) audioResponseIds.set(audioId, responseId);
+      }
       
       if (base64Audio) {
         // 1. Base64 转 Uint8Array
@@ -398,6 +409,8 @@
         const source = audioCtx.createBufferSource();
         source.buffer = audioBuffer;
         source.connect(analyser);
+        activeSources.add(source);
+        source.onended = () => activeSources.delete(source);
         
         const currentTime = audioCtx.currentTime;
         // 留 50ms 缓冲，防止高频小包导致破音/队列下溢
@@ -407,31 +420,66 @@
         
         source.start(nextStartTime);
         nextStartTime += audioBuffer.duration;
+        audioEndTimes.set(audioId || currentAudioId || `audio-${nextStartTime}`, nextStartTime);
       }
 
       // 6. 处理结束标志
       if (isFinal) {
-        isWaitingForEnd = true;
+        const finalId = audioId || currentAudioId || `audio-${Date.now()}`;
+        if (!audioEndTimes.has(finalId)) audioEndTimes.set(finalId, audioCtx.currentTime);
+        finalAudioIds.add(finalId);
         checkFinished();
       }
     };
 
+    window.stopAudioPlayback = () => {
+      for (const source of activeSources) {
+        try { source.stop(); } catch (_) {}
+      }
+      activeSources.clear();
+      isPlaying = false;
+      nextStartTime = 0;
+      const stoppedAudioIds = new Set([...knownAudioIds, ...finalAudioIds]);
+      if (currentAudioId) stoppedAudioIds.add(currentAudioId);
+      audioEndTimes.clear();
+      finalAudioIds.clear();
+      for (const stoppedAudioId of stoppedAudioIds) {
+        if (window.ReactNativeWebView) {
+          window.ReactNativeWebView.postMessage(JSON.stringify({
+            type: 'audio_stopped',
+            audio_id: stoppedAudioId,
+            response_id: audioResponseIds.get(stoppedAudioId) || null,
+          }));
+        }
+      }
+      knownAudioIds.clear();
+      audioResponseIds.clear();
+      currentAudioId = null;
+    };
+
     // 轮询检测是否播放完毕
     function checkFinished() {
-      if (!isWaitingForEnd) return;
-      // 当音频上下文的时间超过了最后一个包的结束时间，说明播放完毕
-      if (audioCtx.currentTime >= nextStartTime) {
-        isWaitingForEnd = false;
-        isPlaying = false;
-        console.log('Audio playback finished');
-        // 重置时间轴，防止下一次对话错乱
-        nextStartTime = 0; 
-        // 通知 RN 播放完成
+      const now = audioCtx.currentTime;
+      for (const audioId of [...finalAudioIds]) {
+        if (now < (audioEndTimes.get(audioId) || now)) continue;
+        finalAudioIds.delete(audioId);
+        audioEndTimes.delete(audioId);
+        knownAudioIds.delete(audioId);
         if (window.ReactNativeWebView) {
-          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'audio_finished' }));
+          window.ReactNativeWebView.postMessage(JSON.stringify({
+            type: 'audio_finished',
+            audio_id: audioId,
+            response_id: audioResponseIds.get(audioId) || null,
+          }));
         }
-      } else {
+        audioResponseIds.delete(audioId);
+      }
+      if (finalAudioIds.size > 0) {
         requestAnimationFrame(checkFinished);
+      } else if (!activeSources.size) {
+        isPlaying = false;
+        nextStartTime = 0;
+        currentAudioId = null;
       }
     }
     // 浏览器原生的 60FPS 渲染循环
