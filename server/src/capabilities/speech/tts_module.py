@@ -7,7 +7,14 @@ from src.utils.asyncio_helpers import run_sync_owned
 from src.capabilities.speech.tts_server import TTSServer
 
 
-SUPPORTED_TTS_BACKENDS = {"gsv_tts", "gsv-tts-lite", "gsv_tts_lite"}
+SUPPORTED_TTS_BACKENDS = {
+    "gsv_tts",
+    "gsv-tts-lite",
+    "gsv_tts_lite",
+    "gsv-tts-lite-multispeaker",
+    "gsv_tts_lite_multispeaker",
+}
+SUPPORTED_TTS_LANGUAGES = {"auto", "ja", "zh", "en"}
 
 
 def get_tts_server_key(tts_config: Dict[str, Any]) -> tuple[str, str, bool, bool]:
@@ -56,7 +63,12 @@ class TTSModule:
         self.tts_server = tts_server
         
         self.character_name = tts_config.get("character_name", "LuoTianyi")
-        self.language = tts_config.get("language", "zh")
+        self.language = str(tts_config.get("language", "zh")).strip().lower()
+        if self.language not in SUPPORTED_TTS_LANGUAGES:
+            raise ValueError(
+                f"Unsupported TTS language: {self.language}. "
+                f"Expected one of {sorted(SUPPORTED_TTS_LANGUAGES)}"
+            )
 
         self.tone_reference_audio_projection: Dict[str, str] = self._prepare_tone_reference_audio_projection(
             tts_config.get("interface_config_path", "res/tts/luotianyi/tts_interface_config.json")
@@ -157,9 +169,9 @@ class TTSModule:
 
         payload = {
             "text": text,
-            "text_lang": self.language,
+            "text_language": self.language,
             "ref_audio_path": ref_audio_obj.audio_path,
-            "prompt_lang": self.language, 
+            "prompt_language": self.language,
             "prompt_text": ref_audio_obj.lyrics,
         }
 
@@ -174,6 +186,8 @@ class TTSModule:
                 payload["ref_audio_path"],
                 payload["prompt_text"],
                 speaker=speaker,
+                text_language=payload["text_language"],
+                prompt_language=payload["prompt_language"],
             )
             self._debug(f"TTS synthesis successful for text: {text[:20]}...")
             return audio_bytes
@@ -212,6 +226,8 @@ class TTSModule:
                 prompt_audio_path=ref_audio_obj.audio_path,
                 prompt_audio_text=ref_audio_obj.lyrics,
                 speaker=speaker,
+                text_language=self.language,
+                prompt_language=self.language,
             ):
                 if chunk:
                     yield chunk

@@ -300,6 +300,8 @@ def _run_gsv_worker(
                         prompt_audio_text = message["prompt_audio_text"]
                         text = message["text"]
                         speaker = message.get("speaker") or default_speaker
+                        text_language = message.get("text_language", "auto")
+                        prompt_language = message.get("prompt_language", "auto")
 
                         is_first_chunk = True
                         if is_multispeaker:
@@ -308,6 +310,8 @@ def _run_gsv_worker(
                                 text=text,
                                 prompt_audio_path=prompt_audio_path,
                                 prompt_audio_text=prompt_audio_text,
+                                text_language=text_language,
+                                prompt_language=prompt_language,
                             )
                         else:
                             stream = tts.infer_stream(
@@ -315,6 +319,8 @@ def _run_gsv_worker(
                                 prompt_audio_path=prompt_audio_path,
                                 prompt_audio_text=prompt_audio_text,
                                 text=text,
+                                text_language=text_language,
+                                prompt_language=prompt_language,
                             )
 
                         for clip in stream:
@@ -370,6 +376,8 @@ def _run_gsv_worker(
                 prompt_audio_text = message["prompt_audio_text"]
                 text = message["text"]
                 speaker = message.get("speaker") or default_speaker
+                text_language = message.get("text_language", "auto")
+                prompt_language = message.get("prompt_language", "auto")
 
                 if is_multispeaker:
                     clip = tts.infer(
@@ -377,6 +385,8 @@ def _run_gsv_worker(
                         text=text,
                         prompt_audio_path=prompt_audio_path,
                         prompt_audio_text=prompt_audio_text,
+                        text_language=text_language,
+                        prompt_language=prompt_language,
                     )
                 else:
                     clip = tts.infer(
@@ -384,6 +394,8 @@ def _run_gsv_worker(
                         prompt_audio_path=prompt_audio_path,
                         prompt_audio_text=prompt_audio_text,
                         text=text,
+                        text_language=text_language,
+                        prompt_language=prompt_language,
                     )
                 wav_bytes = _audio_to_wav_bytes(clip.audio_data, clip.samplerate)
 
@@ -628,6 +640,8 @@ class TTSServer:
         prompt_audio_text: str,
         timeout: int = 600,
         speaker: Optional[str] = None,
+        text_language: str = "auto",
+        prompt_language: str = "auto",
     ) -> bytes:
         self._begin_request()
         try:
@@ -650,6 +664,8 @@ class TTSServer:
                         "prompt_audio_path": prompt_audio_path,
                         "prompt_audio_text": prompt_audio_text,
                         "speaker": speaker,
+                        "text_language": text_language,
+                        "prompt_language": prompt_language,
                     }
                 )
 
@@ -672,6 +688,8 @@ class TTSServer:
         prompt_audio_text: str,
         timeout: int = 600,
         speaker: Optional[str] = None,
+        text_language: str = "auto",
+        prompt_language: str = "auto",
     ) -> Generator[bytes, None, None]:
         self._begin_request()
         try:
@@ -694,6 +712,8 @@ class TTSServer:
                         "prompt_audio_path": prompt_audio_path,
                         "prompt_audio_text": prompt_audio_text,
                         "speaker": speaker,
+                        "text_language": text_language,
+                        "prompt_language": prompt_language,
                     }
                 )
 

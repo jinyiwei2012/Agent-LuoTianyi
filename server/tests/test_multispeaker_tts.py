@@ -14,7 +14,12 @@ if server_root not in sys.path:
 
 from src.capabilities.speech import speech as speech_module
 from src.capabilities.speech.speech import SpeechCapability
-from src.capabilities.speech.tts_module import get_tts_server_key
+from src.capabilities.speech.tts_module import (
+    ReferenceAudio,
+    TTSModule,
+    get_tts_server_key,
+)
+from src.capabilities.speech.tts_server import TTSServer
 
 
 def test_bundled_wheel_uses_standalone_distribution_name():
@@ -98,6 +103,122 @@ def test_server_key_normalizes_equivalent_paths(tmp_path):
 
     assert first == second
     assert first[1] == os.path.normcase(os.path.realpath(config_path))
+
+
+def test_server_key_accepts_standalone_backend_name(tmp_path):
+    key = get_tts_server_key(
+        {
+            "backend": "gsv-tts-lite-multispeaker",
+            "server_config_path": str(tmp_path / "tts.yaml"),
+        }
+    )
+
+    assert key[0] == "gsv_tts"
+
+
+def test_tts_module_rejects_unsupported_language():
+    with pytest.raises(ValueError, match="Unsupported TTS language"):
+        TTSModule({"language": "fr"}, tts_server=object())
+
+
+@pytest.mark.asyncio
+async def test_tts_module_forwards_language_to_sync_and_stream_calls():
+    class RecordingServer:
+        def __init__(self):
+            self.sync_kwargs = None
+            self.stream_kwargs = None
+
+        def synthesize(self, *_args, **kwargs):
+            self.sync_kwargs = kwargs
+            return b"sync-audio"
+
+        def stream_synthesize(self, *_args, **kwargs):
+            self.stream_kwargs = kwargs
+            yield b"stream-audio"
+
+    server = RecordingServer()
+    module = object.__new__(TTSModule)
+    module.tts_server = server
+    module.language = "ja"
+    module.quiet_logs = True
+    module.reference_audio = {
+        "normal": ReferenceAudio("reference.wav", "prompt text")
+    }
+
+    assert await module.synthesize_speech(
+        "hello",
+        "normal",
+        speaker="speaker-a",
+    ) == b"sync-audio"
+    assert list(
+        module.stream_synthesize_speech(
+            "hello",
+            "normal",
+            speaker="speaker-a",
+        )
+    ) == [b"stream-audio"]
+
+    expected = {
+        "speaker": "speaker-a",
+        "text_language": "ja",
+        "prompt_language": "ja",
+    }
+    assert server.sync_kwargs == expected
+    assert {
+        key: server.stream_kwargs[key]
+        for key in expected
+    } == expected
+
+
+def test_tts_server_preserves_languages_in_request_messages(tmp_path):
+    class AliveProcess:
+        @staticmethod
+        def is_alive():
+            return True
+
+    class RecordingQueue:
+        def __init__(self):
+            self.messages = []
+
+        def put(self, message):
+            self.messages.append(message)
+
+    server = TTSServer(str(tmp_path / "tts.yaml"))
+    queue = RecordingQueue()
+    server.server_process = AliveProcess()
+    server.request_queue = queue
+    server.response_queue = object()
+    server._wait_for_response = lambda **_kwargs: {
+        "ok": True,
+        "audio_bytes": b"audio",
+        "is_final": True,
+    }
+
+    assert server.synthesize(
+        "hello",
+        "speaker.wav",
+        "prompt.wav",
+        "prompt text",
+        speaker="speaker-a",
+        text_language="en",
+        prompt_language="ja",
+    ) == b"audio"
+    assert list(
+        server.stream_synthesize(
+            "hello",
+            "speaker.wav",
+            "prompt.wav",
+            "prompt text",
+            speaker="speaker-a",
+            text_language="zh",
+            prompt_language="en",
+        )
+    ) == [b"audio"]
+
+    assert queue.messages[0]["text_language"] == "en"
+    assert queue.messages[0]["prompt_language"] == "ja"
+    assert queue.messages[1]["text_language"] == "zh"
+    assert queue.messages[1]["prompt_language"] == "en"
 
 
 def test_characters_share_worker_by_backend_config_and_flags(monkeypatch, tmp_path):
