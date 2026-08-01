@@ -16,9 +16,9 @@ cryptography
 bcrypt
 Pillow
 flashtext
-# gsv-tts-lite 多说话人版本（MultiSpeakerTTS）未发布 PyPI，
-# 由 setup.bat 从 res\packages\gsv_tts_lite-*.whl 自动安装。
-# 若使用标准单角色版本：pip install gsv-tts-lite（注意多说话人模式会 ImportError）
+# 独立发行包 gsv-tts-lite-multispeaker 未发布 PyPI，
+# 由 setup.bat 从 res\packages\gsv_tts_lite_multispeaker-*.whl 自动安装。
+# Python 导入名仍为 gsv_tts；不要同时安装上游 gsv-tts-lite。
 lunardate
 ml_collections
 segmentation_models_pytorch==0.3.3

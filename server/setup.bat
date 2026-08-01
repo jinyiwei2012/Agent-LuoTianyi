@@ -31,16 +31,25 @@ call conda install ffmpeg -y
 pip install -r docs/gsv_requirements.txt
 pip install -r docs/requirements.txt
 
-REM Install multi-speaker gsv-tts-lite from res\packages (shipped with the
-REM resource package; the MultiSpeakerTTS build is not published on PyPI).
+REM Install the standalone MultiSpeakerTTS distribution shipped with this repo.
 set "GSV_WHEEL="
-for %%f in (res\packages\gsv_tts_lite-*.whl) do set "GSV_WHEEL=%%f"
+for %%f in (res\packages\gsv_tts_lite_multispeaker-*.whl) do set "GSV_WHEEL=%%f"
 if defined GSV_WHEEL (
-    echo Installing gsv-tts-lite from %GSV_WHEEL%
-    pip install "%GSV_WHEEL%"
+    echo Removing the incompatible upstream gsv-tts-lite distribution...
+    pip uninstall -y gsv-tts-lite >nul 2>&1
+    if errorlevel 1 (
+        echo [ERROR] Failed to remove the upstream gsv-tts-lite distribution.
+        exit /b 1
+    )
+    echo Installing gsv-tts-lite-multispeaker from %GSV_WHEEL%
+    pip install --force-reinstall "%GSV_WHEEL%"
+    if errorlevel 1 (
+        echo [ERROR] Failed to install %GSV_WHEEL%.
+        exit /b 1
+    )
 ) else (
-    echo [WARN] No gsv-tts-lite wheel found in res\packages, skipping.
-    echo        Build/download it or install manually: pip install gsv-tts-lite
+    echo [ERROR] No gsv-tts-lite-multispeaker wheel found in res\packages.
+    exit /b 1
 )
 
 python -m playwright install chromium

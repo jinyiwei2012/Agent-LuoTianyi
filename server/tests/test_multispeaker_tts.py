@@ -1,6 +1,9 @@
 import os
 import sys
+from email.parser import Parser
+from email.policy import default
 from pathlib import Path
+from zipfile import ZipFile
 
 import pytest
 
@@ -12,6 +15,35 @@ if server_root not in sys.path:
 from src.capabilities.speech import speech as speech_module
 from src.capabilities.speech.speech import SpeechCapability
 from src.capabilities.speech.tts_module import get_tts_server_key
+
+
+def test_bundled_wheel_uses_standalone_distribution_name():
+    server_root = Path(__file__).resolve().parent.parent
+    wheels = list(
+        (server_root / "res" / "packages").glob(
+            "gsv_tts_lite_multispeaker-*.whl"
+        )
+    )
+
+    assert len(wheels) == 1
+    assert not list(
+        (server_root / "res" / "packages").glob("gsv_tts_lite-*.whl")
+    )
+
+    with ZipFile(wheels[0]) as archive:
+        metadata_path = next(
+            name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+        )
+        metadata = Parser(policy=default).parsestr(
+            archive.read(metadata_path).decode("utf-8")
+        )
+
+    assert metadata["Name"] == "gsv-tts-lite-multispeaker"
+
+    setup = (server_root / "setup.bat").read_text(encoding="utf-8")
+    assert "gsv_tts_lite_multispeaker-*.whl" in setup
+    assert "pip uninstall -y gsv-tts-lite" in setup
+    assert "pip install --force-reinstall" in setup
 
 
 class FakeModule:
