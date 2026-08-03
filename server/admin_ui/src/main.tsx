@@ -256,7 +256,7 @@ type MemoryTraceTab = {
   labels: Array<{ label: string; text: string }>;
 };
 
-type Page = 'dashboard' | 'llm' | 'pipeline' | 'traces' | 'memory' | 'dynamics' | 'config' | 'logs';
+type Page = 'dashboard' | 'llm' | 'pipeline' | 'traces' | 'memory' | 'dynamics' | 'calls' | 'config' | 'logs';
 
 type LlmStatsTab = {
   id: 'seven_days' | 'one_day' | 'recent';
@@ -645,6 +645,7 @@ function App({ onLogout }: { onLogout: () => void }) {
           <button className={page === 'traces' ? 'active' : ''} onClick={() => setPage('traces')}>链路追踪</button>
           <button className={page === 'memory' ? 'active' : ''} onClick={() => setPage('memory')}>记忆追踪</button>
           <button className={page === 'dynamics' ? 'active' : ''} onClick={() => setPage('dynamics')}>动态管理</button>
+          <button className={page === 'calls' ? 'active' : ''} onClick={() => setPage('calls')}>通话记录</button>
           <button className={page === 'config' ? 'active' : ''} onClick={() => setPage('config')}>服务配置</button>
           <button className={page === 'logs' ? 'active' : ''} onClick={() => setPage('logs')}>异常日志</button>
           <button onClick={logout}>退出登录</button>
@@ -657,6 +658,7 @@ function App({ onLogout }: { onLogout: () => void }) {
         {page === 'traces' && <TracePage />}
         {page === 'memory' && <MemoryTracePage />}
         {page === 'dynamics' && <DynamicsPage />}
+        {page === 'calls' && <CallsPage />}
         {page === 'config' && <ConfigPage />}
         {page === 'logs' && <LogsPage />}
       </main>
@@ -1470,6 +1472,151 @@ function DynamicsPage() {
           </Panel>
         </div>
       </section>
+    </>
+  );
+}
+
+interface CallSessionSummary {
+  call_id: string;
+  user_id: string;
+  character_id: string;
+  status: string;
+  requested_at: string | null;
+  connected_at: string | null;
+  ended_at: string | null;
+  duration_seconds: number;
+  exit_code: number | null;
+  summary: string;
+  summary_status: string | null;
+  summary_error: string | null;
+  memory_status: string | null;
+  profile_status: string | null;
+  conversation_id: string | null;
+  turn_count: number;
+}
+
+const callExitCodeLabels: Record<number, string> = {
+  0: '正常挂断',
+  1: '接通前挂断',
+  [-1]: '重连超时',
+  [-2]: 'Qwen 失败',
+  [-3]: 'TTS 失败',
+  [-4]: '内部错误',
+  [-5]: '并发拒绝',
+};
+
+function callExitCodeText(code: number | null): string {
+  if (code === null) return '-';
+  return `${callExitCodeLabels[code] ?? code} (${code})`;
+}
+
+function postprocessPill(status: string | null | undefined): string {
+  if (status === 'success') return 'success';
+  if (status === 'failed') return 'error';
+  if (status === 'pending') return 'warning';
+  return '';
+}
+
+function CallsPage() {
+  const [userIdQuery, setUserIdQuery] = useState('');
+  const [statusFilter, setStatusFilter] = useState('');
+  const [selectedCallId, setSelectedCallId] = useState<string | null>(null);
+
+  const query = `/admin/api/calls?limit=100${userIdQuery ? `&user_id=${encodeURIComponent(userIdQuery)}` : ''}${statusFilter ? `&status=${encodeURIComponent(statusFilter)}` : ''}`;
+  const { data, error, loading } = usePolling<CallSessionSummary[]>(query);
+
+  const rows = data || [];
+  const selected = rows.find((row) => row.call_id === selectedCallId) || null;
+  const normalCount = rows.filter((row) => row.exit_code === 0).length;
+  const abnormalCount = rows.filter((row) => row.exit_code !== null && row.exit_code !== 0).length;
+  const failedSettlementCount = rows.filter(
+    (row) => row.summary_status === 'failed' || row.memory_status === 'failed' || row.profile_status === 'failed',
+  ).length;
+
+  return (
+    <>
+      <PageHeader title="通话记录" subtitle="查看通话摘要、退出码与摘要/记忆/画像后处理状态（P0 不返回完整 transcript）" />
+      <StatusBar loading={loading} error={error} />
+      <section className="metric-grid">
+        <MetricCard title="当前列表" value={formatNumber(rows.length)} detail="最多 100 条" />
+        <MetricCard title="正常结束" value={formatNumber(normalCount)} detail="exit_code = 0" />
+        <MetricCard title="异常结束" value={formatNumber(abnormalCount)} detail="exit_code != 0" tone={abnormalCount ? 'warning' : undefined} />
+        <MetricCard title="后处理失败" value={formatNumber(failedSettlementCount)} detail="summary/memory/profile failed" tone={failedSettlementCount ? 'danger' : undefined} />
+      </section>
+
+      <Panel title="筛选">
+        <div className="filter-row dynamic-filter-row">
+          <input value={userIdQuery} onChange={(event) => setUserIdQuery(event.target.value)} placeholder="user_id" />
+          <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
+            <option value="">全部状态</option>
+            <option value="active">active</option>
+            <option value="ended">ended</option>
+          </select>
+        </div>
+      </Panel>
+
+      <div className="dynamic-layout">
+        <Panel title="通话列表" className="scroll-panel dynamic-list-panel">
+          <div className="dynamic-card-list">
+            {rows.map((row) => (
+              <button
+                key={row.call_id}
+                className={`dynamic-card ${row.call_id === selectedCallId ? 'active' : ''}`}
+                onClick={() => setSelectedCallId(row.call_id)}
+              >
+                <div className="dynamic-card-head">
+                  <div>
+                    <strong>{formatShanghaiTime(row.requested_at) || '-'}</strong>
+                    <span className="pill">{row.status}</span>
+                    <span className={`pill ${row.exit_code === 0 ? 'success' : row.exit_code === null ? '' : 'error'}`}>
+                      {callExitCodeText(row.exit_code)}
+                    </span>
+                  </div>
+                  <div className="mono">{row.call_id.slice(0, 8)}</div>
+                </div>
+                <div className="dynamic-card-meta">
+                  <span>user {row.user_id || '-'}</span>
+                  <span>{formatNumber(row.duration_seconds)}s</span>
+                  <span>{formatNumber(row.turn_count)} turns</span>
+                </div>
+                <div className="dynamic-card-content">{row.summary || '-'}</div>
+                <div className="dynamic-card-status">
+                  <span className={`pill ${postprocessPill(row.summary_status)}`}>summary {row.summary_status || '-'}</span>
+                  <span className={`pill ${postprocessPill(row.memory_status)}`}>memory {row.memory_status || '-'}</span>
+                  <span className={`pill ${postprocessPill(row.profile_status)}`}>profile {row.profile_status || '-'}</span>
+                </div>
+              </button>
+            ))}
+            {rows.length === 0 && <div className="empty-state">当前筛选条件下没有通话记录</div>}
+          </div>
+        </Panel>
+
+        <div>
+          <Panel title="通话详情">
+            {selected ? (
+              <div className="dynamic-detail-grid">
+                <ReadBlock title="call_id" value={selected.call_id} />
+                <ReadBlock title="user_id" value={selected.user_id} />
+                <ReadBlock title="character_id" value={selected.character_id} />
+                <ReadBlock title="状态" value={selected.status} />
+                <ReadBlock title="退出码" value={callExitCodeText(selected.exit_code)} />
+                <ReadBlock title="时长" value={`${formatNumber(selected.duration_seconds)} 秒`} />
+                <ReadBlock title="轮次" value={formatNumber(selected.turn_count)} />
+                <ReadBlock title="请求时间" value={formatShanghaiTime(selected.requested_at)} />
+                <ReadBlock title="接通时间" value={formatShanghaiTime(selected.connected_at)} />
+                <ReadBlock title="结束时间" value={formatShanghaiTime(selected.ended_at)} />
+                <ReadBlock title="摘要" value={selected.summary || '-'} />
+                <ReadBlock title="摘要状态" value={`${selected.summary_status || '-'}${selected.summary_error ? `（${selected.summary_error}）` : ''}`} />
+                <ReadBlock title="记忆状态" value={selected.memory_status || '-'} />
+                <ReadBlock title="画像状态" value={selected.profile_status || '-'} />
+                <ReadBlock title="conversation_id" value={selected.conversation_id || '-'} />
+              </div>
+            ) : (
+              <div className="empty-state">点击左侧列表查看通话详情</div>
+            )}
+          </Panel>
+        </div>
+      </div>
     </>
   );
 }
