@@ -82,7 +82,7 @@ class CallSettlementCoordinator:
         self._active_call_id = call_id
         self._active_user_id = user_id
         state = await asyncio.to_thread(self.call_store.get_postprocess_state, call_id)
-        if state and state.get("memory_status") != "success":
+        if not (state and state.get("memory_status") == "success"):
             await self.write_memory_incremental(call_id=call_id, user_id=user_id, turns=turns, final=True)
         memory_ok = self._memory_error is None
         if exit_code == int(CallExitCode.NORMAL) and not (state and state.get("memory_status") == "success"):
