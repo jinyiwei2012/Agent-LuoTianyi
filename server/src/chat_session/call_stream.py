@@ -75,6 +75,7 @@ class CallStream:
         self._interrupt_started_at: dict[str, float] = {}
         self._playback_ack_tasks: dict[str, asyncio.Task] = {}
         self._sent_audio_ids: set[str] = set()
+        self._packet_seqs: dict[str, int] = {}
         self._reconnect_deadline: float | None = None
         self._audio_tasks: set[asyncio.Task] = set()
         self._parser = CallResponseParser(call_id)
@@ -413,10 +414,9 @@ class CallStream:
         )
 
     def _audio_packet_seq(self, audio_id: str, audio: str | None) -> int:
-        key = f"_packet_seq_{audio_id}"
-        value = getattr(self, key, 0)
-        setattr(self, key, value + 1)
-        return value
+        seq = self._packet_seqs.get(audio_id, 0)
+        self._packet_seqs[audio_id] = seq + 1
+        return seq
 
     async def _on_tts_error(self, exc: Exception) -> None:
         await self.end(CallExitCode.TTS_FAILED, str(exc))
@@ -473,6 +473,8 @@ class CallStream:
         response.completed_audio_ids.add(audio_id)
         raw_events = self._responses.get(line.response_id).raw_events if self._responses.get(line.response_id) else []
         await self._append_turn("assistant", line.content, raw_events=raw_events)
+        # 长通话内存卫生：已消费的音频行及时清理，迟到 ACK 因无对应条目被安全忽略。
+        self._audio_lines.pop(audio_id, None)
         self._record_call_event(
             "client.playback_completed",
             metadata={
@@ -535,6 +537,10 @@ class CallStream:
         self.ws_connection = ws_connection
         self._reconnect_deadline = None
         self._transition(CallState.ACTIVE, expected={CallState.RECONNECTING})
+        if self.provider_task is None or self.provider_task.done():
+            # REQUESTING 期间断线时 start() 会提前返回，此时 provider reader 尚未创建；
+            # 恢复连接后必须补建，否则通话无法消费供应商事件。
+            self.provider_task = asyncio.create_task(self._read_provider_events())
         await self._send_event(WSEventType.CALL_RESUMED, {"call_id": self.call_id, "resumed_at": datetime.now().isoformat()})
         return True
 
@@ -543,9 +549,18 @@ class CallStream:
             return
         self.ws_connection = None
         await self._cancel_proactive_task()
-        if self.state in {CallState.REQUESTING, CallState.ACTIVE}:
-            self._transition(CallState.RECONNECTING, expected={CallState.REQUESTING, CallState.ACTIVE})
+        if self.state in {CallState.REQUESTING, CallState.ACTIVE, CallState.RECONNECTING}:
+            # 已处于 RECONNECTING 时再次断线（例如 resume 过程中又断开）：刷新保留期限，不重复迁移。
+            self._transition(CallState.RECONNECTING, expected={CallState.REQUESTING, CallState.ACTIVE, CallState.RECONNECTING})
         self._reconnect_deadline = time.monotonic() + float(self.config.get("reconnect_grace_seconds", 5))
+        await self._send_event(
+            WSEventType.CALL_RECONNECTING,
+            {
+                "call_id": self.call_id,
+                "reconnect_deadline": datetime.fromtimestamp(self._reconnect_deadline).isoformat(),
+            },
+        )
+        self._record_call_event("call.reconnecting", metadata={"reconnect_grace_seconds": float(self.config.get("reconnect_grace_seconds", 5))})
         if self.session:
             try:
                 await self.session.cancel_response()
@@ -562,7 +577,9 @@ class CallStream:
 
     async def end(self, exit_code: CallExitCode | int, reason: str) -> None:
         async with self._end_lock:
-            if self.state == CallState.ENDED:
+            if self.state in {CallState.ENDING, CallState.ENDED}:
+                # end() 可能被多个路径并发触发（用户挂断 + 供应商错误竞态），
+                # 已进入结算流程后直接返回，避免重复发送 call.ended 和重复后处理。
                 return
             self._transition(CallState.ENDING, expected={
                 CallState.REQUESTING,
@@ -586,12 +603,24 @@ class CallStream:
             if self.session:
                 await self.session.close()
             if self.connected_at is None and self.exit_code == int(CallExitCode.REALTIME_PROVIDER_FAILED):
-                # Qwen 建连失败不生成 call_sessions/call_history；错误只进入日志和协议事件。
+                # Qwen 建连失败不生成 call_sessions/call_history；按协议发送 call.rejected，
+                # 客户端收到后直接结束电话，不等待 call.ended。
                 await self._send_event(
-                    WSEventType.CALL_ERROR,
-                    {"call_id": self.call_id, "code": "REALTIME_PROVIDER_FAILED", "message": reason},
+                    WSEventType.CALL_REJECTED,
+                    {
+                        "call_id": self.call_id,
+                        "exit_code": self.exit_code,
+                        "code": "REALTIME_PROVIDER_FAILED",
+                        "message": reason,
+                    },
+                )
+                self._record_call_event(
+                    "call.rejected",
+                    error={"code": self.exit_code, "reason": reason},
+                    metadata={"exit_code": self.exit_code},
                 )
                 duration = 0
+                send_ended = False
             elif self.connected_at is None:
                 await asyncio.to_thread(
                     self.call_store.create_preconnect_hangup,
@@ -604,25 +633,34 @@ class CallStream:
                     summary=("网络断联结束" if self.exit_code == int(CallExitCode.RECONNECT_TIMEOUT) else "未接通就挂断"),
                 )
                 duration = 0
+                send_ended = True
             else:
                 duration = max(0, int((self.ended_at - self.connected_at).total_seconds()))
-                await asyncio.to_thread(
+                conversation_id = await asyncio.to_thread(
                     self.call_store.settle_call_and_conversation,
                     call_id=self.call_id,
                     ended_at=self.ended_at,
                     exit_code=self.exit_code,
                     duration_seconds=duration,
                 )
+                if conversation_id is None:
+                    self._record_call_event(
+                        "call.settlement_failed",
+                        error={"message": "call settlement returned no conversation"},
+                        metadata={"exit_code": self.exit_code},
+                    )
+                send_ended = True
             self._transition(CallState.ENDED, expected={CallState.ENDING})
-            await self._send_event(
-                WSEventType.CALL_ENDED,
-                {"call_id": self.call_id, "exit_code": self.exit_code, "duration_seconds": duration, "ended_at": self.ended_at.isoformat()},
-            )
-            self._record_call_event(
-                "call.ended",
-                error=(None if self.exit_code == int(CallExitCode.NORMAL) else {"code": self.exit_code, "reason": reason}),
-                metadata={"exit_code": self.exit_code, "duration_seconds": duration},
-            )
+            if send_ended:
+                await self._send_event(
+                    WSEventType.CALL_ENDED,
+                    {"call_id": self.call_id, "exit_code": self.exit_code, "duration_seconds": duration, "ended_at": self.ended_at.isoformat()},
+                )
+                self._record_call_event(
+                    "call.ended",
+                    error=(None if self.exit_code == int(CallExitCode.NORMAL) else {"code": self.exit_code, "reason": reason}),
+                    metadata={"exit_code": self.exit_code, "duration_seconds": duration},
+                )
             if self.connected_at is not None:
                 self._postprocess_task = asyncio.create_task(
                     self._settlement.process_after_end(
@@ -655,12 +693,16 @@ class CallStream:
         try:
             while self.state == CallState.ACTIVE:
                 response = self._responses.get(response_id)
-                if response is None or response.cancelled:
+                if response is None:
+                    return
+                if response.cancelled:
+                    self._cleanup_response_state(response_id)
                     return
                 all_played = set(response.pending_audio_ids) <= response.completed_audio_ids
                 if all_played and not self._pending_function_calls and not self.global_speaking_worker.has_work(self.stream_id):
                     break
                 await asyncio.sleep(0.05)
+            self._cleanup_response_state(response_id)
             await asyncio.sleep(float(self.config.get("proactive_delay_seconds", 2)))
             if self.state != CallState.ACTIVE or self._current_response_id is not None:
                 return
@@ -671,6 +713,15 @@ class CallStream:
             raise
         except Exception:
             self.logger.exception("call proactive topic failed: call_id=%s", self.call_id)
+
+    def _cleanup_response_state(self, response_id: str) -> None:
+        """清理已完成/已取消 response 的内存状态，防止长通话无界增长。
+
+        只移除 response 条目：尚未到达的播放完成 ACK 会通过 setdefault 重建
+        一个空 response，仍能正确落库（行本身由 _playback_completed 逐条清理），
+        避免误删正在播放中的句子导致 turn 丢失。
+        """
+        self._responses.pop(response_id, None)
 
     async def _generate_proactive_topic(self) -> None:
         if self.session is None or self.state != CallState.ACTIVE:
