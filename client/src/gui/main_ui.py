@@ -450,13 +450,17 @@ class ChatWidget(QWidget):
     我不太会写UI，这部分主要是AI写的。关键的回调逻辑是我看过的，也比较trivial，不详细解释了。
     '''
 
-    def __init__(self, config: Dict, agent_binder: AgentBinder, network_client=None, parent=None):
+    def __init__(self, config: Dict, agent_binder: AgentBinder, network_client=None, parent=None,
+                 live2d_config: Dict | None = None, gui_config: Dict | None = None):
         super().__init__(parent)
         self.config = config if config is not None else {}
         self.agent = agent_binder
         self.network_client = network_client
+        self.live2d_config = live2d_config
+        self.gui_config = gui_config
         self.preferences_manager = None  # Will be set from main.py
         self.dynamic_dialog = None
+        self.call_dialog = None
         self.dynamic_unread_count = 0
         self.agent.response_signal.connect(self.on_agent_response)
         self.agent.delete_signal.connect(self.on_agent_delete)
@@ -653,6 +657,26 @@ class ChatWidget(QWidget):
         self.dynamic_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.dynamic_btn.clicked.connect(self.open_dynamics)
         self.toolbar_layout.addWidget(self.dynamic_btn)
+
+        # 电话按钮
+        self.call_btn = HoverButton(tooltip_text="语音通话")
+        self.call_btn.setText("☎")
+        self.call_btn.setFixedSize(24, 24)
+        self.call_btn.setStyleSheet("""
+            QPushButton {
+                border: none;
+                background-color: transparent;
+                font-size: 14px;
+                color: #333333;
+            }
+            QPushButton:hover {
+                background-color: #E0E0E0;
+                border-radius: 4px;
+            }
+        """)
+        self.call_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.call_btn.clicked.connect(self.open_call)
+        self.toolbar_layout.addWidget(self.call_btn)
         
         self.toolbar_layout.addStretch()
 
@@ -708,6 +732,51 @@ class ChatWidget(QWidget):
             self.refresh_dynamic_badge()
         else:
             QMessageBox.warning(self, "提示", "网络客户端未就绪，无法打开动态窗口")
+
+    def open_call(self):
+        if not self.network_client:
+            QMessageBox.warning(self, "提示", "网络客户端未就绪，无法发起电话")
+            return
+        if self.call_dialog is not None:
+            self.call_dialog.raise_()
+            self.call_dialog.activateWindow()
+            return
+        if not self.live2d_config or not self.gui_config:
+            QMessageBox.warning(self, "提示", "Live2D 配置缺失，无法打开电话窗口")
+            return
+        # P0 无 AEC：提示使用耳机，避免扬声器外放回声误触发打断
+        choice = QMessageBox.question(
+            self,
+            "语音通话",
+            "当前版本请使用耳机，扬声器模式可能导致错误打断。\n是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if choice != QMessageBox.StandardButton.Yes:
+            return
+        from .call_dialog import CallDialog  # 延迟导入避免与 call_dialog 循环引用
+
+        self.call_dialog = CallDialog(
+            self.network_client,
+            self.gui_config,
+            self.live2d_config,
+            agent_binder=self.agent,
+            parent=self,
+        )
+        self.call_dialog.chat_blocked.connect(self.set_chat_blocked)
+        self.call_dialog.finished.connect(self._on_call_finished)
+        self.call_dialog.show()
+        self.call_dialog.raise_()
+        self.call_dialog.activateWindow()
+        self.call_dialog.start_call()
+
+    def _on_call_finished(self, _result):
+        self.call_dialog = None
+
+    def set_chat_blocked(self, blocked: bool):
+        """通话期间禁用聊天输入，避免与服务端聊天互斥冲突。"""
+        self.input_box.setEnabled(not blocked)
+        self.send_button.setEnabled(not blocked)
+        self.picture_btn.setEnabled(not blocked)
 
     def refresh_dynamic_badge(self):
         if not self.network_client:
@@ -953,7 +1022,13 @@ class MainWindow(QWidget):
         self.v_line.setFixedWidth(2)
 
         # Right Side (Chat)
-        self.chat_widget = ChatWidget(config=gui_config["chat_window"], agent_binder=ui_binder, network_client=network_client)
+        self.chat_widget = ChatWidget(
+            config=gui_config["chat_window"],
+            agent_binder=ui_binder,
+            network_client=network_client,
+            live2d_config=live2d_config,
+            gui_config=gui_config,
+        )
         self.layout.addWidget(self.live2d_container)
         self.layout.addWidget(self.v_line)
         self.layout.addWidget(self.chat_widget)
