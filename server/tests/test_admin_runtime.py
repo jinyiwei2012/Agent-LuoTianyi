@@ -307,6 +307,7 @@ def test_world_runtime_skips_disabled_optional_tasks():
             "citywalk": {"enabled": False},
             "bili_dynamic_fetcher": {"enabled": False},
             "auto_song_learner": {"enabled": False},
+            "dynamic_interaction": {"enabled": False},
         }
     )
     runtime.system_runtime = SimpleNamespace(

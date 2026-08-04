@@ -119,6 +119,16 @@ class TestLLMService:
         assert "character_name" in vars, "模块变量中缺少 'character_name'"
         assert "input_text" in vars, "模块变量中缺少 'input_text'"
 
+        # 用 fake 响应替代真实 LLM 调用，避免测试依赖 API Key 与网络
+        async def fake_generate_response(prompt, **kwargs):
+            return {
+                "content": "我是洛天依。",
+                "usage": {"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20},
+                "response_time_s": 0.42,
+            }
+
+        module.llm_client.generate_response = fake_generate_response
+
         resp = await module.generate_response(character_name="洛天依", input_text="你好，你是谁？")
         assert resp is not None, "生成的响应不应为None"
         recent_resp = module.recent_response

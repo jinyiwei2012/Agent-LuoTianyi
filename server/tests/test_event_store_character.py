@@ -173,15 +173,31 @@ def test_event_notification_is_scoped_by_character(tmp_path):
     init_sql_db(str(tmp_path), "events.db")
     store = EventStore({}, get_sql_session, NoopRedis())
 
-    store.mark_notified("event-1", "user-1", "day_of_event", "luotianyi")
+    # mark_notified 写入的 event_notifications.event_id 外键引用 events.id，
+    # 必须先创建事件记录再标记通知
+    asyncio.run(
+        store.add_event(
+            {
+                "id": "event-1",
+                "title": "Concert",
+                "event_type": "concert",
+                "start_datetime": datetime(2026, 7, 1, 20, 0, 0),
+                "trigger_conditions": ["day_of_event"],
+                "character": "luotianyi",
+            }
+        )
+    )
+    event_id = "event-1"
 
-    assert store.is_notified("event-1", "user-1", "day_of_event", "luotianyi") is True
-    assert store.is_notified("event-1", "user-1", "day_of_event", "miku") is False
+    store.mark_notified(event_id, "user-1", "day_of_event", "luotianyi")
 
-    store.mark_notified("event-1", "user-1", "day_of_event", "miku")
+    assert store.is_notified(event_id, "user-1", "day_of_event", "luotianyi") is True
+    assert store.is_notified(event_id, "user-1", "day_of_event", "miku") is False
+
+    store.mark_notified(event_id, "user-1", "day_of_event", "miku")
     db = get_sql_session()
     try:
-        rows = db.query(EventNotification).filter(EventNotification.event_id == "event-1").all()
+        rows = db.query(EventNotification).filter(EventNotification.event_id == event_id).all()
     finally:
         db.close()
 
