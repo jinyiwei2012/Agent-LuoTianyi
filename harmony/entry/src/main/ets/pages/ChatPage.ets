@@ -5,6 +5,7 @@ import { WsTransport, WsCallbacks, SendTouchPayload } from '../service/WsTranspo
 import { Live2DFacade, Live2DEvents } from '../service/Live2DFacade';
 import { LlmConfigStore } from '../service/LlmConfigStore';
 import { ImagePicker } from '../service/ImagePicker';
+import { HistoryService } from '../service/HistoryService';
 import { AgentMessagePayload, ChatMessage, SendStatus, createSystemMessage } from '../model/ChatModels';
 
 const TAG = 'ChatPage';
@@ -69,9 +70,18 @@ struct ChatPage {
     this.transport = new WsTransport(username, token, callbacks);
     // 上传 llm_mode：客户端托管的 LLM 类型（PR53 对齐）
     this.setupLlmMode();
+    // 加载历史记录（最近 LOAD_HISTORY_COUNT 条）
+    this.loadHistory();
     this.transport.start();
     this.connectionText = '连接中...';
     this.pushSystemMessage(`已登录：${username}`);
+  }
+
+  private async loadHistory(): Promise<void> {
+    const result = await HistoryService.fetchHistory(0);
+    if (result.messages.length > 0) {
+      this.messages = [...result.messages, ...this.messages];
+    }
   }
 
   private async setupLlmMode(): Promise<void> {

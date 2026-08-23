@@ -27,14 +27,21 @@ export class HttpClient {
     return `${this.baseUrl}${path}`;
   }
 
-  async requestJson(path: string, method: http.RequestMethod, body: string | null): Promise<HttpResult> {
+  async requestJson(path: string, method: http.RequestMethod, body: string | null,
+    extraHeader?: Record<string, string>): Promise<HttpResult> {
     const httpRequest = http.createHttp();
     try {
+      const headerMap: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      if (extraHeader !== undefined) {
+        for (const key of Object.keys(extraHeader)) {
+          headerMap[key] = extraHeader[key];
+        }
+      }
       const options: http.HttpRequestOptions = {
         method: method,
-        header: {
-          'Content-Type': 'application/json',
-        },
+        header: headerMap,
         readTimeout: API_TIMEOUT_MS,
         connectTimeout: API_TIMEOUT_MS,
       };
