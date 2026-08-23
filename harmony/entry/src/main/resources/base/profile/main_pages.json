@@ -4,6 +4,7 @@
     "pages/LoginPage",
     "pages/ChatPage",
     "pages/LlmSettingsPage",
+    "pages/SettingsPage",
     "pages/Live2DTestPage"
   ]
 }

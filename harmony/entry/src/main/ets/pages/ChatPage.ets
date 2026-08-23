@@ -259,6 +259,13 @@ struct ChatPage {
         Text(this.agentState).fontSize(12).fontColor('#999999').margin({ right: 8 })
         Text(this.connectionText).fontSize(12).fontColor(
           this.connectionText === '未连接' ? '#E53935' : '#4CAF50')
+        Text('设置')
+          .fontSize(13)
+          .fontColor('#007DFF')
+          .margin({ left: 8 })
+          .onClick(() => {
+            router.pushUrl({ url: 'pages/SettingsPage' });
+          })
       }
       .width('100%')
       .height(48)
