@@ -1,0 +1,21 @@
+# 鸿蒙工程（DevEco Studio / hvigor）忽略规则
+/node_modules
+/oh_modules
+/local.properties
+/.idea
+**/build
+/.hvigor
+/.cxx
+/.clangd
+/.clang-format
+/.clang-tidy
+**/.test
+/.appanalyzer
+/.linter
+/.preview
+/.test
+.DS_Store
+harmony
+*.har
+*.hsp
+*.hap

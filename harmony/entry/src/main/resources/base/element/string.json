@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "洛天依对话 Agent 主模块"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "洛天依对话 Agent"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "洛天依"
+    }
+  ]
+}
