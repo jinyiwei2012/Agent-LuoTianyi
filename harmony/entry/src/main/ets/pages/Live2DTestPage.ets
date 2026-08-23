@@ -1,5 +1,6 @@
 import { webview } from '@kit.ArkWeb';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { RawfileScheme } from '../service/RawfileScheme';
 
 const TAG = 'Live2DTest';
 
@@ -28,10 +29,12 @@ class JsBridge {
 struct Live2DTestPage {
   private controller: webview.WebviewController = new webview.WebviewController();
   private bridge: JsBridge = new JsBridge();
+  private reloadedOnce: boolean = false;
   @State lastEvent: string = '等待 JS 事件...';
   @State modelLoaded: string = '未加载';
 
   aboutToAppear(): void {
+    RawfileScheme.registerScheme();
     this.bridge.setOnMessage((msg: string) => {
       this.handleJsEvent(msg);
     });
@@ -73,18 +76,30 @@ struct Live2DTestPage {
           .fontWeight(FontWeight.Bold)
       }.width('100%').padding(12)
 
-      // WebView 区域（透明背景，模型展示）
-      Web({ src: $rawfile('live2d/live2d.html'), controller: this.controller })
+      // WebView 区域（透明背景，模型展示；自定义 scheme 拦截 rawfile 资源，
+      // 绕开 resource:// 不支持 fetch/XHR 的限制）
+      Web({ src: 'live2d://live2d.html', controller: this.controller })
         .width('100%')
         .layoutWeight(1)
         .javaScriptAccess(true)
         .domStorageAccess(true)
         .backgroundColor(Color.Transparent)
+        .onControllerAttached(() => {
+          // 在 Web 组件加载前绑定 scheme handler（live2d:// 资源由 rawfile 提供）
+          RawfileScheme.bindHandler(this.controller);
+        })
         .onPageEnd(() => {
           hilog.info(0x0000, TAG, 'onPageEnd');
           // 注册 JS 桥（对齐 window.ReactNativeWebView）
           this.controller.registerJavaScriptProxy(this.bridge, 'ReactNativeWebView', ['postMessage']);
-          this.controller.refresh();
+          // 仅首次注册后重载一次：重载后 JS 在 init 时桥已存在，
+          // 会发出 modelLoaded 事件；守卫避免 onPageEnd->refresh 死循环
+          if (!this.reloadedOnce) {
+            this.reloadedOnce = true;
+            setTimeout(() => {
+              this.controller.refresh();
+            }, 300);
+          }
         })
 
       // 状态区

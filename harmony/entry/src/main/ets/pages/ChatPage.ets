@@ -1,4 +1,5 @@
 import { router, promptAction } from '@kit.ArkUI';
+import { webview } from '@kit.ArkWeb';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { AuthService } from '../service/AuthService';
 import { WsTransport, WsCallbacks, SendTouchPayload } from '../service/WsTransport';
@@ -6,6 +7,7 @@ import { Live2DFacade, Live2DEvents } from '../service/Live2DFacade';
 import { LlmConfigStore } from '../service/LlmConfigStore';
 import { ImagePicker } from '../service/ImagePicker';
 import { HistoryService } from '../service/HistoryService';
+import { RawfileScheme } from '../service/RawfileScheme';
 import { AgentMessagePayload, ChatMessage, SendStatus, createSystemMessage } from '../model/ChatModels';
 
 const TAG = 'ChatPage';
@@ -23,6 +25,7 @@ struct ChatPage {
   private pageBound = false;
 
   aboutToAppear(): void {
+    RawfileScheme.registerScheme();
     if (!AuthService.state.isLoggedIn) {
       router.replaceUrl({ url: 'pages/LoginPage' });
       return;
@@ -271,18 +274,23 @@ struct ChatPage {
       .height(48)
       .padding({ left: 16, right: 16 })
 
-      // Live2D 区域（WebView，模型 + 服务端音频播放引擎）
+      // Live2D 区域（WebView，模型 + 服务端音频播放引擎；
+      // 自定义 scheme 拦截 rawfile 资源，绕开 resource:// 不支持 fetch/XHR）
       if (this.live2d !== null) {
-        Web({ src: $rawfile('live2d/live2d.html'), controller: this.live2d.controller })
+        Web({ src: 'live2d://live2d.html', controller: this.live2d.controller })
           .width('100%')
           .height('42%')
           .javaScriptAccess(true)
           .domStorageAccess(true)
           .backgroundColor(Color.Transparent)
+          .onControllerAttached(() => {
+            // 在 Web 组件加载前绑定 scheme handler（live2d:// 资源由 rawfile 提供）
+            RawfileScheme.bindHandler(this.live2d!.controller);
+          })
           .onPageEnd(() => {
-            this.live2d?.bindBridge();
+            // 注册桥 + 首次重载一次（重载后 JS 能发 modelLoaded/touch）
+            this.live2d?.bindBridgeAndReload();
             this.pageBound = true;
-            this.live2d?.debugLog('chapter page onPageEnd');
           })
           .onErrorReceive((event) => {
             hilog.error(0x0000, TAG, 'webview error: %{public}s', String(event.error));

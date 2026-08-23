@@ -84,6 +84,21 @@ export class Live2DFacade {
     hilog.info(0x0000, TAG, 'bridge registered');
   }
 
+  /**
+   * 注册桥 + 首次重载一次：JS init 发生在桥注册前（modelLoaded 事件被跳过），
+   * 重载后 bridge 已存在，JS 能发出 modelLoaded/touch 事件。
+   * 守卫避免 onPageEnd 循环刷新。
+   */
+  bindBridgeAndReload(): void {
+    if (this.bound) {
+      return;
+    }
+    this.bindBridge();
+    setTimeout(() => {
+      this.controller.refresh();
+    }, 300);
+  }
+
   /** 页面重载后重新绑定 */
   resetBridge(): void {
     this.bound = false;
