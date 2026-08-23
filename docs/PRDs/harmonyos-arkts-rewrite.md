@@ -190,3 +190,76 @@ harmony/
 2. Live2D 表现（表情口型同步、触摸反应）与 Android/iOS 版一致
 3. WebSocket 断线重连 / llm_request 委托异常回传 等错误路径正确
 4. 隐私合规（仅申请必要权限）
+
+## 十、真机验收检查表（执行版）
+
+> 前置：`scripts\build_harmony.ps1` 构建通过，产物 `harmony\entry\build\default\outputs\default\entry-default-unsigned.hap`。
+> 需连真机/模拟器：`hdc list targets` 能看到设备；未签名 HAP 在开发机可直装（商用需 DevEco 登录自动签名）。
+
+### 0. 设备连接
+- [ ] `hdc list targets` 返回设备（如 `127.0.0.1:5555` 或真机序列号）
+- [ ] 手机已开「开发者选项 → USB 调试」，PC 已装 HDC 驱动
+- [ ] 安装：`hdc install <hap路径>` 或用 DevEco 直接运行 entry
+
+### 1. Live2D 验证页（阶段 0 技术项，优先级最高）
+- [ ] 首页 →「Live2D 验证」进入 `Live2DTestPage`
+- [ ] **Live2D 模型渲染**（洛天依绿色长发模型）
+- [ ] 状态显示「模型加载成功」（绿色）
+- [ ] 点「表情开心/普通」→ 模型表情切换（Native→JS 方向）
+- [ ] 触摸画布 → 显示「触摸区域: [...]」（JS→Native 方向）
+- 排查：`hdc shell hilog | grep Live2DTest`
+
+### 2. 账号与连接（阶段 1）
+- [ ] 首页 →「进入聊天」→ 登录页
+- [ ] 服务器地址设置（默认 `https://www-api.u3493359.nyat.app:11664`）
+- [ ] 注册（账号+密码+邀请码）→ 自动切到登录 tab
+- [ ] 登录 → 自动进 ChatPage，顶栏「连接中→已连接」
+- [ ] 勾选自动登录后重开 App → 直接进 ChatPage
+- [ ] 密码 RSA 加密链路：错误密码应提示「登录失败」（而非加密失败）
+- 排查：`hdc shell hilog | grep AuthService`
+
+### 3. 核心聊天（阶段 2）
+- [ ] ChatPage 顶部显示 Live2D 模型
+- [ ] 发文字 → 自气泡（submitted）；天依回复（agent_message）显示
+- [ ] 发图片（点「图片」→ 相册选图）→ 图片气泡
+- [ ] 天依回复时**口型/表情同步**(Live2D 演绎)
+- [ ] 天依回复**语音播放**（TTS 分块流，WebView JS 引擎）
+- [ ] 触摸 Live2D → 上报 user_touch（天依发声/反应）
+- [ ] 断开网络 → 断线重连提示；恢复后自动重连
+- 排查：`hdc shell hilog | grep -E "WsTransport|Live2DFacade"`
+
+### 4. LLM 设置（阶段 2/3 委托）
+- [ ] 设置 →「LLM 模型设置」
+- [ ] 模型类型列表加载（`GET /llm/providers`）
+- [ ] 填 Base URL + API Key → 「探测」显示可用模型数
+- [ ] 保存 → 发消息时若服务端下发 `llm_request`，客户端直接调用成功（用户 Key 不落服务端）
+- 排查：`hdc shell hilog | grep LlmSettingsPage`
+
+### 5. 设置与偏好（阶段 3）
+- [ ] ChatPage 顶栏「设置」→ 设置页
+- [ ] 修改服务器地址并保存
+- [ ] 相处模式偏好（关系/说话风格/人设/上下文）→「保存偏好」成功
+- [ ] 退出登录 → 回登录页
+
+### 6. 动态（阶段 3）
+- [ ] 设置 →「动态」
+- [ ] 动态列表加载；发布一条动态成功
+- [ ] 点「评论 N」展开评论；发表评论成功（计数 +1）
+
+### 7. 历史记录（阶段 3）
+- [ ] 重登后进入 ChatPage，历史消息自动加载（最近 20 条）
+- [ ] 图片历史暂缓回连（get_image 未实现，仅文本）
+
+### 8. 收尾
+- [ ] 全流程无崩溃/ANR
+- [ ] 截取关键界面（登录/聊天/LLM 设置/动态）存档
+
+## 十一、当前实现状态（feat/harmonyos-arkts）
+
+- 分支：`feat/harmonyos-arkts`（基于 dev `b33d359`），19 个原子提交
+- 已实现：工程骨架、Live2D WebView、登录/注册/自动登录（RSA-OAEP-SHA256）、
+  WebSocket 全链路（auth/心跳/ack/重连）、文字/图片聊天（llm_mode 上报）、
+  Live2D 表情/口型/触摸、TTS 分块流、LLM 委托（PR53）、
+  历史记录、LLM 设置、设置/偏好、动态/评论
+- 未实现（延期项）：历史图片回连（get_image）、动态未读红点、主题切换、登录页主题
+- 验收：**待真机**（`hdc list targets` 为空，需连接设备后按上表逐项勾选）
