@@ -4,6 +4,8 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { WsEventType, WS_CLIENT_CAPABILITIES, WsEnvelope, AckResult } from '../model/WsEvents';
 import { AgentMessagePayload } from '../model/ChatModels';
 import { SecurityStore } from './SecurityStore';
+import { LlmConfigStore } from './LlmConfigStore';
+import { buildChatCompletionsPayload, callLlmProvider } from './LlmClient';
 import { HEARTBEAT_INTERVAL_MS } from '../common/Constants';
 
 const TAG = 'WsTransport';
@@ -54,6 +56,19 @@ export interface SendPingPayload {
 /** user_text payload */
 export interface SendTextPayload {
   text: string;
+}
+
+/** llm_response 成功负载 */
+interface LlmResponseOk {
+  request_id: string;
+  content: string;
+  usage: Object | null;
+}
+
+/** llm_response 失败负载 */
+interface LlmResponseFail {
+  request_id: string;
+  error: string;
 }
 
 /**
@@ -358,6 +373,12 @@ export class WsTransport {
         return;
       }
 
+      if (eventType === WsEventType.LLM_REQUEST) {
+        // llm_request 委托：读取本地 LLM 配置 -> OpenAI 兼容调用 -> llm_response
+        this.handleLlmRequest(payload);
+        return;
+      }
+
       if (eventType === WsEventType.AGENT_MESSAGE) {
         this.callbacks.onAgentMessage(payload as AgentMessagePayload);
         return;
@@ -374,6 +395,95 @@ export class WsTransport {
     } catch (e) {
       hilog.error(0x0000, TAG, 'parse error: %{public}s', (e as Error).message);
       this.callbacks.onError('收到无法解析的 WebSocket 消息');
+    }
+  }
+
+  /**
+   * 处理 llm_request 委托（对齐 app message_processor handleLlmRequest）：
+   * 读模块配置 -> 构建 payload -> 直接调用用户自备的 OpenAI 兼容接口 ->
+   * 回传 llm_response{request_id, content, usage}；异常回传错误。
+   */
+  private handleLlmRequest(payload: Record<string, Object>): void {
+    const requestId = String(payload['request_id'] ?? '');
+    this.performLlmRequest(requestId, payload).then((responsePayload: Object) => {
+      const message: WsSendMessage = {
+        type: WsEventType.LLM_RESPONSE,
+        ts: Date.now(),
+        payload: responsePayload,
+      };
+      this.sendRaw(message);
+    });
+  }
+
+  private async performLlmRequest(requestId: string, payload: Record<string, Object>): Promise<Object> {
+    try {
+      const moduleId = String(payload['type'] ?? '');
+      const cfg = await LlmConfigStore.getModuleConfig(moduleId);
+      if (cfg === null) {
+        const fail: LlmResponseFail = {
+          request_id: requestId,
+          error: `未配置模块 ${moduleId} 的 LLM 参数`,
+        };
+        return fail;
+      }
+      const baseUrl = String(cfg['baseUrl'] ?? '').replace(/\/+$/, '');
+      if (baseUrl.length === 0) {
+        const fail: LlmResponseFail = { request_id: requestId, error: 'baseUrl 为空' };
+        return fail;
+      }
+      const apiKey = String(cfg['apiKey'] ?? '');
+      const model = String(cfg['model'] ?? '');
+      const paramsText = String(cfg['paramsText'] ?? '');
+      let cachedParams: Record<string, Object> = {};
+      if (paramsText.length > 0) {
+        try {
+          const parsed = JSON.parse(paramsText) as Record<string, Object>;
+          cachedParams = parsed;
+        } catch (e) {
+          hilog.warn(0x0000, TAG, 'paramsText parse failed: %{public}s', (e as Error).message);
+        }
+      }
+      const caps = cfg['modelCapabilities'] as Record<string, Object> | null ?? {};
+      const useJson = payload['use_json'] === true && caps['can_use_json'] === true;
+      const enableThinking = payload['enable_thinking'] === true && caps['can_enable_thinking'] === true;
+
+      // 合并 params：服务端指定 + 本地缓存
+      const mergedParams: Record<string, Object> = {};
+      const remoteParams = payload['params'] as Record<string, Object> | null ?? {};
+      for (const k of Object.keys(remoteParams)) {
+        mergedParams[k] = remoteParams[k];
+      }
+      for (const k of Object.keys(cachedParams)) {
+        mergedParams[k] = cachedParams[k];
+      }
+
+      const body = buildChatCompletionsPayload({
+        prompt: String(payload['prompt'] ?? ''),
+        model: model,
+        params: mergedParams,
+        enableThinking: enableThinking,
+        useJson: useJson,
+        imageBase64: typeof payload['image_base64'] === 'string' ? String(payload['image_base64']) : undefined,
+      });
+
+      const result = await callLlmProvider({
+        url: `${baseUrl}/chat/completions`,
+        apiKey: apiKey,
+        body: body,
+      });
+
+      const ok: LlmResponseOk = {
+        request_id: requestId,
+        content: result.content,
+        usage: result.usage,
+      };
+      return ok;
+    } catch (e) {
+      const fail: LlmResponseFail = {
+        request_id: requestId,
+        error: e instanceof Error ? e.message : String(e),
+      };
+      return fail;
     }
   }
 
