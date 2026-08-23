@@ -14,6 +14,10 @@ struct Index {
         .onClick(() => {
           router.pushUrl({ url: 'pages/LoginPage' });
         })
+      Button('LLM 模型设置')
+        .onClick(() => {
+          router.pushUrl({ url: 'pages/LlmSettingsPage' });
+        })
       Button('Live2D 验证')
         .onClick(() => {
           router.pushUrl({ url: 'pages/Live2DTestPage' });

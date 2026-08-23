@@ -3,6 +3,7 @@
     "pages/Index",
     "pages/LoginPage",
     "pages/ChatPage",
+    "pages/LlmSettingsPage",
     "pages/Live2DTestPage"
   ]
 }
