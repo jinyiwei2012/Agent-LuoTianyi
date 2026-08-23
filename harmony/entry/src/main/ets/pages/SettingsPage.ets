@@ -110,6 +110,21 @@ struct SettingsPage {
         .borderRadius(8)
         .backgroundColor('#FFFFFF')
 
+        // 动态入口
+        Column() {
+          Row() {
+            Text('动态').fontSize(15)
+            Blank()
+            Button('前往').fontSize(13).onClick(() => {
+              router.pushUrl({ url: 'pages/DynamicsPage' });
+            })
+          }.width('100%')
+        }
+        .width('100%')
+        .padding(12)
+        .borderRadius(8)
+        .backgroundColor('#FFFFFF')
+
         // 偏好设置
         Column({ space: 10 }) {
           Text('相处模式偏好').fontSize(15).fontWeight(FontWeight.Bold)
