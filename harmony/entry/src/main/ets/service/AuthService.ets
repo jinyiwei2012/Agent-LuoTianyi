@@ -1,7 +1,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { HttpClient } from './HttpClient';
 import { SecurityStore } from './SecurityStore';
-import { encryptPasswordWithPem } from './CryptoUtil';
+import { encryptPasswordWithPem, EncryptResult } from './CryptoUtil';
 
 const TAG = 'AuthService';
 
@@ -67,16 +67,16 @@ export class AuthService {
   }
 
   /** 加密密码：需要公钥；失败返回结构化结果 */
-  static async encryptPassword(password: string): Promise<
-    { ok: true, encrypted: string } | { ok: false, reason: string }
-  > {
+  static async encryptPassword(password: string): Promise<EncryptResult> {
     const pem = await AuthService.getPublicKey();
     if (pem === null) {
-      return { ok: false, reason: 'network' };
+      const fail: EncryptResult = { ok: false, encrypted: '', reason: 'network' };
+      return fail;
     }
     const result = encryptPasswordWithPem(password, pem);
     if (!result.ok) {
-      return { ok: false, reason: 'crypto' };
+      const fail: EncryptResult = { ok: false, encrypted: '', reason: 'crypto' };
+      return fail;
     }
     return result;
   }

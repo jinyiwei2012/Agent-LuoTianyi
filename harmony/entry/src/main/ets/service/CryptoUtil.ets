@@ -4,6 +4,13 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 
 const TAG = 'CryptoUtil';
 
+/** 加密结果（显式 interface，满足 ArkTS 严格模式对象字面量约束） */
+export interface EncryptResult {
+  ok: boolean;
+  encrypted: string;
+  reason: string;
+}
+
 /**
  * RSA-OAEP + SHA-256 密码加密工具。
  * 严格对齐 app/utils/crypto.ts（node-forge）与服务端 Python padding.OAEP：
@@ -41,15 +48,8 @@ function bytesToUtf8String(bytes: Uint8Array): string {
  * 加密密码：RSA-OAEP-SHA256，输出 base64。
  * @param password 明文密码（UTF-8）
  * @param publicKeyPem 服务端 /auth/public_key 返回的 PEM 公钥
- * @return 成功 {ok:true, encrypted}；失败 {ok:false, reason}
  */
-export function encryptPasswordWithPem(password: string, publicKeyPem: string): {
-  ok: true,
-  encrypted: string
-} | {
-  ok: false,
-  reason: string
-} {
+export function encryptPasswordWithPem(password: string, publicKeyPem: string): EncryptResult {
   try {
     // 1. PEM -> DER（SPKI X.509 SubjectPublicKeyInfo）
     const base64Helper = new util.Base64Helper();
@@ -77,9 +77,11 @@ export function encryptPasswordWithPem(password: string, publicKeyPem: string): 
     const encBytes: Uint8Array = base64Helper.encodeSync(combined);
     const encrypted = bytesToUtf8String(encBytes);
     hilog.info(0x0000, TAG, 'encrypt ok, len=%{public}d', encrypted.length);
-    return { ok: true, encrypted: encrypted };
+    const okResult: EncryptResult = { ok: true, encrypted: encrypted, reason: '' };
+    return okResult;
   } catch (e) {
     hilog.error(0x0000, TAG, 'encrypt failed: %{public}s', (e as Error).message);
-    return { ok: false, reason: (e as Error).message };
+    const failResult: EncryptResult = { ok: false, encrypted: '', reason: (e as Error).message };
+    return failResult;
   }
 }

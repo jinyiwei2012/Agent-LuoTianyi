@@ -1,4 +1,5 @@
 import { webSocket } from '@kit.NetworkKit';
+import { util } from '@kit.ArkTS';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { WsEventType, WS_CLIENT_CAPABILITIES, WsEnvelope, AckResult } from '../model/WsEvents';
 import { AgentMessagePayload } from '../model/ChatModels';
@@ -17,6 +18,42 @@ export interface WsCallbacks {
 interface AckWaiter {
   resolve: (r: AckResult) => void;
   timer: number;
+}
+
+/** rejectAllWaiters 选项（显式 interface） */
+interface RejectOptions {
+  code?: string;
+  retryable?: boolean;
+  drop?: boolean;
+}
+
+/** payload 容器（ArkTS 要求对象字面量匹配显式声明的 interface） */
+/**
+ * 上行消息信封（对齐 WsEnvelope 结构）。payload 运行时为 JSON 可变对象，
+ * 具体结构由各发送方法的显式 payload interface 决定。
+ */
+interface WsSendMessage {
+  type: string;
+  client_msg_id?: string;
+  ts?: number;
+  payload: Object;
+}
+
+/** user_auth payload */
+export interface SendAuthPayload {
+  username: string;
+  token: string;
+  capabilities: string[];
+}
+
+/** hb_ping payload */
+export interface SendPingPayload {
+  ping_id: number;
+}
+
+/** user_text payload */
+export interface SendTextPayload {
+  text: string;
 }
 
 /**
@@ -104,7 +141,12 @@ export class WsTransport {
         hilog.error(0x0000, TAG, 'message error: %{public}s', err.message);
         return;
       }
-      const raw = typeof data === 'string' ? data : new TextDecoder().decode(data);
+      let raw: string;
+      if (typeof data === 'string') {
+        raw = data;
+      } else {
+        raw = new util.TextDecoder().decodeToString(new Uint8Array(data));
+      }
       this.handleServerMessage(raw);
     });
 
@@ -138,16 +180,18 @@ export class WsTransport {
   }
 
   private sendAuth(): void {
-    this.sendRaw({
+    const payload: SendAuthPayload = {
+      username: this.username,
+      token: this.token,
+      capabilities: WS_CLIENT_CAPABILITIES,
+    };
+    const message: WsSendMessage = {
       type: WsEventType.USER_AUTH,
       client_msg_id: `auth-${Date.now()}`,
       ts: Date.now(),
-      payload: {
-        username: this.username,
-        token: this.token,
-        capabilities: WS_CLIENT_CAPABILITIES,
-      },
-    });
+      payload: payload,
+    };
+    this.sendRaw(message);
   }
 
   private startHeartbeat(): void {
@@ -157,12 +201,14 @@ export class WsTransport {
         return;
       }
       this.pingId += 1;
-      this.sendRaw({
+      const payload: SendPingPayload = { ping_id: this.pingId };
+      const message: WsSendMessage = {
         type: WsEventType.HB_PING,
         client_msg_id: `ping-${this.pingId}`,
         ts: Date.now(),
-        payload: { ping_id: this.pingId },
-      });
+        payload: payload,
+      };
+      this.sendRaw(message);
     }, HEARTBEAT_INTERVAL_MS);
   }
 
@@ -193,7 +239,7 @@ export class WsTransport {
     }
   }
 
-  private sendRaw(message: Record<string, Object>): boolean {
+  private sendRaw(message: WsSendMessage): boolean {
     if (this.ws === null) {
       return false;
     }
@@ -207,7 +253,7 @@ export class WsTransport {
   }
 
   /** 发送并等待 server_ack（超时 10s），返回 ACK 结果 */
-  sendWithAck(eventType: string, payload: Record<string, Object>, timeoutMs: number,
+  sendWithAck(eventType: string, payload: Object, timeoutMs: number,
     clientMsgId?: string): Promise<AckResult> {
     const requestId = clientMsgId !== undefined && clientMsgId.length > 0
       ? clientMsgId
@@ -229,12 +275,13 @@ export class WsTransport {
       };
       this.ackWaiters.set(requestId, waiter);
 
-      const sent = this.sendRaw({
+      const message: WsSendMessage = {
         type: eventType,
         client_msg_id: requestId,
         ts: Date.now(),
         payload: payload,
-      });
+      };
+      const sent = this.sendRaw(message);
       if (!sent) {
         clearTimeout(timer);
         this.ackWaiters.delete(requestId);
@@ -330,8 +377,8 @@ export class WsTransport {
     }
   }
 
-  private rejectAllWaiters(errorText: string, options: Partial<Pick<AckResult, 'code' | 'retryable' | 'drop'>>): void {
-    for (const [requestId, waiter] of this.ackWaiters) {
+  private rejectAllWaiters(errorText: string, options: RejectOptions): void {
+    this.ackWaiters.forEach((waiter: AckWaiter, requestId: string) => {
       clearTimeout(waiter.timer);
       const r: AckResult = {
         ok: false,
@@ -348,7 +395,7 @@ export class WsTransport {
         r.drop = options.drop;
       }
       waiter.resolve(r);
-    }
+    });
     this.ackWaiters.clear();
   }
 }

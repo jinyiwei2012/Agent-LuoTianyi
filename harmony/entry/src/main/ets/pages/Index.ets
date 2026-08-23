@@ -10,6 +10,10 @@ struct Index {
       Text(this.message)
         .fontSize(30)
         .fontWeight(FontWeight.Bold)
+      Button('进入聊天')
+        .onClick(() => {
+          router.pushUrl({ url: 'pages/LoginPage' });
+        })
       Button('Live2D 验证')
         .onClick(() => {
           router.pushUrl({ url: 'pages/Live2DTestPage' });

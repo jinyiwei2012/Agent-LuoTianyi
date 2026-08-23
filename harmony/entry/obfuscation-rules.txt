@@ -1,2 +1,7 @@
 # Define project specific obfuscation rules here.
 # You can include the obfuscation configuration files in the current directory.
+
+-enable-property-obfuscation
+-enable-toplevel-obfuscation
+-enable-filename-obfuscation
+-enable-export-obfuscation

@@ -1,5 +1,4 @@
 import { preferences } from '@kit.ArkData';
-import { common } from '@kit.AbilityKit';
 import { DEFAULT_BASE_URL } from '../common/Constants';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 
@@ -23,8 +22,7 @@ export class SecurityStore {
 
   private static async getStore(): Promise<preferences.Preferences> {
     if (SecurityStore.store === null) {
-      const ctx = common.getContext() as common.UIAbilityContext;
-      SecurityStore.store = await preferences.getPreferences(ctx, STORE_NAME);
+      SecurityStore.store = await preferences.getPreferences(getContext(), STORE_NAME);
     }
     return SecurityStore.store;
   }
