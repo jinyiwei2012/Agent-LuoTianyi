@@ -1,8 +1,10 @@
-import { router } from '@kit.ArkUI';
+import { router, promptAction } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { AuthService } from '../service/AuthService';
-import { WsTransport, WsCallbacks, SendTextPayload, SendTouchPayload } from '../service/WsTransport';
+import { WsTransport, WsCallbacks, SendTouchPayload } from '../service/WsTransport';
 import { Live2DFacade, Live2DEvents } from '../service/Live2DFacade';
+import { LlmConfigStore } from '../service/LlmConfigStore';
+import { ImagePicker } from '../service/ImagePicker';
 import { AgentMessagePayload, ChatMessage, SendStatus, createSystemMessage } from '../model/ChatModels';
 
 const TAG = 'ChatPage';
@@ -65,9 +67,19 @@ struct ChatPage {
 
     this.live2d = new Live2DFacade(live2dEvents);
     this.transport = new WsTransport(username, token, callbacks);
+    // 上传 llm_mode：客户端托管的 LLM 类型（PR53 对齐）
+    this.setupLlmMode();
     this.transport.start();
     this.connectionText = '连接中...';
     this.pushSystemMessage(`已登录：${username}`);
+  }
+
+  private async setupLlmMode(): Promise<void> {
+    if (this.transport === null) {
+      return;
+    }
+    const types = await LlmConfigStore.getEnabledTypes();
+    this.transport.setClientMode({ types: types });
   }
 
   aboutToDisappear(): void {
@@ -170,12 +182,39 @@ struct ChatPage {
     };
     this.messages = [...this.messages, m];
     this.inputText = '';
-    const textPayload: SendTextPayload = { text: text };
-    this.transport.sendWithAck('user_text', textPayload, 10000, m.uuid)
+    this.transport.submitUserText(text, false, 10000, m.uuid)
       .then((result) => {
-        hilog.info(0x0000, TAG, 'sendWithAck ok=%{public}s', String(result.ok));
+        hilog.info(0x0000, TAG, 'submitUserText ok=%{public}s', String(result.ok));
         this.updateLocalMessage(m.uuid, result.ok ? 'submitted' : 'failed');
       });
+  }
+
+  /** 选图并发送 user_image（对齐 NetworkClient.sendImage） */
+  private async sendImage(): Promise<void> {
+    if (this.transport === null) {
+      return;
+    }
+    const picked = await ImagePicker.pickAndRead();
+    if (picked === null) {
+      promptAction.showToast({ message: '未选择图片' });
+      return;
+    }
+    const uuid = `img-${Date.now()}`;
+    const m: ChatMessage = {
+      uuid: uuid,
+      type: 'image',
+      content: picked.uri,
+      isUser: true,
+      timestamp: Date.now(),
+      sendStatus: 'waiting',
+      audioAvailable: false,
+      audioLocalUri: '',
+      audioPlayState: 'idle',
+    };
+    this.messages = [...this.messages, m];
+    const result = await this.transport.submitUserImage(
+      picked.imageBase64, picked.mimeType, picked.uri, 10000, uuid);
+    this.updateLocalMessage(uuid, result.ok ? 'submitted' : 'failed');
   }
 
   private updateLocalMessage(uuid: string, status: SendStatus): void {
@@ -241,12 +280,20 @@ struct ChatPage {
               if (m.isUser) {
                 Blank().width(60)
                 Column() {
-                  Text(m.content)
-                    .fontSize(15)
-                    .padding(12)
-                    .borderRadius(12)
-                    .backgroundColor('#007DFF')
-                    .fontColor(Color.White)
+                  if (m.type === 'image') {
+                    Image(m.content)
+                      .width(180)
+                      .height(180)
+                      .borderRadius(12)
+                      .objectFit(ImageFit.Cover)
+                  } else {
+                    Text(m.content)
+                      .fontSize(15)
+                      .padding(12)
+                      .borderRadius(12)
+                      .backgroundColor('#007DFF')
+                      .fontColor(Color.White)
+                  }
                 }.alignItems(HorizontalAlign.End)
               } else {
                 Column() {
@@ -278,6 +325,12 @@ struct ChatPage {
           .backgroundColor('#F2F2F2')
           .onChange((v: string) => {
             this.inputText = v;
+          })
+        Button('图片')
+          .backgroundColor('#90A4AE')
+          .height(44)
+          .onClick(() => {
+            this.sendImage();
           })
         Button('发送')
           .backgroundColor('#007DFF')

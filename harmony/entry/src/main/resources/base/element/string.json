@@ -11,6 +11,10 @@
     {
       "name": "EntryAbility_label",
       "value": "洛天依"
+    },
+    {
+      "name": "permission_read_imagevideo_reason",
+      "value": "用于选择图片发送给洛天依"
     }
   ]
 }

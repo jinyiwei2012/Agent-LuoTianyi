@@ -53,9 +53,24 @@ export interface SendPingPayload {
   ping_id: number;
 }
 
-/** user_text payload */
-export interface SendTextPayload {
-  text: string;
+/** user_text payload（对齐 app submitUserText: message + llm_mode） */
+export interface SendUserTextPayload {
+  message: string;
+  is_proactive?: boolean;
+  llm_mode: ServerLlmMode;
+}
+
+/** user_image payload（对齐 app submitUserImage） */
+export interface SendUserImagePayload {
+  image_base64: string;
+  mime_type: string;
+  image_client_path: string;
+  llm_mode: ServerLlmMode;
+}
+
+/** llm_mode 上报（PR53: 客户端托管的 LLM 类型） */
+export interface ServerLlmMode {
+  types: string[];
 }
 
 /** user_touch payload（对齐 app ws_transport submitUserTouch 的字段） */
@@ -98,11 +113,41 @@ export class WsTransport {
   private heartbeatTimer: number = -1;
   private pingId = 0;
   private ackWaiters: Map<string, AckWaiter> = new Map<string, AckWaiter>();
+  /** 客户端托管的 LLM 模式（PR53: 随 user_text/user_image 上报） */
+  private clientMode: ServerLlmMode = { types: [] };
 
   constructor(username: string, token: string, callbacks: WsCallbacks) {
     this.username = username;
     this.token = token;
     this.callbacks = callbacks;
+  }
+
+  /** 设置客户端 LLM 托管模式（登录后从本地配置读取类型） */
+  setClientMode(mode: ServerLlmMode): void {
+    this.clientMode = mode;
+  }
+
+  /** 发送文本（对齐 submitUserText: {message, is_proactive?, llm_mode}） */
+  submitUserText(message: string, isProactive: boolean = false, ackTimeout: number = 10000,
+    clientMsgId?: string): Promise<AckResult> {
+    const payload: SendUserTextPayload = {
+      message: message,
+      is_proactive: isProactive,
+      llm_mode: { types: this.clientMode.types },
+    };
+    return this.sendWithAck(WsEventType.USER_TEXT, payload, ackTimeout, clientMsgId);
+  }
+
+  /** 发送图片（对齐 submitUserImage, 输入已 sanitize 的 base64） */
+  submitUserImage(imageBase64: string, mimeType: string, imageClientPath: string,
+    ackTimeout: number = 10000, clientMsgId?: string): Promise<AckResult> {
+    const payload: SendUserImagePayload = {
+      image_base64: imageBase64,
+      mime_type: mimeType,
+      image_client_path: imageClientPath,
+      llm_mode: { types: this.clientMode.types },
+    };
+    return this.sendWithAck(WsEventType.USER_IMAGE, payload, ackTimeout, clientMsgId);
   }
 
   async start(): Promise<void> {
