@@ -10,6 +10,7 @@ import {
   Image,
   Keyboard,
   PanResponder,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -64,12 +65,45 @@ export default function Index({ onLogout }: { onLogout?: () => void }) {
   const theme = useMemo(() => resolveTheme(colorMode, systemScheme), [colorMode, systemScheme]);
 
   const debuggerHost = Constants.expoConfig?.hostUri || 'localhost:8081';
-  const live2dAssetRoot = 'file:///android_asset/public/';
-  const live2dRoot = __DEV__ ? `http://${debuggerHost}/` : live2dAssetRoot;
+  // Android 生产: WebView 从 android_asset 读取 public/（assetBundlePatterns 打包进 assets）
+  // iOS 生产: public/ 经 withLive2DIosAssets 插件拷入 app bundle 的 Assets/public，WebView 用相对路径解析
+  const [live2dRoot, setLive2dRoot] = useState<string>('file:///android_asset/public/');
+
+  useEffect(() => {
+    let cancelled = false;
+    const setup = async () => {
+      if (__DEV__) {
+        const root = `http://${debuggerHost}/`;
+        if (!cancelled) {
+          setLive2dRoot(root);
+        }
+        return;
+      }
+      if (Platform.OS === 'ios') {
+        // WKWebView 相对路径：bundle 内 Assets/public（withLive2DIosAssets 递归拷入并注册到 Xcode）
+        if (!cancelled) {
+          setLive2dRoot('public/');
+        }
+        return;
+      }
+      // Android 生产（含 dev build）：保持 android_asset 路径
+      if (!cancelled) {
+        setLive2dRoot('file:///android_asset/public/');
+      }
+    };
+    setup();
+    return () => {
+      cancelled = true;
+    };
+  }, [debuggerHost]);
+
   const live2dUrl = `${live2dRoot}live2d/live2d.html`;
 
   const isAllowedWebviewUrl = (url: string) => {
-    return __DEV__ ? url.startsWith(live2dRoot) : url.startsWith(live2dAssetRoot);
+    if (__DEV__) return url.startsWith(live2dRoot);
+    // 生产：iOS 相对路径（public/...）会由 WKWebView 解析为 file:///<bundle>/Assets/public/...
+    // Android 为 file:///android_asset/public/...；两者都包含 public/ 片段
+    return url.includes('public/');
   };
 
   const {
@@ -324,7 +358,7 @@ export default function Index({ onLogout }: { onLogout?: () => void }) {
           ref={webviewRef}
           source={{ uri: live2dUrl }}
           style={styles.webview}
-          originWhitelist={[live2dRoot]}
+          originWhitelist={Platform.OS === 'ios' ? ['*'] : [live2dRoot]}
           scrollEnabled={false}
           bounces={false}
           allowFileAccess={true}

@@ -13,7 +13,13 @@
       "public/**/*"
     ],
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.sheepliu712.ailuotianyi",
+      "infoPlist": {
+        "NSPhotoLibraryUsageDescription": "AI小洛需要访问相册以选择图片发送给天依",
+        "NSCameraUsageDescription": "AI小洛需要调用相机拍摄图片发送给天依",
+        "NSMicrophoneUsageDescription": "AI小洛需要麦克风录制语音用于对话"
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -49,7 +55,8 @@
         }
       ],
       "expo-web-browser",
-      "expo-secure-store"
+      "expo-secure-store",
+      "./plugins/withLive2DIosAssets"
     ],
     "experiments": {
       "typedRoutes": true,
