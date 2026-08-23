@@ -1,7 +1,8 @@
 import { router } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { AuthService } from '../service/AuthService';
-import { WsTransport, WsCallbacks, SendTextPayload } from '../service/WsTransport';
+import { WsTransport, WsCallbacks, SendTextPayload, SendTouchPayload } from '../service/WsTransport';
+import { Live2DFacade, Live2DEvents } from '../service/Live2DFacade';
 import { AgentMessagePayload, ChatMessage, SendStatus, createSystemMessage } from '../model/ChatModels';
 
 const TAG = 'ChatPage';
@@ -13,7 +14,10 @@ struct ChatPage {
   @State inputText: string = '';
   @State agentState: string = '等待中';
   @State connectionText: string = '未连接';
+  @State modelLoaded: string = '';
   private transport: WsTransport | null = null;
+  private live2d: Live2DFacade | null = null;
+  private pageBound = false;
 
   aboutToAppear(): void {
     if (!AuthService.state.isLoggedIn) {
@@ -29,7 +33,7 @@ struct ChatPage {
         this.handleAgentMessage(payload);
       },
       onAgentStateChanged: (state: string) => {
-        this.agentState = state;
+        this.agentState = state === 'thinking' ? '思考中...' : (state === 'speaking' ? '说话中...' : state);
       },
       onError: (errorText: string) => {
         this.connectionText = errorText;
@@ -37,6 +41,29 @@ struct ChatPage {
       },
     };
 
+    const live2dEvents: Live2DEvents = {
+      onModelLoaded: (ok: boolean, error?: string) => {
+        if (this.live2d === null) {
+          return;
+        }
+        if (!this.pageBound && ok) {
+          // 模型就绪后补绑定桥（页面首次 onPageEnd 已 bind，这里作为兜底）
+          this.pageBound = true;
+        }
+        this.modelLoaded = ok ? '模型就绪' : `模型加载失败: ${error ?? ''}`;
+      },
+      onTouch: (touchArea: string, raw: string) => {
+        this.reportTouch(touchArea, raw);
+      },
+      onAudioStopped: () => {
+        hilog.info(0x0000, TAG, 'server audio stopped');
+      },
+      onAudioFinished: () => {
+        hilog.info(0x0000, TAG, 'server audio finished');
+      },
+    };
+
+    this.live2d = new Live2DFacade(live2dEvents);
     this.transport = new WsTransport(username, token, callbacks);
     this.transport.start();
     this.connectionText = '连接中...';
@@ -48,6 +75,10 @@ struct ChatPage {
       this.transport.stop();
       this.transport = null;
     }
+    if (this.live2d !== null) {
+      this.live2d.stopServerAudio();
+      this.live2d = null;
+    }
   }
 
   private pushSystemMessage(text: string): void {
@@ -55,26 +86,70 @@ struct ChatPage {
     this.messages = [...this.messages, m];
   }
 
+  /** agent_message 路由：文本展示 + 表情切换 + 音频分块投喂 + 幂等包处理 */
   private handleAgentMessage(payload: AgentMessagePayload): void {
-    const text = payload.text ?? '';
     const uuid = payload.uuid ?? `agent-${Date.now()}`;
-    if (payload.is_ephemeral === true) {
-      hilog.info(0x0000, TAG, 'ephemeral message, skip display: %{public}s', uuid);
+    const text = payload.text ?? '';
+    const displayInChat = payload.display_in_chat !== false;
+
+    // 文本展示路径
+    if (displayInChat && text.length > 0 && payload.is_ephemeral !== true) {
+      const m: ChatMessage = {
+        uuid: uuid,
+        type: 'text',
+        content: text,
+        isUser: false,
+        timestamp: Date.now(),
+        sendStatus: 'submitted',
+        audioAvailable: payload.audio !== null && payload.audio !== undefined && payload.audio.length > 0,
+        audioLocalUri: payload.audio ?? '',
+        audioPlayState: 'idle',
+      };
+      this.messages = [...this.messages, m];
+      hilog.info(0x0000, TAG, 'agent message: %{public}s', text.substr(0, 60));
+    }
+
+    // 表情路径
+    if (payload.expression !== null && payload.expression !== undefined && this.live2d !== null) {
+      this.live2d.setExpression(payload.expression);
+    }
+
+    // 音频路径：分块 base64 -> WebView JS 播放引擎；final 包结束流
+    if (this.live2d !== null) {
+      const audioChunk = payload.audio ?? '';
+      if (audioChunk.length > 0) {
+        this.live2d.feedAudioChunk(audioChunk, false);
+      }
+      if (payload.is_final_package === true) {
+        this.live2d.feedAudioChunk('', true);
+      }
+    }
+  }
+
+  /** 触摸上报：user_touch（对齐 useChatLogic sendTouch） */
+  private reportTouch(touchArea: string, raw: string): void {
+    if (this.transport === null || touchArea.length === 0) {
       return;
     }
-    const m: ChatMessage = {
-      uuid: uuid,
-      type: 'text',
-      content: text,
-      isUser: false,
-      timestamp: Date.now(),
-      sendStatus: 'submitted',
-      audioAvailable: payload.audio !== null && payload.audio !== undefined && payload.audio.length > 0,
-      audioLocalUri: payload.audio ?? '',
-      audioPlayState: 'idle',
-    };
-    this.messages = [...this.messages, m];
-    hilog.info(0x0000, TAG, 'agent message: %{public}s', text.substr(0, 60));
+    let frequency: Record<string, number> | null = null;
+    try {
+      const parsed = JSON.parse(raw) as Record<string, Object>;
+      if (parsed['clickFrequency'] !== undefined) {
+        const rawFreq = parsed['clickFrequency'] as Record<string, Object>;
+        const freq: Record<string, number> = {};
+        for (const k of Object.keys(rawFreq)) {
+          freq[k] = Number(rawFreq[k] ?? 0);
+        }
+        frequency = freq;
+      }
+    } catch (e) {
+      hilog.warn(0x0000, TAG, 'touch parse failed: %{public}s', (e as Error).message);
+    }
+    const payload: SendTouchPayload = { touch_area: touchArea };
+    if (frequency !== null) {
+      payload.click_frequency = frequency;
+    }
+    this.transport.sendWithAck('user_touch', payload, 10000, `t-${Date.now()}`);
   }
 
   private sendMessage(): void {
@@ -129,6 +204,9 @@ struct ChatPage {
       Row() {
         Text('洛天依').fontSize(18).fontWeight(FontWeight.Bold)
         Blank()
+        if (this.modelLoaded.length > 0) {
+          Text(this.modelLoaded).fontSize(12).fontColor('#999999').margin({ right: 8 })
+        }
         Text(this.agentState).fontSize(12).fontColor('#999999').margin({ right: 8 })
         Text(this.connectionText).fontSize(12).fontColor(
           this.connectionText === '未连接' ? '#E53935' : '#4CAF50')
@@ -136,6 +214,24 @@ struct ChatPage {
       .width('100%')
       .height(48)
       .padding({ left: 16, right: 16 })
+
+      // Live2D 区域（WebView，模型 + 服务端音频播放引擎）
+      if (this.live2d !== null) {
+        Web({ src: $rawfile('live2d/live2d.html'), controller: this.live2d.controller })
+          .width('100%')
+          .height('42%')
+          .javaScriptAccess(true)
+          .domStorageAccess(true)
+          .backgroundColor(Color.Transparent)
+          .onPageEnd(() => {
+            this.live2d?.bindBridge();
+            this.pageBound = true;
+            this.live2d?.debugLog('chapter page onPageEnd');
+          })
+          .onErrorReceive((event) => {
+            hilog.error(0x0000, TAG, 'webview error: %{public}s', String(event.error));
+          })
+      }
 
       // 消息列表
       List() {

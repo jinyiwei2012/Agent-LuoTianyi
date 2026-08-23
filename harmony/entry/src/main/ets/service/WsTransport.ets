@@ -58,6 +58,12 @@ export interface SendTextPayload {
   text: string;
 }
 
+/** user_touch payload（对齐 app ws_transport submitUserTouch 的字段） */
+export interface SendTouchPayload {
+  touch_area: string;
+  click_frequency?: Record<string, number>;
+}
+
 /** llm_response 成功负载 */
 interface LlmResponseOk {
   request_id: string;
