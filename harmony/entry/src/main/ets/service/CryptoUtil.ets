@@ -15,7 +15,7 @@ export interface EncryptResult {
  * RSA-OAEP + SHA-256 密码加密工具。
  * 严格对齐 app/utils/crypto.ts（node-forge）与服务端 Python padding.OAEP：
  *   - OAEP 主哈希 SHA-256
- *   - MGF1 哈希 SHA-256（cryptoFramework 的 RSA|PKCS1_OAEP|SHA256 MGF1 默认与主摘要一致）
+ *   - MGF1 哈希 SHA-256（算法串必须显式写 MGF1_SHA256；cryptoFramework 无默认跟随主摘要行为）
  *   - OAEP label 为空
  */
 
@@ -63,18 +63,19 @@ export function encryptPasswordWithPem(password: string, publicKeyPem: string): 
     // 3. UTF-8 编码密码
     const passwordData: Uint8Array = new util.TextEncoder().encodeInto(password);
 
-    // 4. RSA-OAEP-SHA256 加密（一次性 update + doFinal）
-    const cipher = cryptoFramework.createCipher('RSA|PKCS1_OAEP|SHA256');
+    // 4. RSA-OAEP-SHA256 加密。
+    //    关键约束（与 app 端 node-forge、服务端 Python padding.OAEP 严格对齐）：
+    //    - createCipher 的 transformation 只描述算法，密钥长度从导入密钥推导，
+    //      故算法串不带 RSA2048 密钥长度前缀（带前缀会报 create C cipher fail）。
+    //    - 算法串必须 4 段式：RSA|PKCS1_OAEP|摘要md|掩码摘要mgf1_md；
+    //      服务端为 padding.OAEP(mgf=MGF1(SHA256), algorithm=SHA256)，故必须显式写 MGF1_SHA256。
+    //    - RSA 非对称加解密不支持 update/updateSync，必须在 init 后直接 doFinalSync。
+    const cipher = cryptoFramework.createCipher('RSA|PKCS1_OAEP|SHA256|MGF1_SHA256');
     cipher.initSync(cryptoFramework.CryptoMode.ENCRYPT_MODE, pubKey, null);
-    const encData = cipher.updateSync({ data: passwordData });
-    const finalData = cipher.doFinalSync(null);
-
-    const combined = new Uint8Array(encData.data.length + finalData.data.length);
-    combined.set(encData.data, 0);
-    combined.set(finalData.data, encData.data.length);
+    const encryptedData = cipher.doFinalSync({ data: passwordData });
 
     // 5. base64 输出（encodeSync 返回 base64 字符字节）
-    const encBytes: Uint8Array = base64Helper.encodeSync(combined);
+    const encBytes: Uint8Array = base64Helper.encodeSync(encryptedData.data);
     const encrypted = bytesToUtf8String(encBytes);
     hilog.info(0x0000, TAG, 'encrypt ok, len=%{public}d', encrypted.length);
     const okResult: EncryptResult = { ok: true, encrypted: encrypted, reason: '' };
