@@ -686,6 +686,8 @@ struct ChatPage {
         .padding({ left: 12, right: 12, top: 18, bottom: 16 })
         .backgroundColor(this.getTheme().surface)
         .border({ width: { right: 1 }, color: this.getTheme().border })
+        .align(Alignment.Start)
+        .position({ x: 0, y: 0 })
         .zIndex(100)
       }
 
