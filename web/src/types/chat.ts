@@ -10,7 +10,8 @@ export interface ChatMessage {
   timestamp?: number;
   sendStatus?: SendStatus;
   audioAvailable?: boolean;
-  audioLocalUri?: string;
+  /** Web 版：音频以 base64 形式存于内存，无本地文件路径 */
+  audioBase64?: string;
   audioPlayState?: AudioPlayState;
 }
 
