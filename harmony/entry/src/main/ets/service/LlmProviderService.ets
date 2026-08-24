@@ -36,10 +36,10 @@ export interface ModelTypesResponse {
  * - fetchModelsList:  GET <base_url>/models (Bearer) 探测校验，不耗时/不消耗 Token
  */
 export class LlmProviderService {
-  /** 获取客户端模型类型（服务端下发 LLM/VLM 支持项） */
+  /** 获取客户端模型类型（服务端下发 LLM/VLM 支持项），30s 超时 */
   static async fetchModelTypes(serverBaseUrl: string): Promise<ModelTypesResponse> {
     const client = new HttpClient(serverBaseUrl);
-    const r = await client.requestJson('/llm/providers', http.RequestMethod.GET, null);
+    const r = await client.requestJson('/llm/providers', http.RequestMethod.GET, null, undefined, 30000);
     if (!r.ok) {
       hilog.error(0x0000, TAG, 'llm/providers failed: %{public}d', r.status);
       return { types: [] };
@@ -54,11 +54,11 @@ export class LlmProviderService {
     return { types: types };
   }
 
-  /** 探测校验：GET <base_url>/models，返回模型 id 列表；异常抛错 */
+  /** 探测校验：GET <base_url>/models，返回模型 id 列表；异常抛错，30s 超时 */
   static async fetchModelsList(baseUrl: string, apiKey: string): Promise<string[]> {
     const client = new HttpClient(baseUrl.replace(/\/+$/, ''));
     const r = await client.requestJson('/models', http.RequestMethod.GET, null,
-      { 'Authorization': `Bearer ${apiKey}` });
+      { 'Authorization': `Bearer ${apiKey}` }, 30000);
     if (!r.ok) {
       throw new Error(`HTTP ${r.status}`);
     }

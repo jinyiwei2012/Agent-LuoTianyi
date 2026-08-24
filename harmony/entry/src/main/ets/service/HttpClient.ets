@@ -28,7 +28,7 @@ export class HttpClient {
   }
 
   async requestJson(path: string, method: http.RequestMethod, body: string | null,
-    extraHeader?: Record<string, string>): Promise<HttpResult> {
+    extraHeader?: Record<string, string>, timeoutMs: number = API_TIMEOUT_MS): Promise<HttpResult> {
     const httpRequest = http.createHttp();
     try {
       const headerMap: Record<string, string> = {
@@ -42,8 +42,8 @@ export class HttpClient {
       const options: http.HttpRequestOptions = {
         method: method,
         header: headerMap,
-        readTimeout: API_TIMEOUT_MS,
-        connectTimeout: API_TIMEOUT_MS,
+        readTimeout: timeoutMs,
+        connectTimeout: timeoutMs,
       };
       if (body !== null) {
         options.extraData = body;
