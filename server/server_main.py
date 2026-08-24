@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, WebSocket, WebSocketDisconnect, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import os
 import sys
@@ -41,6 +42,7 @@ from src.utils.helpers import load_config
 from src.utils.logger import get_logger, install_access_log_filter
 from src.system.network_helper import (
     register_project_plan,
+    register_web_ui,
     require_bearer_token,
     runtime_not_ready_detail,
 )
@@ -81,6 +83,16 @@ def get_runtime():
     return runtime
 
 app = FastAPI(lifespan=startup_event)
+
+# CORS：允许 Web 网页版跨域访问 HTTP 接口（WebSocket 由浏览器策略宽松处理）。
+# Web 前端默认连接绝对 BASE_URL（跨域），因此需要放开来源；也可收紧为具体前端来源。
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ——————————————————————————————————————————————————————————————————
 # 主要的 API 路由定义
@@ -460,6 +472,10 @@ async def update_image_client_path(
     """
     logger.info(f"Update image client path request from {request.username} for {request.uuid}")
     return await system_runtime.user_interface.update_image_client_path(request, system_runtime)
+
+
+# 注册 Web 网页版静态托管（放在所有 API 路由之后，作为 SPA fallback）
+register_web_ui(app, current_dir)
 
 
 if __name__ == "__main__":
