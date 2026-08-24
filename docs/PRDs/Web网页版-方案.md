@@ -2,6 +2,7 @@
 
 ## 更新日志
 - 2026-08-24：创建第一版方案文档，完成可行性分析、技术选型、Web 适配拆解与实施路径。
+- 2026-08-24：完成阶段二独立 Web 前端技术栈调研（本地代码核对 + 外部来源），确定 **React + Vite（SPA）** 为推荐方案，归入 §5.3。
 
 ## 1. 背景与动机
 AgentLuo 目前提供三种客户端形态：
@@ -68,9 +69,9 @@ AgentLuo 目前提供三种客户端形态：
 - 适配 4.2 中的四块（Live2D、音频、存储、WebView bridge）。
 - 适合：快速验证可行性、个人使用、局域网访问、演示。
 
-**阶段二：独立 Web 前端（可选，质量更高）**
-- 不复用 RN 组件，用 React + Vite/Next.js 重写专为 Web 优化的界面（桌面宽屏布局：Live2D 侧边、聊天主区）。
-- 服务端 HTTP + WebSocket 接口完全复用，只写前端。
+**阶段二：独立 Web 前端（正式产品形态，质量更高）**
+- 不复用 RN 组件，用 **React + Vite（SPA）** 重写专为 Web 优化的界面（桌面宽屏布局：Live2D 侧边、聊天主区）。
+- 服务端 HTTP + WebSocket 接口完全复用，只写前端；业务逻辑层直接复用 `app/utils/` 的 2922 行 TypeScript（选型依据见 §5.3）。
 - 适合：作为正式产品形态、需要更好的桌面体验时。
 
 **推荐：先做阶段一，达到可用后按需演进到阶段二。**
@@ -81,6 +82,50 @@ AgentLuo 目前提供三种客户端形态：
 - 将 Web 前端 build 产物交由 FastAPI 服务托管（类似现有 `admin_ui` 的处理方式）。
 - 同一端口/域名同时提供聊天页面与管理控制台，用户访问一个网址即可使用，无需单独部署前端。
 - 备选：独立静态托管（Nginx / GitHub Pages / 对象存储），Web 前端通过 HTTP/WS 连接独立部署的 FastAPI 服务端。
+
+### 5.3 阶段二技术栈选型：React + Vite（SPA）
+#### 5.3.1 结论
+阶段二独立 Web 前端采用 **React 19 + Vite + TypeScript 纯 SPA**，状态管理使用 Zustand，长列表使用 `@tanstack/react-virtual`。**明确不采用 Next.js**。
+
+该结论由本项目四个硬约束（WebSocket 双工实时、流式音频、Live2D/PixiJS、FastAPI 静态托管）与一个独有资产（`app/` 下 2922 行可复用 TypeScript）共同推演得出，依据如下。
+
+#### 5.3.2 核心决策依据：可复用代码
+核对 `app/utils/` 全部 18 个 TS 文件，共 2922 行：
+
+| 文件 | 行数 | 与 React Native 耦合 |
+| --- | --- | --- |
+| `message_processor.ts` | 775 | 仅 1 行 `import { AppState }` |
+| `ws_transport.ts` | 556 | 仅 1 行 `import { AppState }` |
+| 其余 16 个文件（`crypto.ts` 119、`chat_stream.ts` 161、`network_client.ts` 139、`binder.ts` 72、`dynamics.ts` 191、`getHistory.ts` 185 等） | 1591 | **零依赖** |
+
+即 **99.9% 的逻辑代码可直接搬入 Web 前端**，仅需把 2 处 `AppState`（前后台检测）替换为浏览器 `visibilitychange`。`hooks/useChatLogic.ts`（约 400 行）使用的 `useState/useCallback/useEffect/useRef` 均为标准 React API，RN 专属部分仅 3 个组件：`FlatList`（→ `@tanstack/react-virtual`）、`WebView`（→ 直接 canvas，音频从 `injectJavaScript` 桥改为直接调用 Web Audio API，架构反而更简单）、`ImagePicker`（→ `<input type="file">`）。
+
+> 选 React 的决定性优势：React hooks 状态机（聊天逻辑、音频优先级互斥等）**语义 100% 保留**，直接移植；若选 Vue/Svelte/Solid，纯 TS 工具可复用，但 hooks 状态机必须重写为 composable / runes / signals，回归风险完全不同量级。
+
+#### 5.3.3 候选方案对比
+| 维度 | **React + Vite** ✅ | Next.js | Vue 3 + Vite | SvelteKit / Svelte 5 | SolidStart / Solid |
+| --- | --- | --- | --- | --- | --- |
+| WebSocket 实时聊天 | ★★★★★ 无 SSR 障碍 | ★★☆ 必须 client-only + useEffect，serverless 平台不支持长连接 | ★★★★★ | ★★★★★ | ★★★★★ |
+| 流式音频（base64 分块） | ★★★★★ 框架无关 | ★★★★ | ★★★★★ | ★★★★★ | ★★★★★ |
+| Live2D/PixiJS 集成 | ★★★★★ 先例最多，含同构项目 | ★★★☆ 有踩坑笔记 | ★★★★★ vue-live2d / tsukuyomi-space 先例 | ★★★☆ 无先例 | ★★☆ 无先例 |
+| 复用 `app/` 2922 行 TS 逻辑 | ★★★★★ 16/18 文件零改动 + hooks 原样保留 | ★★★★★ 同左（但被 SSR 约束抵消） | ★★★★ 纯 TS 可搬，hooks 需重写 | ★★★ 纯 TS 可搬，hooks 需重写 runes | ★★★ 纯 TS 可搬，hooks 需重写 signals |
+| FastAPI 静态托管 | ★★★★★ 仓库已有同款模式（ui_register.py） | ★★☆ 静态导出禁核心特性，否则要 Node server | ★★★★★ 同 Vite | ★★★★ adapter-static 有坑 | ★★★ Nitro 配置复杂 |
+| 中文文档/社区 | ★★★★★ | ★★★★ | ★★★★★（略胜） | ★★★ | ★★ |
+| 构建/部署复杂度 | ★★★★★ dist 一个目录 | ★★☆ 两层选择（export vs server） | ★★★★★ | ★★★★ | ★★★ |
+| **综合** | **🥇 首选** | 🥉 收益为零、成本全担 | 🥈 合理次选 | 不推荐 | 不推荐 |
+
+#### 5.3.4 关键决策依据详解
+1. **SSR 对实时聊天应用是负优化（业界共识）**。中文圈最大的 AI 聊天开源应用 LobeChat 正将页面从 SSR 反向迁移回 SPA，原话："对 lobechat 来说，SSR 的好处没落到多少，问题倒是接了个全……高频操作、需要授权才能用的场景，本身没有 SEO 诉求，SPA 的类客户端模式是首选"。Next.js 官方仓库讨论区社区共识同样明确："Client-side. Period. SSR optimizes for strangers. Dashboards serve authenticated users with live data."
+2. **WebSocket 与 Next.js 架构天生错配**。websocket.org 官方指南（2026-03）：*"WebSockets are a persistent connection protocol. These two things do not fit together naturally"*。App Router 中 WebSocket 只能在 `useEffect` 中实例化；serverless 平台（Vercel/Netlify）不支持长连接。
+3. **Next.js 静态托管死结**：`output: 'export'` 会禁掉 Server Actions、API 路由、middleware、ISR、rewrites、headers、image 优化等核心特性；不开静态导出则必须 Node server，违背"FastAPI 单进程托管"目标。
+4. **Live2D 生态先例**：与本项目**几乎 1:1 同构**的先例是 [AI-Desktop-Pet](https://github.com/ruguo0119/AI-Desktop-Pet)（React 18 + Vite 6 + PixiJS 6 + pixi-live2d-display + WebSocket + **FastAPI 后端** + TTS/STT + 对话状态机）。Vue 侧完整先例为 [tsukuyomi-space](https://github.com/redchenk/tsukuyomi-space)（Vue 3 + Vite + Live2D Cubism + 浏览器侧 LLM 聊天 + TTS）。Svelte/Solid 阵营未检索到"AI 聊天 + Live2D"完整先例。
+5. **中文生态**：React / Vue 均为第一梯队（官方中文文档完备、国产组件生态、中文社区活跃）；Svelte 中文资料相对稀缺；Solid 中文资料最少、国内几乎无招聘需求。本项目 UI 自研为主，组件库差异影响小，但踩坑资料可获取性是长期维护风险。
+
+#### 5.3.5 关键技术坑（写进实施清单）
+1. **PixiJS 版本坑**：`pixi-live2d-display` v0.4.0 基于 **PixiJS v6**，与 v7 不兼容（v7 的 shader 检查会拒绝 Live2D shader）。建议直接用 [oh-my-live2d](https://github.com/oh-my-live2d/oh-my-live2d)（内置 PixiJS v6 + Cubism2/5 SDK，规避版本冲突）；若需深度定制（触摸区域、表情映射现有 `live2d_helper.ts`），锁定 `pixi.js@^6` + `pixi-live2d-display@0.4`。
+2. **RN AppState 替换**：`ws_transport.ts` / `message_processor.ts` 各 1 处，改为 `document.visibilityState`。
+3. **Web 音频架构简化**：RN 用 WebView `injectJavaScript` 桥喂音频，Web 端直接调用 Web Audio API / `<audio>`，保留消息协议与音频优先级互斥逻辑即可。
+4. **状态管理**：Zustand（LobeChat 同款，中文资料充足）。
 
 ## 6. 关键现实考量
 ### 6.1 CORS / 跨域
@@ -131,7 +176,20 @@ Web 页面与服务端若不同源，需要服务端配置 CORS（FastAPI `CORSM
 7. 服务端 CORS 与 HTTPS 配置正确，无混合内容 / 跨域报错。
 
 ## 10. 参考
+**仓库内**
 - 现有 Web 输出配置：`app/package.json` 的 `web` 脚本、`app/app.json` 的 `web.output`。
-- 服务端静态托管先例：`server/res/admin_ui/admin_static/`。
-- 通信层：`app/utils/ws_transport.ts`、`app/utils/chat_stream.ts`、`app/utils/message_processor.ts`。
+- 服务端静态托管先例：`server/src/system/admin/ui_register.py`（`StaticFiles` + `/{path:path}` fallback 模式）、`server/res/admin_ui/admin_static/`。
+- 可复用逻辑层：`app/utils/ws_transport.ts`、`app/utils/chat_stream.ts`、`app/utils/message_processor.ts`、`app/utils/crypto.ts`、`app/hooks/useChatLogic.ts`。
 - Live2D 承载：`app/utils/live2d_helper.ts`、`app/public/live2d/live2d.html`。
+
+**外部（技术栈调研来源）**
+- [LobeChat Discussion #9209：SSR → SPA 反向迁移实录](https://github.com/lobehub/lobehub/discussions/9209)
+- [vercel/next.js Discussion #91475：应用走客户端渲染的社区共识](https://github.com/vercel/next.js/discussions/91475)
+- [websocket.org: WebSockets with Next.js（2026-03）](https://websocket.org/guides/frameworks/nextjs/)
+- [Next.js 官方 Static Exports 文档（Unsupported Features 清单）](https://nextjs.org/docs/app/guides/static-exports)
+- [SvelteKit adapter-static 官方文档](https://svelte.dev/docs/kit/adapter-static)、[kit issue #14471](https://github.com/sveltejs/kit/issues/14471)、[#15150](https://github.com/sveltejs/kit/issues/15150)
+- [SolidStart v2 部署文档](https://docs.solidjs.com/solid-start/v2/guides/deployment-plugins)、[SPA discussion #1398](https://github.com/solidjs/solid-start/discussions/1398)
+- [oh-my-live2d（内置 PixiJS v6 + Cubism2/5 的框架无关组件）](https://github.com/oh-my-live2d/oh-my-live2d)
+- [AI-Desktop-Pet（React + Vite + PixiJS6 + FastAPI 同构先例）](https://github.com/ruguo0119/AI-Desktop-Pet)
+- [tsukuyomi-space（Vue3 + Vite + Live2D + LLM 聊天先例）](https://github.com/redchenk/tsukuyomi-space)
+- [2026 前端框架横评（中文社区生态数据）](https://jishuzhan.net/article/2085492165102157825)、[掘金框架对比](https://juejin.cn/post/7508648111486550031)
