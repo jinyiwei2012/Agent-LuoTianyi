@@ -1,13 +1,6 @@
 # dependencies
 node_modules/
 
-# build output
-dist/
-dist-ssr/
-
-# typescript
-*.tsbuildinfo
-
 # local env files
 .env*.local
 
