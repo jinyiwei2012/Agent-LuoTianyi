@@ -8,6 +8,7 @@ import { LlmConfigStore } from '../service/LlmConfigStore';
 import { ImagePicker } from '../service/ImagePicker';
 import { HistoryService } from '../service/HistoryService';
 import { RawfileScheme } from '../service/RawfileScheme';
+import { Theme, MSG_FONT_SIZE, BUBBLE_PADDING_V, BUBBLE_PADDING_H, BUBBLE_RADIUS, BUBBLE_TAIL_RADIUS, BUBBLE_MAX_WIDTH, LIVE2D_HEIGHT_RATIO } from '../common/Theme';
 import { AgentMessagePayload, ChatMessage, SendStatus, createSystemMessage } from '../model/ChatModels';
 
 const TAG = 'ChatPage';
@@ -254,17 +255,17 @@ struct ChatPage {
     Column() {
       // 顶栏
       Row() {
-        Text('洛天依').fontSize(18).fontWeight(FontWeight.Bold)
+        Text('洛天依').fontSize(18).fontWeight(FontWeight.Bold).fontColor(Theme.text)
         Blank()
         if (this.modelLoaded.length > 0) {
-          Text(this.modelLoaded).fontSize(12).fontColor('#999999').margin({ right: 8 })
+          Text(this.modelLoaded).fontSize(12).fontColor(Theme.textMuted).margin({ right: 8 })
         }
-        Text(this.agentState).fontSize(12).fontColor('#999999').margin({ right: 8 })
+        Text(this.agentState).fontSize(12).fontColor(Theme.textMuted).margin({ right: 8 })
         Text(this.connectionText).fontSize(12).fontColor(
-          this.connectionText === '未连接' ? '#E53935' : '#4CAF50')
+          this.connectionText === '未连接' ? Theme.dangerText : '#4CAF50')
         Text('设置')
           .fontSize(13)
-          .fontColor('#007DFF')
+          .fontColor(Theme.accentText)
           .margin({ left: 8 })
           .onClick(() => {
             router.pushUrl({ url: 'pages/SettingsPage' });
@@ -273,13 +274,14 @@ struct ChatPage {
       .width('100%')
       .height(48)
       .padding({ left: 16, right: 16 })
+      .backgroundColor(Theme.safeArea)
 
       // Live2D 区域（WebView，模型 + 服务端音频播放引擎；
       // 自定义 scheme 拦截 rawfile 资源，绕开 resource:// 不支持 fetch/XHR）
       if (this.live2d !== null) {
         Web({ src: 'live2d://live2d.html', controller: this.live2d.controller })
           .width('100%')
-          .height('42%')
+          .height(LIVE2D_HEIGHT_RATIO)
           .javaScriptAccess(true)
           .domStorageAccess(true)
           .backgroundColor(Color.Transparent)
@@ -302,34 +304,57 @@ struct ChatPage {
         ForEach(this.messages, (m: ChatMessage) => {
           ListItem() {
             Row() {
-              if (m.isUser) {
-                Blank().width(60)
+              if (m.type === 'system') {
+                Text(m.content)
+                  .fontSize(14)
+                  .fontColor(Theme.systemMessageText)
+                  .width('100%')
+                  .textAlign(TextAlign.Center)
+                  .padding({ left: 24, right: 24, top: 5, bottom: 5 })
+              } else if (m.isUser) {
                 Column() {
                   if (m.type === 'image') {
                     Image(m.content)
                       .width(180)
                       .height(180)
-                      .borderRadius(12)
+                      .borderRadius(BUBBLE_RADIUS)
                       .objectFit(ImageFit.Cover)
+                      .margin({ left: BUBBLE_PADDING_H, top: BUBBLE_PADDING_V, bottom: BUBBLE_PADDING_V })
                   } else {
                     Text(m.content)
-                      .fontSize(15)
-                      .padding(12)
-                      .borderRadius(12)
-                      .backgroundColor('#007DFF')
-                      .fontColor(Color.White)
+                      .fontSize(MSG_FONT_SIZE)
+                      .padding({ left: BUBBLE_PADDING_H, right: BUBBLE_PADDING_H, top: BUBBLE_PADDING_V, bottom: BUBBLE_PADDING_V })
+                      .borderRadius(BUBBLE_RADIUS)
+                      .borderRadius({ topLeft: BUBBLE_RADIUS, topRight: BUBBLE_RADIUS, bottomLeft: BUBBLE_RADIUS, bottomRight: BUBBLE_TAIL_RADIUS })
+                      .backgroundColor(Theme.userBubble)
+                      .fontColor(Theme.userBubbleText)
+                      .constraintSize({ maxWidth: BUBBLE_MAX_WIDTH })
                   }
-                }.alignItems(HorizontalAlign.End)
+                }
+                .layoutWeight(1)
+                .alignItems(HorizontalAlign.End)
               } else {
                 Column() {
-                  Text(m.content)
-                    .fontSize(15)
-                    .padding(12)
-                    .borderRadius(12)
-                    .backgroundColor('#F2F2F2')
-                    .fontColor('#333333')
-                }.alignItems(HorizontalAlign.Start)
-                Blank().width(60)
+                  if (m.type === 'image') {
+                    Image(m.content)
+                      .width(180)
+                      .height(180)
+                      .borderRadius(BUBBLE_RADIUS)
+                      .objectFit(ImageFit.Cover)
+                      .margin({ right: BUBBLE_PADDING_H, top: BUBBLE_PADDING_V, bottom: BUBBLE_PADDING_V })
+                  } else {
+                    Text(m.content)
+                      .fontSize(MSG_FONT_SIZE)
+                      .padding({ left: BUBBLE_PADDING_H, right: BUBBLE_PADDING_H, top: BUBBLE_PADDING_V, bottom: BUBBLE_PADDING_V })
+                      .borderRadius(BUBBLE_RADIUS)
+                      .borderRadius({ topLeft: BUBBLE_RADIUS, topRight: BUBBLE_RADIUS, bottomLeft: BUBBLE_TAIL_RADIUS, bottomRight: BUBBLE_RADIUS })
+                      .backgroundColor(Theme.botBubble)
+                      .fontColor(Theme.bubbleText)
+                      .constraintSize({ maxWidth: BUBBLE_MAX_WIDTH })
+                  }
+                }
+                .layoutWeight(1)
+                .alignItems(HorizontalAlign.Start)
               }
             }
             .width('100%')
@@ -340,34 +365,44 @@ struct ChatPage {
       .width('100%')
       .layoutWeight(1)
       .padding({ left: 12, right: 12 })
+      .backgroundColor(Theme.chatList)
 
       // 输入区
       Row({ space: 8 }) {
         TextInput({ placeholder: '对洛天依说点什么...', text: this.inputText })
           .layoutWeight(1)
-          .height(44)
-          .borderRadius(22)
-          .backgroundColor('#F2F2F2')
+          .height(40)
+          .borderRadius(20)
+          .backgroundColor(Theme.inputBackground)
+          .fontColor(Theme.inputText)
+          .placeholderColor(Theme.placeholder)
+          .border({ width: 1, color: Theme.inputBorder })
           .onChange((v: string) => {
             this.inputText = v;
           })
         Button('图片')
-          .backgroundColor('#90A4AE')
-          .height(44)
+          .backgroundColor(Theme.accentSoft)
+          .fontColor(Theme.accentText)
+          .height(40)
+          .borderRadius(20)
           .onClick(() => {
             this.sendImage();
           })
         Button('发送')
-          .backgroundColor('#007DFF')
-          .height(44)
+          .backgroundColor(Theme.accent)
+          .fontColor(Theme.text)
+          .height(40)
+          .borderRadius(20)
           .onClick(() => {
             this.sendMessage();
           })
       }
       .width('100%')
-      .padding({ left: 12, right: 12, top: 8, bottom: 16 })
+      .padding({ left: 12, right: 12, top: 8, bottom: 12 })
+      .backgroundColor(Theme.inputBar)
     }
     .width('100%')
     .height('100%')
+    .backgroundColor(Theme.root)
   }
 }
