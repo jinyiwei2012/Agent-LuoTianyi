@@ -5,7 +5,8 @@
 #   any "BUILD FAILED" | "COMPILE RESULT:FAIL" | "Error Message:" in NEW log lines => exit 1
 
 param(
-    [string]$Task = "assembleHap"
+    [string]$Task = "assembleHap",
+    [string]$BuildMode = "debug"
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,7 +39,7 @@ if (Test-Path $buildLog) {
 }
 
 # First build outputs unsigned HAP; configure signingConfigs in DevEco Studio for signed builds
-$taskArg = "$Task --mode module -p product=default -p buildMode=debug --no-daemon"
+$taskArg = "$Task --mode module -p product=default -p buildMode=$BuildMode --no-daemon"
 
 Write-Host "==> hvigorw $taskArg" -ForegroundColor Cyan
 # Run via cmd /c: keeps hvigor stderr raw (PS 5.1 would wrap it as RemoteException noise)

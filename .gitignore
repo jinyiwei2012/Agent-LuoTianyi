@@ -17,6 +17,13 @@ venv/
 Thumbs.db
 .DS_Store
 
+# Office 临时/锁文件
+~$*
+
+# Node / 项目运行时
+node_modules/
+.omo/
+
 songlearner/
 
 # Logs
