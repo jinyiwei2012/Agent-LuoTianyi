@@ -218,4 +218,37 @@ export class DynamicsService {
       return null;
     }
   }
+
+  /** 动态未读状态（对齐 app getDynamicUnreadStatus, GET /dynamics/unread） */
+  static async getUnreadStatus(): Promise<DynamicUnreadStatus> {
+    const client = await DynamicsService.withClient();
+    if (client === null) {
+      const empty: DynamicUnreadStatus = { has_unread: false, unread_count: 0 };
+      return empty;
+    }
+    try {
+      const query = `username=${encodeURIComponent(AuthService.state.username)}`;
+      const r = await client.requestJson(`/dynamics/unread?${query}`,
+        http.RequestMethod.GET, null, DynamicsService.authHeader());
+      if (!r.ok) {
+        const empty: DynamicUnreadStatus = { has_unread: false, unread_count: 0 };
+        return empty;
+      }
+      const ok: DynamicUnreadStatus = {
+        has_unread: r.data['has_unread'] === true,
+        unread_count: Number(r.data['unread_count'] ?? 0),
+      };
+      return ok;
+    } catch (e) {
+      hilog.error(0x0000, TAG, 'getUnreadStatus error: %{public}s', (e as Error).message);
+      const empty: DynamicUnreadStatus = { has_unread: false, unread_count: 0 };
+      return empty;
+    }
+  }
+}
+
+/** 动态未读状态接口（显式） */
+export interface DynamicUnreadStatus {
+  has_unread: boolean;
+  unread_count: number;
 }
