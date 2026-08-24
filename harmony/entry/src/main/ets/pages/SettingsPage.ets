@@ -3,6 +3,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { AuthService } from '../service/AuthService';
 import { SecurityStore } from '../service/SecurityStore';
 import { PreferencesService, UserPreferences } from '../service/PreferencesService';
+import { Theme } from '../common/Theme';
 
 const TAG = 'SettingsPage';
 
@@ -74,33 +75,38 @@ struct SettingsPage {
     Scroll() {
       Column({ space: 16 }) {
         Row() {
-          Text('设置').fontSize(20).fontWeight(FontWeight.Bold)
+          Text('设置').fontSize(20).fontWeight(FontWeight.Bold).fontColor(Theme.text)
           Blank()
-          Button('返回').fontSize(13).onClick(() => {
+          Button('返回').fontSize(13).backgroundColor(Theme.surfaceAlt).fontColor(Theme.text).onClick(() => {
             router.back();
           })
         }.width('100%')
 
         // 服务器地址
         Column({ space: 10 }) {
-          Text('服务器地址').fontSize(15).fontWeight(FontWeight.Bold)
+          Text('服务器地址').fontSize(15).fontWeight(FontWeight.Bold).fontColor(Theme.text)
           TextInput({ placeholder: 'https://example.com', text: this.serverUrl })
+            .fontColor(Theme.inputText)
+            .placeholderColor(Theme.placeholder)
+            .backgroundColor(Theme.inputBackground)
+            .border({ width: 1, color: Theme.inputBorder })
+            .borderRadius(10)
             .onChange((v: string) => { this.serverUrl = v; })
-          Button('保存服务器地址').backgroundColor('#007DFF').onClick(() => {
+          Button('保存服务器地址').backgroundColor(Theme.accent).fontColor(Theme.text).onClick(() => {
             this.saveServerUrl();
           })
         }
         .width('100%')
         .padding(12)
         .borderRadius(8)
-        .backgroundColor('#FFFFFF')
+        .backgroundColor(Theme.surface)
 
         // LLM 模型设置入口
         Column() {
           Row() {
-            Text('LLM 模型设置').fontSize(15)
+            Text('LLM 模型设置').fontSize(15).fontColor(Theme.text)
             Blank()
-            Button('前往').fontSize(13).onClick(() => {
+            Button('前往').fontSize(13).backgroundColor(Theme.accentSoft).fontColor(Theme.accentText).onClick(() => {
               router.pushUrl({ url: 'pages/LlmSettingsPage' });
             })
           }.width('100%')
@@ -108,14 +114,14 @@ struct SettingsPage {
         .width('100%')
         .padding(12)
         .borderRadius(8)
-        .backgroundColor('#FFFFFF')
+        .backgroundColor(Theme.surface)
 
         // 动态入口
         Column() {
           Row() {
-            Text('动态').fontSize(15)
+            Text('动态').fontSize(15).fontColor(Theme.text)
             Blank()
-            Button('前往').fontSize(13).onClick(() => {
+            Button('前往').fontSize(13).backgroundColor(Theme.accentSoft).fontColor(Theme.accentText).onClick(() => {
               router.pushUrl({ url: 'pages/DynamicsPage' });
             })
           }.width('100%')
@@ -123,36 +129,58 @@ struct SettingsPage {
         .width('100%')
         .padding(12)
         .borderRadius(8)
-        .backgroundColor('#FFFFFF')
+        .backgroundColor(Theme.surface)
 
         // 偏好设置
         Column({ space: 10 }) {
-          Text('相处模式偏好').fontSize(15).fontWeight(FontWeight.Bold)
+          Text('相处模式偏好').fontSize(15).fontWeight(FontWeight.Bold).fontColor(Theme.text)
           if (this.loadingPrefs) {
-            Text('加载中...').fontSize(13).fontColor('#999999')
+            Text('加载中...').fontSize(13).fontColor(Theme.textMuted)
           } else {
             TextInput({ placeholder: '关系（如：朋友/恋人）', text: this.relationship })
+              .fontColor(Theme.inputText)
+              .placeholderColor(Theme.placeholder)
+              .backgroundColor(Theme.inputBackground)
+              .border({ width: 1, color: Theme.inputBorder })
+              .borderRadius(10)
               .onChange((v: string) => { this.relationship = v; })
             TextInput({ placeholder: '说话风格', text: this.speakingStyle })
+              .fontColor(Theme.inputText)
+              .placeholderColor(Theme.placeholder)
+              .backgroundColor(Theme.inputBackground)
+              .border({ width: 1, color: Theme.inputBorder })
+              .borderRadius(10)
               .onChange((v: string) => { this.speakingStyle = v; })
             TextInput({ placeholder: '人设补充文本', text: this.personalityText })
+              .fontColor(Theme.inputText)
+              .placeholderColor(Theme.placeholder)
+              .backgroundColor(Theme.inputBackground)
+              .border({ width: 1, color: Theme.inputBorder })
+              .borderRadius(10)
               .onChange((v: string) => { this.personalityText = v; })
             TextArea({ placeholder: '自定义背景上下文', text: this.customContext })
               .height(100)
+              .fontColor(Theme.inputText)
+              .placeholderColor(Theme.placeholder)
+              .backgroundColor(Theme.inputBackground)
+              .border({ width: 1, color: Theme.inputBorder })
+              .borderRadius(10)
               .onChange((v: string) => { this.customContext = v; })
             Button(this.savingPrefs ? '保存中...' : '保存偏好')
-              .backgroundColor('#007DFF')
+              .backgroundColor(Theme.accent)
+              .fontColor(Theme.text)
               .onClick(() => { this.savePreferences(); })
           }
         }
         .width('100%')
         .padding(12)
         .borderRadius(8)
-        .backgroundColor('#FFFFFF')
+        .backgroundColor(Theme.surface)
 
         // 登出
         Button('退出登录')
-          .backgroundColor('#E53935')
+          .backgroundColor(Theme.dangerText)
+          .fontColor(Color.White)
           .width('100%')
           .onClick(() => { this.logout(); })
       }
@@ -161,6 +189,6 @@ struct SettingsPage {
     }
     .width('100%')
     .height('100%')
-    .backgroundColor('#F5F5F5')
+    .backgroundColor(Theme.chatList)
   }
 }

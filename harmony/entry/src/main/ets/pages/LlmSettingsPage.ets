@@ -3,6 +3,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { SecurityStore } from '../service/SecurityStore';
 import { LlmConfigStore, LlmModuleConfig, LlmCapabilities } from '../service/LlmConfigStore';
 import { LlmProviderService, ModelType, ModelProvider, ProviderModel } from '../service/LlmProviderService';
+import { Theme } from '../common/Theme';
 
 const TAG = 'LlmSettingsPage';
 
@@ -128,13 +129,13 @@ struct LlmModuleForm {
       }.width('100%')
 
       if (this.probeResult.length > 0) {
-        Text(this.probeResult).fontSize(12).fontColor('#666666')
+        Text(this.probeResult).fontSize(12).fontColor(Theme.textMuted)
       }
     }
     .width('100%')
     .padding(12)
     .borderRadius(8)
-    .backgroundColor('#FFFFFF')
+    .backgroundColor(Theme.surface)
     .margin({ bottom: 12 })
   }
 }
@@ -214,10 +215,10 @@ struct LlmSettingsPage {
       .padding({ left: 16, right: 16 })
 
       if (this.loading) {
-        Text('加载中...').margin({ top: 40 })
+        Text('加载中...').margin({ top: 40 }).fontColor(Theme.textMuted)
       } else if (this.error.length > 0) {
-        Text(this.error).fontColor('#E53935').margin({ top: 24 }).padding(16)
-        Button('重试').onClick(() => { this.loadAll(); }).margin({ top: 12 })
+        Text(this.error).fontColor(Theme.dangerText).margin({ top: 24 }).padding(16)
+        Button('重试').backgroundColor(Theme.accentSoft).fontColor(Theme.accentText).onClick(() => { this.loadAll(); }).margin({ top: 12 })
       } else {
         Scroll() {
           Column() {
@@ -229,11 +230,13 @@ struct LlmSettingsPage {
               .width('90%')
               .height(46)
               .margin({ top: 16 })
-              .backgroundColor('#007DFF')
+              .borderRadius(23)
+              .backgroundColor(Theme.accent)
+              .fontColor(Theme.text)
               .onClick(() => { this.handleSave(); })
 
             if (this.savedTip.length > 0) {
-              Text(this.savedTip).fontSize(12).fontColor('#666666').margin({ top: 12 })
+              Text(this.savedTip).fontSize(12).fontColor(Theme.textMuted).margin({ top: 12 })
             }
           }
           .width('100%')
@@ -245,6 +248,6 @@ struct LlmSettingsPage {
     }
     .width('100%')
     .height('100%')
-    .backgroundColor('#F5F5F5')
+    .backgroundColor(Theme.chatList)
   }
 }

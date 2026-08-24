@@ -2,6 +2,7 @@ import { router } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { AuthService } from '../service/AuthService';
 import { SecurityStore } from '../service/SecurityStore';
+import { Theme } from '../common/Theme';
 
 const TAG = 'LoginPage';
 
@@ -89,7 +90,7 @@ struct LoginPage {
     Text(label)
       .fontSize(16)
       .fontWeight(this.activeTab === tab ? FontWeight.Bold : FontWeight.Normal)
-      .fontColor(this.activeTab === tab ? '#007DFF' : '#666666')
+      .fontColor(this.activeTab === tab ? Theme.accentText : Theme.textMuted)
       .padding({ left: 20, right: 20, top: 10, bottom: 10 })
       .onClick(() => {
         this.activeTab = tab;
@@ -103,8 +104,11 @@ struct LoginPage {
       .type(isPassword ? InputType.Password : InputType.Normal)
       .width('100%')
       .height(48)
-      .borderRadius(8)
-      .backgroundColor('#F2F2F2')
+      .borderRadius(10)
+      .backgroundColor(Theme.inputBackground)
+      .fontColor(Theme.inputText)
+      .placeholderColor(Theme.placeholder)
+      .border({ width: 1, color: Theme.inputBorder })
       .margin({ top: 12 })
       .onChange((v: string) => {
         onValue(v);
@@ -118,17 +122,22 @@ struct LoginPage {
         Text('洛天依')
           .fontSize(36)
           .fontWeight(FontWeight.Bold)
+          .fontColor(Theme.accent)
           .margin({ top: 80, bottom: 8 })
         Text('与天依的每一句话')
           .fontSize(14)
-          .fontColor('#999999')
+          .fontColor(Theme.textMuted)
           .margin({ bottom: 40 })
 
         // Tab 栏
         Row() {
           this.tabButton('登录', 'login')
           this.tabButton('注册', 'register')
-        }.margin({ bottom: 20 })
+        }
+        .padding(4)
+        .borderRadius(12)
+        .backgroundColor(Theme.surfaceAlt)
+        .margin({ bottom: 20 })
 
         // 表单
         Column() {
@@ -152,10 +161,11 @@ struct LoginPage {
         if (this.activeTab === 'login') {
           Row() {
             Toggle({ type: ToggleType.Switch, isOn: this.autoLogin })
+              .selectedColor(Theme.accent)
               .onChange((isOn: boolean) => {
                 this.autoLogin = isOn;
               })
-            Text('自动登录').fontSize(14).fontColor('#666666').margin({ left: 8 })
+            Text('自动登录').fontSize(14).fontColor(Theme.textMuted).margin({ left: 8 })
           }.width('85%').margin({ top: 14 })
         }
 
@@ -164,7 +174,9 @@ struct LoginPage {
           .width('85%')
           .height(48)
           .margin({ top: 24 })
-          .backgroundColor('#007DFF')
+          .borderRadius(24)
+          .backgroundColor(Theme.accent)
+          .fontColor(Theme.text)
           .onClick(() => {
             if (this.activeTab === 'login') {
               this.handleLogin();
@@ -177,7 +189,7 @@ struct LoginPage {
         if (this.message.length > 0) {
           Text(this.message)
             .fontSize(13)
-            .fontColor('#E53935')
+            .fontColor(Theme.dangerText)
             .margin({ top: 16 })
             .textAlign(TextAlign.Center)
         }
@@ -185,7 +197,7 @@ struct LoginPage {
         // 服务器设置入口
         Text('服务器设置')
           .fontSize(13)
-          .fontColor('#999999')
+          .fontColor(Theme.accent)
           .margin({ top: 40 })
           .onClick(() => {
             this.serverUrl = '';
@@ -196,23 +208,28 @@ struct LoginPage {
       }
       .width('100%')
       .height('100%')
-      .backgroundColor('#FFFFFF')
+      .backgroundColor(Theme.root)
 
       // 服务器地址弹窗
       if (this.showServerDialog) {
         Column() {
-          Text('服务器地址').fontSize(16).fontWeight(FontWeight.Bold)
+          Text('服务器地址').fontSize(16).fontWeight(FontWeight.Bold).fontColor(Theme.text)
           TextInput({ placeholder: 'https://example.com', text: this.serverUrl })
             .type(InputType.Normal)
+            .fontColor(Theme.inputText)
+            .placeholderColor(Theme.placeholder)
+            .backgroundColor(Theme.inputBackground)
+            .border({ width: 1, color: Theme.inputBorder })
+            .borderRadius(10)
             .onChange((v: string) => {
               this.serverUrl = v;
             })
             .margin({ top: 16 })
           Row({ space: 12 }) {
-            Button('取消').backgroundColor('#CCCCCC').onClick(() => {
+            Button('取消').backgroundColor(Theme.surfaceAlt).fontColor(Theme.textMuted).onClick(() => {
               this.showServerDialog = false;
             })
-            Button('保存').onClick(() => {
+            Button('保存').backgroundColor(Theme.accent).fontColor(Theme.text).onClick(() => {
               this.saveServerUrl();
             })
           }.margin({ top: 20 })
@@ -220,7 +237,7 @@ struct LoginPage {
         .width('80%')
         .padding(20)
         .borderRadius(12)
-        .backgroundColor('#FFFFFF')
+        .backgroundColor(Theme.surface)
       }
     }
     .width('100%')

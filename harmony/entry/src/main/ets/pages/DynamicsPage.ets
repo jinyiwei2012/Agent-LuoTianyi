@@ -1,6 +1,7 @@
 import { router, promptAction } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { DynamicsService, DynamicPost, DynamicComment, getDynamicSourceLabel } from '../service/DynamicsService';
+import { Theme } from '../common/Theme';
 
 const TAG = 'DynamicsPage';
 
@@ -109,9 +110,9 @@ struct DynamicsPage {
   build() {
     Column() {
       Row() {
-        Text('动态').fontSize(20).fontWeight(FontWeight.Bold)
+        Text('动态').fontSize(20).fontWeight(FontWeight.Bold).fontColor(Theme.text)
         Blank()
-        Button('返回').fontSize(13).onClick(() => {
+        Button('返回').fontSize(13).backgroundColor(Theme.surfaceAlt).fontColor(Theme.text).onClick(() => {
           router.back();
         })
       }
@@ -123,46 +124,52 @@ struct DynamicsPage {
       Column({ space: 8 }) {
         TextArea({ placeholder: '分享一条生活动态...', text: this.inputContent })
           .height(80)
+          .fontColor(Theme.inputText)
+          .placeholderColor(Theme.placeholder)
+          .backgroundColor(Theme.inputBackground)
+          .border({ width: 1, color: Theme.inputBorder })
+          .borderRadius(10)
           .onChange((v: string) => { this.inputContent = v; })
         Button(this.submitting ? '发布中...' : '发布')
-          .backgroundColor('#007DFF')
+          .backgroundColor(Theme.accent)
+          .fontColor(Theme.text)
           .alignSelf(ItemAlign.End)
           .onClick(() => { this.publish(); })
       }
       .width('100%')
       .padding(12)
-      .backgroundColor('#FFFFFF')
+      .backgroundColor(Theme.surface)
 
       if (this.loading) {
-        Text('加载中...').margin({ top: 40 })
+        Text('加载中...').margin({ top: 40 }).fontColor(Theme.textMuted)
       } else if (this.error.length > 0) {
-        Text(this.error).fontColor('#E53935').margin({ top: 24 }).padding(16)
+        Text(this.error).fontColor(Theme.dangerText).margin({ top: 24 }).padding(16)
       } else if (this.posts.length === 0) {
-        Text('暂无动态').fontColor('#999999').margin({ top: 40 })
+        Text('暂无动态').fontColor(Theme.textMuted).margin({ top: 40 })
       } else {
         List() {
           ForEach(this.posts, (post: DynamicPost) => {
             ListItem() {
               Column({ space: 8 }) {
                 Row() {
-                  Text(post.author_name).fontSize(15).fontWeight(FontWeight.Bold)
+                  Text(post.author_name).fontSize(15).fontWeight(FontWeight.Bold).fontColor(Theme.text)
                   Blank()
                   Text(getDynamicSourceLabel(post.source_type))
                     .fontSize(12)
-                    .fontColor('#007DFF')
+                    .fontColor(Theme.accentText)
                     .padding({ left: 8, right: 8, top: 2, bottom: 2 })
                     .borderRadius(8)
-                    .backgroundColor('#E3F2FD')
+                    .backgroundColor(Theme.accentSoft)
                 }.width('100%')
 
-                Text(post.content).fontSize(14).width('100%')
+                Text(post.content).fontSize(14).width('100%').fontColor(Theme.text)
 
                 Row() {
-                  Text(this.formatTime(post.created_at)).fontSize(12).fontColor('#999999')
+                  Text(this.formatTime(post.created_at)).fontSize(12).fontColor(Theme.textMuted)
                   Blank()
                   Text(`评论 ${post.comment_count}`)
                     .fontSize(12)
-                    .fontColor('#007DFF')
+                    .fontColor(Theme.accentText)
                     .onClick(() => { this.toggleComments(post.id); })
                 }.width('100%')
 
@@ -170,15 +177,15 @@ struct DynamicsPage {
                 if (this.expandedPostId === post.id) {
                   Divider().margin({ top: 4, bottom: 4 })
                   if (this.commentsLoading) {
-                    Text('加载评论中...').fontSize(12).fontColor('#999999')
+                    Text('加载评论中...').fontSize(12).fontColor(Theme.textMuted)
                   } else {
                     ForEach(this.comments, (c: DynamicComment) => {
                       Column() {
                         Row() {
-                          Text(c.author_name).fontSize(12).fontColor('#007DFF')
+                          Text(c.author_name).fontSize(12).fontColor(Theme.accentText)
                           Text('  ').fontSize(12)
                         }
-                        Text(c.content).fontSize(13)
+                        Text(c.content).fontSize(13).fontColor(Theme.text)
                         Divider()
                       }
                       .width('100%')
@@ -190,8 +197,13 @@ struct DynamicsPage {
                       .layoutWeight(1)
                       .height(36)
                       .fontSize(13)
+                      .fontColor(Theme.inputText)
+                      .placeholderColor(Theme.placeholder)
+                      .backgroundColor(Theme.inputBackground)
+                      .border({ width: 1, color: Theme.inputBorder })
+                      .borderRadius(18)
                       .onChange((v: string) => { this.commentInput = v; })
-                    Button('发送').fontSize(13).height(36).onClick(() => {
+                    Button('发送').fontSize(13).height(36).backgroundColor(Theme.accent).fontColor(Theme.text).onClick(() => {
                       this.submitComment();
                     })
                   }.margin({ top: 6 })
@@ -200,7 +212,7 @@ struct DynamicsPage {
               .width('100%')
               .padding(12)
               .borderRadius(8)
-              .backgroundColor('#FFFFFF')
+              .backgroundColor(Theme.surface)
               .margin({ bottom: 10 })
             }
           }, (post: DynamicPost) => post.id)
@@ -212,6 +224,6 @@ struct DynamicsPage {
     }
     .width('100%')
     .height('100%')
-    .backgroundColor('#F5F5F5')
+    .backgroundColor(Theme.chatList)
   }
 }
