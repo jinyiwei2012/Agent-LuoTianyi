@@ -7,6 +7,10 @@ import { http } from '@kit.NetworkKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 
 const TAG = 'HistoryService';
+/** 本地历史缓存 key 前缀（按用户名隔离） */
+const HISTORY_CACHE_KEY_PREFIX = 'chat_history_cache:';
+/** 本地缓存最多保留的消息条数（防止 preferences 膨胀） */
+const CACHE_KEEP_COUNT = 100;
 
 /** 服务端 history 原始消息结构（对齐 app getHistory） */
 interface HistoryRawMessage {
@@ -74,6 +78,43 @@ export class HistoryService {
     } catch (e) {
       hilog.error(0x0000, TAG, 'history error: %{public}s', (e as Error).message);
       return { messages: [], startIndex: 0 };
+    }
+  }
+
+  /**
+   * 读取本地缓存的历史消息（冷启动秒显用，随后仍以服务端数据为准刷新）。
+   * 缓存按用户名隔离；损坏时静默返回空。
+   */
+  static async getCachedMessages(username: string): Promise<ChatMessage[]> {
+    if (username.length === 0) {
+      return [];
+    }
+    try {
+      const raw = await SecurityStore.getString(HISTORY_CACHE_KEY_PREFIX + username, '');
+      if (raw.length === 0) {
+        return [];
+      }
+      const parsed = JSON.parse(raw) as ChatMessage[];
+      return parsed instanceof Array ? parsed : [];
+    } catch (e) {
+      hilog.debug(0x0000, TAG, 'cache read failed: %{public}s', (e as Error).message);
+      return [];
+    }
+  }
+
+  /**
+   * 把服务端拉到的历史写入本地缓存（仅保留最近 CACHE_KEEP_COUNT 条）。
+   * 写入失败不影响主流程。
+   */
+  static async saveCachedMessages(username: string, messages: ChatMessage[]): Promise<void> {
+    if (username.length === 0 || messages.length === 0) {
+      return;
+    }
+    try {
+      const keep = messages.slice(-CACHE_KEEP_COUNT);
+      await SecurityStore.setString(HISTORY_CACHE_KEY_PREFIX + username, JSON.stringify(keep));
+    } catch (e) {
+      hilog.debug(0x0000, TAG, 'cache write failed: %{public}s', (e as Error).message);
     }
   }
 }

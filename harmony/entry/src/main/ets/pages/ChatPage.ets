@@ -6,7 +6,7 @@ import { WsTransport, WsCallbacks, SendTouchPayload } from '../service/WsTranspo
 import { Live2DFacade, Live2DEvents } from '../service/Live2DFacade';
 import { LlmConfigStore } from '../service/LlmConfigStore';
 import { ImagePicker } from '../service/ImagePicker';
-import { HistoryService } from '../service/HistoryService';
+import { HistoryService, HistoryResponse } from '../service/HistoryService';
 import { RawfileScheme } from '../service/RawfileScheme';
 import { SecurityStore } from '../service/SecurityStore';
 import { DynamicsService } from '../service/DynamicsService';
@@ -44,6 +44,9 @@ struct ChatPage {
   @State thinkingFrame: number = 0;
   @State hasDynamicsUnread: boolean = false;
   @State dynamicsUnreadCount: number = 0;
+  /** 历史翻页游标：-1=未拉取（服务端约定 -1=从最新开始），0=已到最早 */
+  @State historyStartIndex: number = -1;
+  private historyLoading: boolean = false;
 
   // ---- 抽屉/弹层 ----
   @State drawerOpen: boolean = false;
@@ -166,9 +169,51 @@ struct ChatPage {
   }
 
   private async loadHistory(): Promise<void> {
-    const result = await HistoryService.fetchHistory(0);
+    // 单账号多端轮流使用：对齐安卓端逻辑——游标初始 -1（服务端约定 -1=从最新开始），
+    // 冷启动先用本地缓存秒显，再以服务端数据为准刷新
+    const cached = await HistoryService.getCachedMessages(AuthService.state.username);
+    if (cached.length > 0) {
+      const existing = new Set(this.messages.map((m: ChatMessage) => m.uuid));
+      const fresh = cached.filter((m: ChatMessage) => !existing.has(m.uuid));
+      if (fresh.length > 0) {
+        this.messages = [...fresh, ...this.messages];
+      }
+    }
+
+    const result = await HistoryService.fetchHistory(-1);
     if (result.messages.length > 0) {
-      this.messages = [...result.messages, ...this.messages];
+      this.mergeHistoryPage(result);
+      void HistoryService.saveCachedMessages(AuthService.state.username, result.messages);
+    }
+  }
+
+  /** 合并一页历史（uuid 去重、时间正序前置插入），并更新翻页游标 */
+  private mergeHistoryPage(result: HistoryResponse): void {
+    const existing = new Set(this.messages.map((m: ChatMessage) => m.uuid));
+    const fresh = result.messages.filter((m: ChatMessage) => !existing.has(m.uuid));
+    if (fresh.length > 0) {
+      this.messages = [...fresh, ...this.messages];
+    }
+    this.historyStartIndex = result.startIndex;
+  }
+
+  /** 滚动到顶部时加载更早的历史（start_index<=0 表示已到最早） */
+  private async loadMoreHistory(): Promise<void> {
+    if (this.historyLoading || this.historyStartIndex <= 0) {
+      return;
+    }
+    this.historyLoading = true;
+    try {
+      const result = await HistoryService.fetchHistory(this.historyStartIndex);
+      if (result.messages.length > 0) {
+        this.mergeHistoryPage(result);
+        void HistoryService.saveCachedMessages(AuthService.state.username,
+          this.messages.filter((m: ChatMessage) => m.type !== 'system'));
+      } else {
+        this.historyStartIndex = 0;
+      }
+    } finally {
+      this.historyLoading = false;
     }
   }
 
@@ -514,6 +559,12 @@ struct ChatPage {
         .layoutWeight(1)
         .padding({ top: 10, bottom: 10 })
         .backgroundColor(this.getTheme().chatList)
+        .onScrollIndex((first: number) => {
+          // 对齐安卓 FlatList onEndReached：滚动到顶部时加载更早的历史
+          if (first === 0) {
+            this.loadMoreHistory();
+          }
+        })
 
         // 输入栏（安卓 inputContainer：bg + borderTop）
         Row({ space: 0 }) {
