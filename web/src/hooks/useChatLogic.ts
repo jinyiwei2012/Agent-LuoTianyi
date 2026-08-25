@@ -30,7 +30,10 @@ export const useChatLogic = (
   const messageProcessorRef = useRef<MessageProcessor | null>(null);
   const serverAudioPlayerRef = useRef<ServerAudioPlayer | null>(null);
   const onExpressionRef = useRef(options.onExpression);
-  onExpressionRef.current = options.onExpression;
+  // 通过 effect 同步最新回调，避免 render 期间写 ref
+  useEffect(() => {
+    onExpressionRef.current = options.onExpression;
+  }, [options.onExpression]);
 
   const updateMessageByUuid = useCallback((uuid: string, updater: (msg: ChatMessage) => ChatMessage) => {
     setMessages((prev) => prev.map((msg) => (msg.uuid === uuid ? updater(msg) : msg)));

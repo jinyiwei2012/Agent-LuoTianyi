@@ -13,6 +13,15 @@ export interface ImageResponse {
   newClientPath?: string; // Web 版为 data URL / Blob URL
 }
 
+/** 服务端 /history 返回的单条消息原始结构 */
+interface HistoryRawItem {
+  uuid?: string;
+  content: string;
+  source?: string;
+  type: ChatMessage['type'];
+  timestamp?: number;
+}
+
 // Web 版：无本地文件系统，历史音频不落盘，直接由 message_processor 在线播放，
 // 因此不尝试 attach 本地音频路径（见 Web 方案 §7.2）。
 
@@ -40,7 +49,7 @@ export async function getHistory(username: string, token: string, count: number,
       };
     }
 
-    const messages: ChatMessage[] = data.history.map((msg: any) => {
+    const messages: ChatMessage[] = data.history.map((msg: HistoryRawItem) => {
       return {
         uuid: msg.uuid || 'unknown_id',
         content: msg.content,

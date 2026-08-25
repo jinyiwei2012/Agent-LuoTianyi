@@ -49,7 +49,11 @@ export function LlmSettingsPage({ onBack }: LlmSettingsPageProps) {
     }
   }, []);
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    // 异步加载模型类型与已存配置，setState 均在 await 之后，属标准 mount 初始化。
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void load();
+  }, [load]);
 
   const updateForm = (id: string, patch: Partial<ModuleFormState>) => {
     setForms((current) => ({ ...current, [id]: { ...(current[id] ?? emptyModuleForm()), ...patch } }));

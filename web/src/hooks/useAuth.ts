@@ -118,7 +118,7 @@ export function useAuth() {
       const autoLogin = await storage.getItem(AUTO_LOGIN_KEY);
       if (autoLogin === 'true') {
         const savedUsername = await storage.getItem(USERNAME_KEY);
-        let autoLoginToken = await storage.getItem(AUTOLOGIN_TOKEN_KEY);
+        const autoLoginToken = await storage.getItem(AUTOLOGIN_TOKEN_KEY);
         if (savedUsername && autoLoginToken) { // 此时可以尝试自动登录
           // 并发保护：重复进入时复用进行中的自动登录，避免重复请求竞争轮换 token
           if (!autoLoginInFlight) {
@@ -164,6 +164,9 @@ export function useAuth() {
 
   // 启动时检查是否有自动登录凭据，并获取公钥
   useEffect(() => {
+    // 异步初始化认证（获取公钥/自动登录），setState 均在 await 之后，
+    // 属标准 mount 初始化流程，非同步级联渲染。
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     initializeAuth();
   }, [initializeAuth]);
 
