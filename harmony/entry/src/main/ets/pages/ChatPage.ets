@@ -2,7 +2,7 @@ import { router } from '@kit.ArkUI';
 import { webview } from '@kit.ArkWeb';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { AuthService } from '../service/AuthService';
-import { WsTransport, WsCallbacks, SendTouchPayload } from '../service/WsTransport';
+import { WsTransport, WsCallbacks } from '../service/WsTransport';
 import { Live2DFacade, Live2DEvents } from '../service/Live2DFacade';
 import { LlmConfigStore } from '../service/LlmConfigStore';
 import { ImagePicker } from '../service/ImagePicker';
@@ -271,11 +271,7 @@ struct ChatPage {
     } catch (e) {
       addDebugTrace('live2d', 'touch parse failed', (e as Error).message);
     }
-    const payload: SendTouchPayload = { touch_area: touchArea };
-    if (frequency !== null) {
-      payload.click_frequency = frequency;
-    }
-    this.transport.sendWithAck('user_touch', payload, 10000, `t-${Date.now()}`);
+    this.transport.submitUserTouch(touchArea, frequency, 10000);
   }
 
   private sendMessage(): void {
