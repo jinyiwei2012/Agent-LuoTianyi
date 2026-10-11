@@ -41,6 +41,7 @@ from src.infrastructure.models.realtime_speech import (
     SpeechStopped,
     TurnCompleted,
 )
+from src.infrastructure.observability.call_metrics import CallMetric, CallMetricName, CallMetricResult, CallMetricStatus
 from src.infrastructure.persistence.call_sessions.repository import CallSessionRecord, CallSessionRepository
 from src.utils.owned_operation import complete_owned
 
@@ -155,6 +156,7 @@ class CallStage:
         transport: CallTransportSink,
         release_ownership: Callable[[CallStageOwnership], bool] | None = None,
         settlement_sink: CallSettlementSink | None = None,
+        call_metrics: Any | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], datetime] | None = None,
         config: dict[str, object] | None = None,
@@ -168,6 +170,7 @@ class CallStage:
         self._speech_factory, self._transport = speech_factory, transport
         self._release_ownership = release_ownership
         self._settlement_sink = settlement_sink
+        self._call_metrics = call_metrics
         self._monotonic = monotonic
         self._wall_clock = wall_clock or (lambda: datetime.now(timezone.utc))
         settings = {} if config is None else config
@@ -614,6 +617,11 @@ class CallStage:
         self._record = updated
         self._lifecycle._snapshot = snapshot
         self._playback.set_call_state(snapshot.state)
+        self._record_metric(
+            CallMetricName.STATE,
+            duration_ms=0,
+            labels={"state": state.value, "result": CallMetricResult.SUCCEEDED.value},
+        )
         if publish:
             try:
                 await self._transport.send_state(CallStateChanged(self._ownership.call_id, state))
@@ -666,6 +674,12 @@ class CallStage:
             try:
                 await self._settlement_sink.emit(self._final)
             except BaseException as error:
+                self._record_metric(
+                    CallMetricName.SETTLEMENT_ADMISSION,
+                    duration_ms=0,
+                    status=CallMetricStatus.ERROR,
+                    labels={"result": CallMetricResult.FAILED.value, "error_code": "SETTLEMENT_ADMISSION_FAILED"},
+                )
                 ending_error = ending_error or error
         await self._send_terminal_best_effort(self._final)
         ending_error = ending_error or cleanup_error
@@ -706,6 +720,12 @@ class CallStage:
             raise cleanup_error
 
     def _interrupt(self) -> None:
+        self._record_metric(
+            CallMetricName.INTERRUPT,
+            duration_ms=0,
+            numeric={"interrupt_count": 1},
+            labels={"result": CallMetricResult.SUCCEEDED.value},
+        )
         self._generation += 1
         for token in self._request_tokens:
             token.cancel(d.CancellationReason.SUPERSEDED)
@@ -840,6 +860,23 @@ class CallStage:
     def _now(self) -> datetime:
         value = self._wall_clock()
         return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+    def _record_metric(self, name, *, duration_ms, status=CallMetricStatus.SUCCESS, numeric=None, labels=None) -> None:
+        if self._call_metrics is None:
+            return
+        timestamp = self._now().astimezone(timezone.utc).isoformat(timespec="milliseconds")
+        self._call_metrics.record(
+            CallMetric(
+                call_id=self._record.call_id,
+                name=name,
+                start_ts=timestamp,
+                end_ts=timestamp,
+                duration_ms=duration_ms,
+                status=status,
+                numeric=numeric,
+                labels=labels,
+            )
+        )
 
     def _active_duration_ms(self, ended: datetime) -> int:
         _ = ended

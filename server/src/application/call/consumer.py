@@ -14,8 +14,11 @@ from src.domain.call import (
     derive_call_conversation_id,
 )
 from src.domain.conversation_type import ConversationItem
+from src.infrastructure.observability.call_metrics import CallMetric, CallMetricName, CallMetricResult, CallMetricStatus
 from src.infrastructure.persistence.call_sessions import CallSessionRepository, SettlementStatus
 from src.utils.owned_operation import complete_owned
+
+from .conversation_projection import validate_call_conversation_winner
 
 
 class CallAgentSettlementPort:
@@ -31,12 +34,14 @@ class CallSettlementConsumerImpl:
         conversation_service: object,
         release_call_maintenance=None,
         call_maintenance_batches=None,
+        call_metrics=None,
     ) -> None:
         self._agent_settlement = agent_settlement
         self._calls = call_sessions
         self._conversations = conversation_service
         self._release_call_maintenance = release_call_maintenance
         self._batches = call_maintenance_batches
+        self._call_metrics = call_metrics
 
     async def settle(self, snapshot: CallFinalSnapshot) -> None:
         record = await complete_owned(asyncio.to_thread(self._calls.find_by_id, snapshot.terminal.call_id))
@@ -57,6 +62,22 @@ class CallSettlementConsumerImpl:
             if self._release_call_maintenance is not None:
                 self._release_call_maintenance(record.call_id)
 
+    def _record_metric(self, call_id, name, result, *, status=CallMetricStatus.SUCCESS) -> None:
+        if self._call_metrics is None:
+            return
+        now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        self._call_metrics.record(
+            CallMetric(
+                call_id=call_id,
+                name=name,
+                start_ts=now,
+                end_ts=now,
+                duration_ms=0,
+                status=status,
+                labels={"result": result.value},
+            )
+        )
+
     async def _settle_record(self, record, snapshot, digest) -> None:
         winner = await self._load_summary_winner(record)
         if record.outcome is not CallOutcome.CONNECTED:
@@ -74,6 +95,23 @@ class CallSettlementConsumerImpl:
         if record.maintenance_status is not SettlementStatus.SUCCEEDED:
             lanes.append(self._settle_maintenance(record, result.maintenance_turn_seq))
         outcomes = await asyncio.gather(*lanes, return_exceptions=True)
+        for name, outcome in zip(
+            (
+                name
+                for name, required in (
+                    (CallMetricName.SUMMARY, record.summary_status is not SettlementStatus.SUCCEEDED),
+                    (CallMetricName.MAINTENANCE, record.maintenance_status is not SettlementStatus.SUCCEEDED),
+                )
+                if required
+            ),
+            outcomes,
+        ):
+            self._record_metric(
+                record.call_id,
+                name,
+                CallMetricResult.FAILED if isinstance(outcome, BaseException) else CallMetricResult.SUCCEEDED,
+                status=CallMetricStatus.ERROR if isinstance(outcome, BaseException) else CallMetricStatus.SUCCESS,
+            )
         errors = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
         if errors:
             raise errors[0]
@@ -108,41 +146,7 @@ class CallSettlementConsumerImpl:
         )
         if item is None:
             return None
-        data = item.data or {}
-        conversation_id = derive_call_conversation_id(
-            user_id=record.user_id, character_id=record.character_id, call_id=record.call_id
-        )
-        expected = {
-            "call_id": str(record.call_id),
-            "outcome": record.outcome.value,
-            "active_duration_ms": record.active_duration_ms,
-            "end_reason": record.end_reason.value,
-        }
-        summary = data.get("summary")
-        try:
-            content = CallContent(
-                call_id=record.call_id,
-                outcome=record.outcome,
-                active_duration_ms=record.active_duration_ms,
-                summary=summary,
-                end_reason=record.end_reason,
-            )
-        except ValueError as error:
-            raise RuntimeError("persisted call conversation content is invalid") from error
-        requested_at = record.requested_at.replace(tzinfo=None).isoformat(sep=" ", timespec="microseconds")
-        if (
-            item.uuid != str(conversation_id)
-            or item.source != "user"
-            or item.type != "call"
-            or item.timestamp != requested_at
-            or item.content != content.render_for_agent()
-            or set(data) != {"call_id", "outcome", "active_duration_ms", "summary", "end_reason"}
-            or any(data.get(key) != value for key, value in expected.items())
-        ):
-            raise RuntimeError("persisted call conversation identity conflicts with ledger")
-        if record.outcome is CallOutcome.CONNECTED and (not isinstance(summary, str) or not summary.strip()):
-            raise RuntimeError("persisted connected call has no summary")
-        return summary if isinstance(summary, str) else ""
+        return validate_call_conversation_winner(record, item)
 
     async def _settle_summary(self, record, summary) -> None:
         if isinstance(summary, BaseException):

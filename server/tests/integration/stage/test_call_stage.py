@@ -545,6 +545,45 @@ async def test_blocked_terminal_delivery_is_bounded_after_settlement_admission(c
 
 
 @pytest.mark.asyncio
+async def test_settlement_admission_failure_records_only_admission_metric(call_setup):
+    repository, record, ownership, clock = call_setup
+    captured = []
+
+    class Metrics:
+        def record(self, metric):
+            captured.append(metric)
+            return True
+
+    class Settlement:
+        async def emit(self, snapshot):
+            raise RuntimeError("reset admission rejected")
+
+    stage = await CallStage.create(
+        ownership=ownership,
+        record=record,
+        agent=_agent(_TurnHandler()),
+        context_factory=ContextFactory(character_id="luotianyi", database=_ContextDatabase()),
+        call_sessions=repository,
+        speech_factory=FakeRealtimeSpeechSessionFactory(),
+        transport=_Transport(),
+        settlement_sink=Settlement(),
+        call_metrics=Metrics(),
+        monotonic=clock.tick,
+        wall_clock=clock.now,
+    )
+    await stage.apply_answer(
+        d.AnswerCall(action_id="answer", call_id=record.call_id, decision=CallAnswerDecision.ACCEPT)
+    )
+    with pytest.raises(RuntimeError, match="reset admission rejected"):
+        await stage.terminate()
+
+    names = [metric.name.value for metric in captured]
+    assert "settlement_admission" in names
+    assert "summary" not in names
+    assert "maintenance" not in names
+
+
+@pytest.mark.asyncio
 async def test_terminal_ledger_uses_monotonic_duration_and_first_disconnect_cutoff(call_setup):
     stage, _, _, _ = await _create(call_setup)
     repository, record, _, clock = call_setup

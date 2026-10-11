@@ -6,7 +6,7 @@ from collections.abc import Callable
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import case, delete, select, update
+from sqlalchemy import and_, case, delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -338,6 +338,35 @@ class SqlCallSessionRepository:
                 .where(
                     CallSession.state.in_(state.value for state in query_states),
                     CallSession.updated_at < _stored_time(before),
+                )
+                .order_by(CallSession.updated_at, CallSession.call_id)
+            ).all()
+            return tuple(_to_record(row) for row in rows)
+        finally:
+            session.close()
+
+    def list_recovery_pending(self, *, before: datetime) -> tuple[CallSessionRecord, ...]:
+        before = normalize_call_datetime(before, field_name="before")
+        session = self._sql_session_factory()
+        try:
+            rows = session.scalars(
+                select(CallSession)
+                .where(
+                    or_(
+                        and_(
+                            CallSession.state.in_(state.value for state in STALE_RECOVERABLE_STATES),
+                            CallSession.updated_at < _stored_time(before),
+                        ),
+                        and_(
+                            CallSession.state == CallState.ENDED.value,
+                            CallSession.outcome == CallOutcome.CONNECTED.value,
+                            CallSession.end_reason == CallEndReason.SYSTEM_FAILURE.value,
+                            or_(
+                                CallSession.summary_status != SettlementStatus.SUCCEEDED.value,
+                                CallSession.maintenance_status == SettlementStatus.PENDING.value,
+                            ),
+                        ),
+                    )
                 )
                 .order_by(CallSession.updated_at, CallSession.call_id)
             ).all()
