@@ -27,6 +27,8 @@ class DeterministicLLMModule:
                     "ack_style": "thinking",
                 }
             )
+        if self.name.endswith("call_summary"):
+            return "用户与角色讨论了音乐喜好，并约定之后继续交流。"
         if self.name.endswith("main_chat"):
             topic = str(kwargs.get("reply_topic") or "")
             if "刚刚接通" in topic:
@@ -166,5 +168,6 @@ def runtime_config(tmp_path) -> dict[str, object]:
             },
             "main_chat": {"llm_module": {}},
             "call_recall": {"llm_module": {}},
+            "call_summary": {"llm_module": {}},
         },
     }

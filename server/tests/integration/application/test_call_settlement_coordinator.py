@@ -45,3 +45,65 @@ async def test_settlement_always_releases_agent_resources(mode):
     await coordinator.close()
 
     assert resources.released == [call_id]
+
+
+@pytest.mark.asyncio
+async def test_timeout_waits_for_owned_consumer_cleanup_before_releasing_resources():
+    call_id = uuid4()
+    resources = _Resources()
+    started = asyncio.Event()
+    cleanup_gate = asyncio.Event()
+
+    class Consumer:
+        async def settle(self, snapshot):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await cleanup_gate.wait()
+                raise
+
+    coordinator = CallSettlementCoordinator(consumer=Consumer(), resources=resources, timeout_seconds=0.01)
+    await coordinator.emit(_snapshot(call_id))
+    await started.wait()
+    await asyncio.sleep(0.02)
+    assert resources.released == []
+
+    cleanup_gate.set()
+    await coordinator.close()
+
+    assert resources.released == [call_id]
+
+
+@pytest.mark.asyncio
+async def test_timeout_during_owned_batch_create_holds_resources_until_repository_returns():
+    call_id = uuid4()
+    resources = _Resources()
+    thread_started = __import__("threading").Event()
+    thread_gate = __import__("threading").Event()
+    writes = []
+
+    class Consumer:
+        async def settle(self, snapshot):
+            from src.utils.owned_operation import complete_owned
+
+            def create_batch():
+                thread_started.set()
+                thread_gate.wait()
+                writes.append("created")
+
+            await complete_owned(asyncio.to_thread(create_batch))
+            raise asyncio.CancelledError
+
+    coordinator = CallSettlementCoordinator(consumer=Consumer(), resources=resources, timeout_seconds=0.01)
+    await coordinator.emit(_snapshot(call_id))
+    await asyncio.to_thread(thread_started.wait)
+    await asyncio.sleep(0.02)
+    assert resources.released == []
+    assert writes == []
+
+    thread_gate.set()
+    await coordinator.close()
+
+    assert writes == ["created"]
+    assert resources.released == [call_id]
