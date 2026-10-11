@@ -1,4 +1,4 @@
-import type { CapturedAudioFrame } from '../utils/call_audio_contracts';
+import type { SequencedCapturedAudioFrame } from '../utils/call_audio_contracts';
 import { PlaybackGenerationLedger } from '../utils/call_audio/playback_ledger';
 import {
   CaptureRecoveryBuffer,
@@ -7,8 +7,8 @@ import {
 
 const format = { encoding: 'pcm_s16le', sampleRateHz: 16_000, channels: 1 };
 
-function frame(sequence: number, bytes: number): CapturedAudioFrame {
-  return { sequence, format, payload: new Uint8Array(bytes) };
+function frame(wireSequence: number, bytes: number): SequencedCapturedAudioFrame {
+  return { deviceSequence: wireSequence + 100, wireSequence, format, payload: new Uint8Array(bytes) };
 }
 
 describe('CaptureRecoveryBuffer', () => {
@@ -19,7 +19,7 @@ describe('CaptureRecoveryBuffer', () => {
     }
 
     expect(buffer.bufferedBytes).toBe(MAX_RECOVERY_BYTES);
-    expect(buffer.unacknowledgedAfter(0).map((item) => item.sequence)).toEqual([2, 3, 4]);
+    expect(buffer.unacknowledgedAfter(0).map((item) => item.wireSequence)).toEqual([2, 3, 4]);
   });
 
   it('removes only acknowledged frames and exposes missing frames in order', () => {
@@ -30,7 +30,7 @@ describe('CaptureRecoveryBuffer', () => {
 
     buffer.acknowledge(10);
 
-    expect(buffer.unacknowledgedAfter(10).map((item) => item.sequence)).toEqual([11, 12]);
+    expect(buffer.unacknowledgedAfter(10).map((item) => item.wireSequence)).toEqual([11, 12]);
   });
 });
 

@@ -29,4 +29,9 @@ export class PlaybackGenerationLedger {
     this.completed.add(key);
     return true;
   }
+
+  clear(): void {
+    this.generations.clear();
+    this.completed.clear();
+  }
 }

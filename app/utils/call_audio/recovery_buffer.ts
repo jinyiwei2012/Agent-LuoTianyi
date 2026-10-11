@@ -1,14 +1,14 @@
-import type { CapturedAudioFrame } from '../call_audio_contracts';
+import type { SequencedCapturedAudioFrame } from '../call_audio_contracts';
 
 export const CAPTURE_BYTES_PER_SECOND = 16_000 * 2;
 export const MAX_RECOVERY_BYTES = CAPTURE_BYTES_PER_SECOND * 3;
 
-/** Keeps original capture sequence numbers for call.v1 reconnect retransmission. */
+/** Keeps transport-assigned call.v1 sequence numbers for reconnect retransmission. */
 export class CaptureRecoveryBuffer {
-  private readonly frames: CapturedAudioFrame[] = [];
+  private readonly frames: SequencedCapturedAudioFrame[] = [];
   private byteLength = 0;
 
-  append(frame: CapturedAudioFrame): void {
+  append(frame: SequencedCapturedAudioFrame): void {
     if (frame.payload.byteLength > MAX_RECOVERY_BYTES) {
       throw new Error('capture_frame_too_large');
     }
@@ -20,14 +20,14 @@ export class CaptureRecoveryBuffer {
     }
   }
 
-  acknowledge(sequence: number): void {
-    while (this.frames[0] && this.frames[0].sequence <= sequence) {
+  acknowledge(wireSequence: number): void {
+    while (this.frames[0] && this.frames[0].wireSequence <= wireSequence) {
       this.byteLength -= this.frames.shift()!.payload.byteLength;
     }
   }
 
-  unacknowledgedAfter(sequence: number): readonly CapturedAudioFrame[] {
-    return this.frames.filter((frame) => frame.sequence > sequence);
+  unacknowledgedAfter(wireSequence: number): readonly SequencedCapturedAudioFrame[] {
+    return this.frames.filter((frame) => frame.wireSequence > wireSequence);
   }
 
   clear(): void {

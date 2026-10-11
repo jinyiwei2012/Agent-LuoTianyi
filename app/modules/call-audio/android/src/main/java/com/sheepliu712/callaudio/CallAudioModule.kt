@@ -10,14 +10,18 @@ import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioFocusRequest
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.NoiseSuppressor
 import android.os.Bundle
+import android.os.Build
 import android.util.Base64
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
+import expo.modules.kotlin.Promise
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -27,29 +31,38 @@ private const val PLAYBACK_RATE = 24_000
 private const val CHANNELS = 1
 private const val MAX_CAPTURE_BUFFER_BYTES = CAPTURE_RATE * 2 * 3
 private const val MAX_PLAYBACK_BUFFER_BYTES = PLAYBACK_RATE * 2 * 4
+private const val MAX_CAPTURE_IN_FLIGHT = 30
 
 class CallAudioModule : Module(), Application.ActivityLifecycleCallbacks {
   private val captureRunning = AtomicBoolean(false)
   private val playbackRunning = AtomicBoolean(false)
   private val generation = AtomicLong(0)
+  private val sessionGeneration = AtomicLong(0)
+  private val workerOwnership = WorkerOwnership()
+  @Volatile private var sessionTerminationFailed = false
+  private val captureSequence = AtomicLong(0)
   private val streamGenerations = ConcurrentHashMap<StreamKey, Long>()
   private val tombstonedStreams = ConcurrentHashMap.newKeySet<StreamKey>()
-  private val queue = BoundedByteQueue(MAX_PLAYBACK_BUFFER_BYTES)
+  private val queue = PlaybackQueue(MAX_PLAYBACK_BUFFER_BYTES)
+  private val playbackState = PlaybackState(queue)
   private var captureThread: Thread? = null
   private var playbackThread: Thread? = null
   private var sessionReady = false
   private var audioRecord: AudioRecord? = null
   private var audioTrack: AudioTrack? = null
   private var echoCanceler: AcousticEchoCanceler? = null
+  private var noiseSuppressor: NoiseSuppressor? = null
+  private var aecStatus: Pair<Boolean, String?> = false to "aec_not_initialized"
+  private var noiseSuppressorStatus: Pair<Boolean, String?> = false to "noise_suppressor_not_initialized"
+  private var audioFocusRequest: AudioFocusRequest? = null
+  private var legacyAudioFocusListener: AudioManager.OnAudioFocusChangeListener? = null
+  private var audioFocusGranted = false
   private var originalAudioMode: Int? = null
   private var routeCallback: AudioDeviceCallback? = null
-  private var playbackHeadBase = 0L
-  private var resetEpoch = 0L
-  @Volatile private var pendingFlush = false
-  private val stoppedReceiptLock = java.lang.Object()
-  private val stoppedReceipts = ArrayDeque<Pair<StreamKey, Long>>()
-  private val pendingFinalsLock = java.lang.Object()
-  private val pendingFinals = ArrayDeque<PlaybackChunk>()
+  private val playbackCommandLock = java.lang.Object()
+  private val playbackCommands = ArrayDeque<PlaybackCommand>()
+  private var stopOperations = StopOperationRegistry<Promise>()
+  private val captureInFlight = ConcurrentHashMap.newKeySet<Long>()
   private var resumedActivities = 0
   private var lifecycleRegistered = false
 
@@ -69,6 +82,9 @@ class CallAudioModule : Module(), Application.ActivityLifecycleCallbacks {
     AsyncFunction("stopSession") { closeSession() }
     AsyncFunction("startCapture") { startCapture() }
     AsyncFunction("stopCapture") { stopCapture() }
+    AsyncFunction("acknowledgeCapturedAudio") { deviceSequence: Long, eventSessionGeneration: Long ->
+      if (eventSessionGeneration == sessionGeneration.get()) captureInFlight.remove(deviceSequence)
+    }
     AsyncFunction("enqueuePlayback") {
         responseId: String,
         streamId: Int,
@@ -77,40 +93,53 @@ class CallAudioModule : Module(), Application.ActivityLifecycleCallbacks {
       ->
       enqueuePlayback(responseId, streamId, payloadBase64, isFinal)
     }
-    AsyncFunction("stopPlayback") { responseId: String?, streamId: Int? ->
-      stopPlayback(responseId, streamId)
+    AsyncFunction("stopPlayback") { responseId: String?, streamId: Int?, promise: Promise ->
+      stopPlayback(responseId, streamId, promise)
     }
-    AsyncFunction("tombstone") { responseId: String, streamId: Int ->
-      tombstone(StreamKey(responseId, streamId), true)
+    AsyncFunction("tombstone") { responseId: String, streamId: Int, promise: Promise ->
+      stopPlayback(responseId, streamId, promise)
     }
 
     OnDestroy { closeSession() }
   }
 
   private fun startSession(): Map<String, Any?> {
-    val context = requireContext()
-    if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-      return capability(false, "permission_denied")
+    if (sessionTerminationFailed || !workerOwnership.canStart()) {
+      return capability(false, "session_termination_failed")
     }
-    val captureProbeError = probeCaptureInitialization()
-    if (captureProbeError != null) return capability(false, captureProbeError)
-    registerLifecycle(context)
-    val manager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-    if (originalAudioMode == null) originalAudioMode = manager.mode
-    manager.mode = AudioManager.MODE_IN_COMMUNICATION
-    registerRouteCallback(manager)
+    if (sessionReady) return capability(true, null)
+    val currentSessionGeneration = sessionGeneration.incrementAndGet()
+    resetSessionState()
     try {
+      val context = requireContext()
+      if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+        return capability(false, "permission_denied")
+      }
+      val captureInitializationError = initializeCaptureDevice()
+      if (captureInitializationError != null) throw SessionInitializationException(captureInitializationError)
+      registerLifecycle(context)
+      val manager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+      if (originalAudioMode == null) originalAudioMode = manager.mode
+      manager.mode = AudioManager.MODE_IN_COMMUNICATION
+      val focusError = requestAudioFocus(manager, currentSessionGeneration)
+      if (focusError != null) throw SessionInitializationException(focusError)
+      registerRouteCallback(manager, currentSessionGeneration)
       startPlayback()
-    } catch (error: IllegalStateException) {
-      restoreAudioMode()
-      unregisterLifecycle()
-      return capability(false, error.message ?: "playback_initialization_failed")
+    } catch (error: Exception) {
+      val rollbackSucceeded = rollbackSessionInitialization()
+      val code = when (error) {
+        is SessionInitializationException -> error.code
+        is SecurityException -> "permission_denied"
+        else -> "session_initialization_failed"
+      }
+      return capability(false, if (rollbackSucceeded) code else "session_termination_failed")
     }
     sessionReady = true
     return capability(true, null)
   }
 
   private fun probeCapability(): Map<String, Any?> {
+    if (sessionTerminationFailed) return capability(false, "session_termination_failed")
     val context = requireContext()
     if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
       return capability(false, "permission_denied")
@@ -131,40 +160,22 @@ class CallAudioModule : Module(), Application.ActivityLifecycleCallbacks {
   }
 
   private fun startCapture(): Map<String, Any?> {
+    if (sessionTerminationFailed) return capability(false, "session_termination_failed")
     val context = requireContext()
     if (!sessionReady) return capability(false, "session_not_initialized")
     if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
       return capability(false, "permission_denied")
     }
     if (captureRunning.get()) return capability(true, null)
+    if (audioRecord == null) {
+      val captureInitializationError = initializeCaptureDevice()
+      if (captureInitializationError != null) {
+        releaseCapture()
+        return capability(false, captureInitializationError)
+      }
+    }
 
-    val minBytes = AudioRecord.getMinBufferSize(
-      CAPTURE_RATE,
-      AudioFormat.CHANNEL_IN_MONO,
-      AudioFormat.ENCODING_PCM_16BIT,
-    )
-    if (minBytes <= 0 || minBytes > MAX_CAPTURE_BUFFER_BYTES) {
-      return capability(false, "capture_format_unavailable")
-    }
-    val record = try {
-      AudioRecord(
-        MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-        CAPTURE_RATE,
-        AudioFormat.CHANNEL_IN_MONO,
-        AudioFormat.ENCODING_PCM_16BIT,
-        minOf(MAX_CAPTURE_BUFFER_BYTES, maxOf(minBytes * 2, 3200)),
-      )
-    } catch (_: IllegalArgumentException) {
-      return capability(false, "capture_initialization_failed")
-    } catch (_: SecurityException) {
-      return capability(false, "permission_denied")
-    }
-    if (record.state != AudioRecord.STATE_INITIALIZED || record.sampleRate != CAPTURE_RATE) {
-      record.release()
-      return capability(false, "capture_initialization_failed")
-    }
-    audioRecord = record
-    val aecResult = enableAec(record.audioSessionId)
+    val record = audioRecord ?: return capability(false, "capture_initialization_failed")
     try {
       record.startRecording()
     } catch (_: IllegalStateException) {
@@ -179,11 +190,15 @@ class CallAudioModule : Module(), Application.ActivityLifecycleCallbacks {
       return capability(false, "capture_start_failed")
     }
     captureRunning.set(true)
-    captureThread = Thread({ captureLoop(record) }, "CallAudioCapture").apply { start() }
-    return capability(true, null, aecResult)
+    val eventSessionGeneration = sessionGeneration.get()
+    captureThread = Thread(
+      { captureLoop(record, eventSessionGeneration) },
+      "CallAudioCapture-$eventSessionGeneration",
+    ).apply { start() }
+    return capability(true, null)
   }
 
-  private fun probeCaptureInitialization(): String? {
+  private fun initializeCaptureDevice(): String? {
     val minBytes = AudioRecord.getMinBufferSize(
       CAPTURE_RATE,
       AudioFormat.CHANNEL_IN_MONO,
@@ -203,31 +218,43 @@ class CallAudioModule : Module(), Application.ActivityLifecycleCallbacks {
     } catch (_: SecurityException) {
       return "permission_denied"
     }
-    val error = if (record.state == AudioRecord.STATE_INITIALIZED && record.sampleRate == CAPTURE_RATE) {
-      null
-    } else {
-      "capture_initialization_failed"
+    if (record.state != AudioRecord.STATE_INITIALIZED || record.sampleRate != CAPTURE_RATE) {
+      record.release()
+      return "capture_initialization_failed"
     }
-    record.release()
-    return error
+    audioRecord = record
+    aecStatus = enableAec(record.audioSessionId)
+    noiseSuppressorStatus = enableNoiseSuppressor(record.audioSessionId)
+    return when {
+      !aecStatus.first -> aecStatus.second ?: "aec_initialization_failed"
+      !noiseSuppressorStatus.first -> noiseSuppressorStatus.second ?: "noise_suppressor_initialization_failed"
+      else -> null
+    }
   }
 
-  private fun captureLoop(record: AudioRecord) {
+  private fun captureLoop(record: AudioRecord, eventSessionGeneration: Long) {
     val buffer = ByteArray(3200)
-    var sequence = 1L
     while (captureRunning.get()) {
       val read = record.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
       if (read > 0) {
+        val deviceSequence = captureSequence.incrementAndGet()
+        if (captureInFlight.size >= MAX_CAPTURE_IN_FLIGHT) {
+          failure("capture_bridge_backpressure", "capture", eventSessionGeneration)
+          captureRunning.set(false)
+          break
+        }
+        captureInFlight.add(deviceSequence)
         sendEvent(
           "onCapturedAudio",
           mapOf(
-            "sequence" to sequence++,
+            "deviceSequence" to deviceSequence,
+            "sessionGeneration" to eventSessionGeneration,
             "payloadBase64" to Base64.encodeToString(buffer, 0, read, Base64.NO_WRAP),
             "format" to format(CAPTURE_RATE),
           ),
         )
       } else if (read < 0 && captureRunning.get()) {
-        failure("capture_read_failed", "capture")
+        failure("capture_read_failed", "capture", eventSessionGeneration)
         captureRunning.set(false)
       }
     }
@@ -235,9 +262,18 @@ class CallAudioModule : Module(), Application.ActivityLifecycleCallbacks {
 
   private fun stopCapture() {
     captureRunning.set(false)
-    runCatching { audioRecord?.stop() }
+    try {
+      audioRecord?.stop()
+    } catch (_: RuntimeException) {
+      // The worker stop/join result below remains authoritative.
+    }
     captureThread?.interrupt()
-    captureThread?.join(250)
+    val thread = captureThread
+    thread?.join(250)
+    if (thread?.isAlive == true) {
+      markTerminationFailed("capture_stop_timeout", sessionGeneration.get())
+      return
+    }
     captureThread = null
     releaseCapture()
   }
@@ -245,11 +281,16 @@ class CallAudioModule : Module(), Application.ActivityLifecycleCallbacks {
   private fun releaseCapture() {
     echoCanceler?.release()
     echoCanceler = null
+    noiseSuppressor?.release()
+    noiseSuppressor = null
+    aecStatus = false to "aec_not_initialized"
+    noiseSuppressorStatus = false to "noise_suppressor_not_initialized"
     audioRecord?.release()
     audioRecord = null
   }
 
   private fun startPlayback() {
+    if (sessionTerminationFailed) throw IllegalStateException("session_termination_failed")
     if (playbackRunning.get()) return
     val minBytes = AudioTrack.getMinBufferSize(
       PLAYBACK_RATE,
@@ -281,7 +322,11 @@ class CallAudioModule : Module(), Application.ActivityLifecycleCallbacks {
     audioTrack = track
     track.play()
     playbackRunning.set(true)
-    playbackThread = Thread({ playbackLoop(track) }, "CallAudioPlayback").apply { start() }
+    val eventSessionGeneration = sessionGeneration.get()
+    playbackThread = Thread(
+      { playbackLoop(track, eventSessionGeneration) },
+      "CallAudioPlayback-$eventSessionGeneration",
+    ).apply { start() }
   }
 
   private fun enqueuePlayback(
@@ -290,6 +335,8 @@ class CallAudioModule : Module(), Application.ActivityLifecycleCallbacks {
     payloadBase64: String,
     isFinal: Boolean,
   ): Long {
+    check(!sessionTerminationFailed) { "session_termination_failed" }
+    check(sessionReady) { "session_not_initialized" }
     val payload = try {
       Base64.decode(payloadBase64, Base64.DEFAULT)
     } catch (_: IllegalArgumentException) {
@@ -305,156 +352,157 @@ class CallAudioModule : Module(), Application.ActivityLifecycleCallbacks {
     return currentGeneration
   }
 
-  private fun playbackLoop(track: AudioTrack) {
-    var previousHead = track.playbackHeadPosition.toLong() and 0xffffffffL
-    var observedResetEpoch = resetEpoch
-    var submittedFrames = 0L
-    val finalTargets = mutableListOf<Pair<PlaybackChunk, Long>>()
-    while (playbackRunning.get()) {
-      if (observedResetEpoch != resetEpoch) {
-        observedResetEpoch = resetEpoch
-        previousHead = track.playbackHeadPosition.toLong() and 0xffffffffL
-        submittedFrames = 0L
-        finalTargets.clear()
+  private fun playbackLoop(track: AudioTrack, eventSessionGeneration: Long) {
+    val accounting = PlaybackLoopAccounting(track.playbackHeadPosition.toLong() and 0xffffffffL)
+    val commandProcessor = PlaybackCommandProcessor(playbackState, accounting)
+    while (playbackRunning.get() || hasPlaybackCommands()) {
+      val command = synchronized(playbackCommandLock) {
+        if (playbackCommands.isEmpty()) null else playbackCommands.removeFirst()
       }
-      synchronized(pendingFinalsLock) {
-        while (pendingFinals.isNotEmpty()) {
-          val finalChunk = pendingFinals.removeFirst()
-          finalTargets.add(finalChunk to submittedFrames)
+      if (command != null) {
+        val outcome = commandProcessor.stop(
+          command.keys,
+          track.playbackHeadPosition.toLong() and 0xffffffffL,
+        )
+        if (outcome.activeStopped) {
+          track.pause()
+          track.flush()
+          if (playbackRunning.get()) track.play()
+          accounting.applyStop(true, track.playbackHeadPosition.toLong() and 0xffffffffL)
         }
+        outcome.stoppedKeys.forEach { emitStoppedReceipt(it, command.generation, eventSessionGeneration) }
+        stopOperations.complete(outcome.stoppedKeys).forEach { it.resolve(null) }
       }
-      if (pendingFlush) {
-        track.pause()
-        track.flush()
-        playbackHeadBase = 0L
-        previousHead = track.playbackHeadPosition.toLong() and 0xffffffffL
-        submittedFrames = 0L
-        finalTargets.clear()
-        pendingFlush = false
-        if (playbackRunning.get()) track.play()
-        emitStoppedReceipts()
-      }
-      val chunk = if (finalTargets.isEmpty()) {
-        queue.pollWhile { playbackRunning.get() }
-      } else {
+
+      val active = playbackState.chooseActive()
+      val chunk = if (active != null && accounting.finalTarget == null) queue.pollFor(active) else null
+      if (chunk == null) {
         Thread.sleep(5)
-        null
       }
       if (chunk != null && isCurrent(chunk)) {
         var offset = 0
         while (offset < chunk.payload.size && playbackRunning.get() && isCurrent(chunk)) {
-          val written = track.write(chunk.payload, offset, chunk.payload.size - offset, AudioTrack.WRITE_BLOCKING)
+          val writeBytes = minOf(960, chunk.payload.size - offset)
+          val written = track.write(chunk.payload, offset, writeBytes, AudioTrack.WRITE_BLOCKING)
           if (written <= 0) {
-            failure("playback_write_failed", "playback")
+            failure("playback_write_failed", "playback", eventSessionGeneration)
             break
           }
           offset += written
-          submittedFrames += written / 2L
+          accounting.recordSubmitted(written / 2L)
         }
-      if (offset == chunk.payload.size && chunk.isFinal && isCurrent(chunk)) {
-          synchronized(pendingFinalsLock) { pendingFinals.addLast(chunk) }
-      }
+        if (offset == chunk.payload.size && chunk.isFinal && isCurrent(chunk)) {
+          accounting.markFinal(chunk)
+        }
       }
 
       val currentHead = track.playbackHeadPosition.toLong() and 0xffffffffL
-      playbackHeadBase += PlaybackAccounting.unsignedDelta(previousHead, currentHead)
-      previousHead = currentHead
-      val iterator = finalTargets.iterator()
-      while (iterator.hasNext()) {
-        val (finalChunk, target) = iterator.next()
-        if (!isCurrent(finalChunk)) {
-          iterator.remove()
-        } else if (playbackHeadBase >= target) {
-          completion(finalChunk)
-          iterator.remove()
+      accounting.observeHead(currentHead)
+      accounting.finalTarget?.first?.let { finalChunk ->
+        if (!isCurrent(finalChunk)) accounting.discardStaleFinal()
+        else accounting.takeConsumedFinal()?.let { consumedFinal ->
+          completion(consumedFinal, eventSessionGeneration)
+          playbackState.complete(finalChunk.key)
+          accounting.complete(track.playbackHeadPosition.toLong() and 0xffffffffL)
         }
       }
     }
   }
 
-  private fun completion(chunk: PlaybackChunk) {
+  private fun completion(chunk: PlaybackChunk, eventSessionGeneration: Long) {
     sendEvent(
       "onPlaybackCompleted",
       mapOf(
         "responseId" to chunk.key.responseId,
         "streamId" to chunk.key.streamId,
         "generation" to chunk.generation,
+        "sessionGeneration" to eventSessionGeneration,
       ),
     )
   }
 
-  private fun stopPlayback(responseId: String?, streamId: Int?) {
-    if (responseId != null && streamId != null) {
-      tombstone(StreamKey(responseId, streamId), true)
+  private fun stopPlayback(responseId: String?, streamId: Int?, promise: Promise) {
+    if (sessionTerminationFailed) {
+      promise.reject("ERR_CALL_AUDIO_TERMINATION_FAILED", "session_termination_failed", null)
       return
     }
-    val keys = streamGenerations.keys.toList()
-    keys.forEach { tombstone(it, true) }
-    queue.clear()
-    flushPlaybackTrack()
-  }
-
-  private fun tombstone(key: StreamKey, emitReceipt: Boolean) {
+    val requestedKeys = if (responseId != null && streamId != null) {
+      listOf(StreamKey(responseId, streamId))
+    } else {
+      streamGenerations.keys.toList()
+    }
+    val registration = stopOperations.register(requestedKeys, promise)
+    if (registration.resolveImmediately) {
+      promise.resolve(null)
+      return
+    }
+    val keys = registration.newlyPendingKeys
+    if (keys.isEmpty()) return
+    if (playbackThread?.isAlive != true) {
+      stopOperations.cancelRegistration(promise)
+      promise.reject("ERR_CALL_AUDIO_PLAYBACK_UNAVAILABLE", "playback_worker_unavailable", null)
+      return
+    }
     val stoppedGeneration = generation.incrementAndGet()
-    tombstonedStreams.add(key)
-    streamGenerations[key] = stoppedGeneration
-    queue.remove(key)
-    synchronized(pendingFinalsLock) {
-      val retained = pendingFinals.filterNot { it.key == key }
-      pendingFinals.clear()
-      pendingFinals.addAll(retained)
+    keys.forEach {
+      tombstonedStreams.add(it)
+      streamGenerations[it] = stoppedGeneration
     }
-    flushPlaybackTrack()
-    if (emitReceipt) synchronized(stoppedReceiptLock) {
-      stoppedReceipts.addLast(key to stoppedGeneration)
+    synchronized(playbackCommandLock) {
+      playbackCommands.addLast(PlaybackCommand(keys, stoppedGeneration))
     }
-  }
-
-  private fun isCurrent(chunk: PlaybackChunk): Boolean =
-    streamGenerations[chunk.key] == chunk.generation
-
-  private fun flushPlaybackTrack() {
-    resetEpoch += 1
-    pendingFlush = true
     queue.wake()
   }
 
-  private fun emitStoppedReceipts() {
-    val receipts = synchronized(stoppedReceiptLock) {
-      stoppedReceipts.toList().also { stoppedReceipts.clear() }
-    }
-    receipts.forEach { (key, stoppedGeneration) ->
-      sendEvent(
-        "onPlaybackStopped",
-        mapOf(
-          "responseId" to key.responseId,
-          "streamId" to key.streamId,
-          "generation" to stoppedGeneration,
-        ),
-      )
-    }
+  private fun isCurrent(chunk: PlaybackChunk): Boolean = streamGenerations[chunk.key] == chunk.generation
+
+  private fun hasPlaybackCommands(): Boolean = synchronized(playbackCommandLock) {
+    playbackCommands.isNotEmpty()
   }
+
+  private fun emitStoppedReceipt(key: StreamKey, stoppedGeneration: Long, eventSessionGeneration: Long) = sendEvent(
+    "onPlaybackStopped",
+    mapOf(
+      "responseId" to key.responseId,
+      "streamId" to key.streamId,
+      "generation" to stoppedGeneration,
+      "sessionGeneration" to eventSessionGeneration,
+    ),
+  )
 
   private fun closeSession() {
     stopCapture()
+    if (captureThread?.isAlive == true) {
+      cleanupSessionSideEffects()
+      throw IllegalStateException("session_termination_failed")
+    }
     playbackRunning.set(false)
     queue.clear()
-    playbackThread?.interrupt()
-    playbackThread?.join(250)
+    queue.wake()
+    val thread = playbackThread
+    thread?.join(250)
+    if (thread?.isAlive == true) {
+      markTerminationFailed("playback_stop_timeout", sessionGeneration.get())
+      cleanupSessionSideEffects()
+      throw IllegalStateException("session_termination_failed")
+    }
     playbackThread = null
-    runCatching { audioTrack?.stop() }
+    try {
+      audioTrack?.stop()
+    } catch (_: RuntimeException) {
+      // Track is released only after its worker has terminated.
+    }
     audioTrack?.release()
     audioTrack = null
-    unregisterRouteCallback()
-    restoreAudioMode()
-    unregisterLifecycle()
+    cleanupSessionSideEffects()
     sessionReady = false
+    check(stopOperations.isIdle()) { "playback_stop_operations_pending" }
+    resetSessionState()
   }
 
   private fun capability(
     available: Boolean,
     reason: String?,
-    aecResult: Pair<Boolean, String?> = false to null,
   ): Map<String, Any?> = mapOf(
     "available" to available,
     "reason" to reason,
@@ -462,9 +510,19 @@ class CallAudioModule : Module(), Application.ActivityLifecycleCallbacks {
     "playbackFormat" to if (available) format(PLAYBACK_RATE) else null,
     "aec" to mapOf(
       "available" to AcousticEchoCanceler.isAvailable(),
-      "enabled" to aecResult.first,
-      "error" to aecResult.second,
+      "enabled" to aecStatus.first,
+      "error" to aecStatus.second,
     ),
+    "noiseSuppressor" to mapOf(
+      "available" to NoiseSuppressor.isAvailable(),
+      "enabled" to noiseSuppressorStatus.first,
+      "error" to noiseSuppressorStatus.second,
+    ),
+    "audioFocus" to mapOf(
+      "granted" to audioFocusGranted,
+      "error" to if (audioFocusGranted) null else "audio_focus_not_granted",
+    ),
+    "sessionGeneration" to sessionGeneration.get(),
   )
 
   private fun enableAec(audioSessionId: Int): Pair<Boolean, String?> {
@@ -476,14 +534,151 @@ class CallAudioModule : Module(), Application.ActivityLifecycleCallbacks {
     return if (result == 0 && effect.enabled) true to null else false to "aec_enable_failed"
   }
 
+  private fun enableNoiseSuppressor(audioSessionId: Int): Pair<Boolean, String?> {
+    if (!NoiseSuppressor.isAvailable()) return false to "noise_suppressor_unavailable"
+    val effect = NoiseSuppressor.create(audioSessionId) ?: return false to "noise_suppressor_create_failed"
+    noiseSuppressor = effect
+    val result = effect.setEnabled(true)
+    return if (result == 0 && effect.enabled) true to null else false to "noise_suppressor_enable_failed"
+  }
+
+  private fun requestAudioFocus(manager: AudioManager, eventSessionGeneration: Long): String? {
+    val listener = AudioManager.OnAudioFocusChangeListener { change ->
+      if (change < 0) {
+        failure("audio_focus_lost", "session", eventSessionGeneration)
+      }
+    }
+    legacyAudioFocusListener = listener
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+      @Suppress("DEPRECATION")
+      val result = manager.requestAudioFocus(
+        listener,
+        AudioManager.STREAM_VOICE_CALL,
+        AudioManager.AUDIOFOCUS_GAIN_TRANSIENT,
+      )
+      audioFocusGranted = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+      return if (audioFocusGranted) null else "audio_focus_denied"
+    }
+    val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
+      .setAudioAttributes(
+        AudioAttributes.Builder()
+          .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+          .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+          .build(),
+      )
+      .setOnAudioFocusChangeListener(listener)
+      .build()
+    audioFocusRequest = request
+    audioFocusGranted = manager.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+    return if (audioFocusGranted) null else "audio_focus_denied"
+  }
+
+  private fun abandonAudioFocus() {
+    val context = appContext.reactContext
+    if (context == null) {
+      audioFocusRequest = null
+      legacyAudioFocusListener = null
+      audioFocusGranted = false
+      return
+    }
+    val manager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    val request = audioFocusRequest
+    val listener = legacyAudioFocusListener
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && request != null) {
+      manager.abandonAudioFocusRequest(request)
+    } else if (listener != null) {
+      @Suppress("DEPRECATION")
+      manager.abandonAudioFocus(listener)
+    }
+    audioFocusRequest = null
+    legacyAudioFocusListener = null
+    audioFocusGranted = false
+  }
+
+  private fun rollbackSessionInitialization(): Boolean {
+    playbackRunning.set(false)
+    queue.wake()
+    val thread = playbackThread
+    thread?.join(250)
+    if (thread?.isAlive == true) {
+      markTerminationFailed("playback_stop_timeout", sessionGeneration.get())
+      releaseCapture()
+      cleanupSessionSideEffects()
+      return false
+    }
+    playbackThread = null
+    try {
+      audioTrack?.stop()
+    } catch (_: RuntimeException) {
+      // Track is released only after its worker has terminated.
+    }
+    audioTrack?.release()
+    audioTrack = null
+    releaseCapture()
+    cleanupSessionSideEffects()
+    sessionReady = false
+    return true
+  }
+
+  private fun markTerminationFailed(code: String, eventSessionGeneration: Long) {
+    sessionTerminationFailed = true
+    workerOwnership.markStopResult(stopped = false)
+    sessionReady = false
+    synchronized(playbackCommandLock) { playbackCommands.clear() }
+    stopOperations.fail().forEach {
+      it.reject("ERR_CALL_AUDIO_TERMINATION_FAILED", "session_termination_failed", null)
+    }
+    failure(code, "session", eventSessionGeneration)
+  }
+
+  private fun cleanupSessionSideEffects() {
+    try {
+      unregisterRouteCallback()
+    } catch (_: RuntimeException) {
+      routeCallback = null
+    }
+    try {
+      abandonAudioFocus()
+    } catch (_: RuntimeException) {
+      audioFocusRequest = null
+      legacyAudioFocusListener = null
+      audioFocusGranted = false
+    }
+    try {
+      restoreAudioMode()
+    } catch (_: RuntimeException) {
+      originalAudioMode = null
+    }
+    try {
+      unregisterLifecycle()
+    } catch (_: RuntimeException) {
+      lifecycleRegistered = false
+    }
+  }
+
+  private fun resetSessionState() {
+    streamGenerations.clear()
+    tombstonedStreams.clear()
+    captureInFlight.clear()
+    playbackState.reset()
+    synchronized(playbackCommandLock) { playbackCommands.clear() }
+    stopOperations = StopOperationRegistry()
+    generation.set(0)
+    captureSequence.set(0)
+  }
+
   private fun format(sampleRate: Int): Map<String, Any> = mapOf(
     "encoding" to "pcm_s16le",
     "sampleRateHz" to sampleRate,
     "channels" to CHANNELS,
   )
 
-  private fun failure(code: String, operation: String) {
-    sendEvent("onAudioFailure", mapOf("code" to code, "operation" to operation))
+  private fun failure(code: String, operation: String, eventSessionGeneration: Long) {
+    sendEvent("onAudioFailure", mapOf(
+      "code" to code,
+      "operation" to operation,
+      "sessionGeneration" to eventSessionGeneration,
+    ))
   }
 
   private fun requireContext(): Context =
@@ -502,14 +697,14 @@ class CallAudioModule : Module(), Application.ActivityLifecycleCallbacks {
     lifecycleRegistered = false
   }
 
-  private fun registerRouteCallback(manager: AudioManager) {
+  private fun registerRouteCallback(manager: AudioManager, eventSessionGeneration: Long) {
     if (routeCallback != null) return
     routeCallback = object : AudioDeviceCallback() {
-        override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) = emitRoutes(manager)
-        override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) = emitRoutes(manager)
+        override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) = emitRoutes(manager, eventSessionGeneration)
+        override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) = emitRoutes(manager, eventSessionGeneration)
       }
     manager.registerAudioDeviceCallback(routeCallback, null)
-    emitRoutes(manager)
+    emitRoutes(manager, eventSessionGeneration)
   }
 
   private fun unregisterRouteCallback() {
@@ -519,9 +714,9 @@ class CallAudioModule : Module(), Application.ActivityLifecycleCallbacks {
     routeCallback = null
   }
 
-  private fun emitRoutes(manager: AudioManager) {
+  private fun emitRoutes(manager: AudioManager, eventSessionGeneration: Long) {
     val outputs = manager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).map { deviceType(it.type) }
-    sendEvent("onRouteChanged", mapOf("outputs" to outputs))
+    sendEvent("onRouteChanged", mapOf("outputs" to outputs, "sessionGeneration" to eventSessionGeneration))
   }
 
   private fun deviceType(type: Int): String = when (type) {
@@ -543,7 +738,10 @@ class CallAudioModule : Module(), Application.ActivityLifecycleCallbacks {
   override fun onActivityResumed(activity: Activity) { resumedActivities += 1 }
   override fun onActivityPaused(activity: Activity) {
     resumedActivities = maxOf(0, resumedActivities - 1)
-    if (resumedActivities == 0) sendEvent("onLifecycle", mapOf("state" to "background"))
+    if (resumedActivities == 0) sendEvent("onLifecycle", mapOf(
+      "state" to "background",
+      "sessionGeneration" to sessionGeneration.get(),
+    ))
   }
   override fun onActivityCreated(activity: Activity, state: Bundle?) = Unit
   override fun onActivityStarted(activity: Activity) = Unit
@@ -551,3 +749,10 @@ class CallAudioModule : Module(), Application.ActivityLifecycleCallbacks {
   override fun onActivitySaveInstanceState(activity: Activity, state: Bundle) = Unit
   override fun onActivityDestroyed(activity: Activity) = Unit
 }
+
+private data class PlaybackCommand(
+  val keys: List<StreamKey>,
+  val generation: Long,
+)
+
+private class SessionInitializationException(val code: String) : Exception(code)

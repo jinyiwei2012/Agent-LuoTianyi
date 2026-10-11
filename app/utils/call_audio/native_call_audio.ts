@@ -53,7 +53,12 @@ function matchesFormat(
 function capabilityOf(native: NativeCapability): CallAudioCapability {
   return native.available &&
     matchesFormat(native.captureFormat, CAPTURE_FORMAT) &&
-    matchesFormat(native.playbackFormat, PLAYBACK_FORMAT)
+    matchesFormat(native.playbackFormat, PLAYBACK_FORMAT) &&
+    native.aec.available &&
+    native.aec.enabled &&
+    native.noiseSuppressor.available &&
+    native.noiseSuppressor.enabled &&
+    native.audioFocus.granted
     ? 'available'
     : 'unavailable';
 }
@@ -69,6 +74,8 @@ export class AndroidCallAudio implements CallAudioCapturePort, CallAudioPlayback
   private readonly subscriptions: { remove(): void }[] = [];
   private consumptionListener: (receipt: PlaybackConsumptionReceipt) => void = () => {};
   private captureListener: ((frame: CapturedAudioFrame) => void) | undefined;
+  private sessionGeneration: number | undefined;
+  private terminationFailed = false;
 
   constructor(
     private readonly events: CallAudioCoordinatorEvents = {},
@@ -77,10 +84,14 @@ export class AndroidCallAudio implements CallAudioCapturePort, CallAudioPlayback
   ) {}
 
   async initialize(): Promise<CallAudioCapability> {
-    if (this.platform !== 'android' || this.native === null) return 'unavailable';
+    if (this.terminationFailed || this.platform !== 'android' || this.native === null) return 'unavailable';
     try {
-      const capability = capabilityOf(await this.native.startSession());
-      if (capability === 'available') this.subscribe();
+      const nativeCapability = await this.native.startSession();
+      const capability = capabilityOf(nativeCapability);
+      if (capability === 'available') {
+        this.resetSessionState(nativeCapability.sessionGeneration);
+        this.subscribe();
+      }
       return capability;
     } catch {
       return 'unavailable';
@@ -88,7 +99,7 @@ export class AndroidCallAudio implements CallAudioCapturePort, CallAudioPlayback
   }
 
   async getCapability(): Promise<CallAudioCapability> {
-    if (this.platform !== 'android' || this.native === null) return 'unavailable';
+    if (this.terminationFailed || this.platform !== 'android' || this.native === null) return 'unavailable';
     try {
       return capabilityOf(await this.native.getCapability());
     } catch {
@@ -126,6 +137,11 @@ export class AndroidCallAudio implements CallAudioCapturePort, CallAudioPlayback
     this.ledger.register(chunk.stream, generation);
   }
 
+  /** Records a capture frame after the call transport has assigned its authoritative wire seq. */
+  recordTransportFrame(frame: CapturedAudioFrame, wireSequence: number): void {
+    this.recoveryBuffer.append({ ...frame, wireSequence });
+  }
+
   async stop(stream?: CallAudioStreamIdentity): Promise<void> {
     const native = this.requireNative();
     if (stream) {
@@ -153,22 +169,34 @@ export class AndroidCallAudio implements CallAudioCapturePort, CallAudioPlayback
     this.subscriptions.splice(0).forEach((subscription) => subscription.remove());
     this.captureListener = undefined;
     this.recoveryBuffer.clear();
-    if (this.native !== null && this.platform === 'android') await this.native.stopSession();
+    this.streams.clear();
+    this.ledger.clear();
+    this.sessionGeneration = undefined;
+    if (this.native !== null && this.platform === 'android') {
+      try {
+        await this.native.stopSession();
+      } catch (error) {
+        this.terminationFailed = true;
+        throw error;
+      }
+    }
   }
 
   private subscribe(): void {
     if (this.native === null || this.subscriptions.length > 0) return;
     this.subscriptions.push(
       this.native.addListener('onCapturedAudio', (event) => {
+        if (!this.isCurrentSession(event.sessionGeneration)) return;
         const frame: CapturedAudioFrame = {
-          sequence: event.sequence,
+          deviceSequence: event.deviceSequence,
           payload: Uint8Array.from(Buffer.from(event.payloadBase64, 'base64')),
           format: event.format,
         };
-        this.recoveryBuffer.append(frame);
         this.captureListener?.(frame);
+        void this.native?.acknowledgeCapturedAudio(event.deviceSequence, event.sessionGeneration);
       }),
       this.native.addListener('onPlaybackCompleted', (event) => {
+        if (!this.isCurrentSession(event.sessionGeneration)) return;
         const stream = this.streams.get(this.key(event.responseId, event.streamId));
         if (stream && sameStream(stream, event.responseId, event.streamId)) {
           if (this.ledger.acceptCompletion(stream, event.generation)) {
@@ -177,24 +205,43 @@ export class AndroidCallAudio implements CallAudioCapturePort, CallAudioPlayback
         }
       }),
       this.native.addListener('onPlaybackStopped', (event) => {
+        if (!this.isCurrentSession(event.sessionGeneration)) return;
         const stream = this.streams.get(this.key(event.responseId, event.streamId));
         if (stream) this.ledger.tombstone(stream, event.generation);
       }),
-      this.native.addListener('onAudioFailure', (event) => this.events.onFailure?.(event)),
-      this.native.addListener('onLifecycle', (event: NativeLifecycleEvent) => {
-        if (event.state === 'background') this.events.onBackgrounded?.();
+      this.native.addListener('onAudioFailure', (event) => {
+        if (this.isCurrentSession(event.sessionGeneration)) this.events.onFailure?.(event);
       }),
-      this.native.addListener('onRouteChanged', (event) => this.events.onRouteObserved?.(event)),
+      this.native.addListener('onLifecycle', (event: NativeLifecycleEvent) => {
+        if (this.isCurrentSession(event.sessionGeneration) && event.state === 'background') {
+          this.events.onBackgrounded?.();
+        }
+      }),
+      this.native.addListener('onRouteChanged', (event) => {
+        if (this.isCurrentSession(event.sessionGeneration)) this.events.onRouteObserved?.(event);
+      }),
     );
   }
 
   private requireNative(): CallAudioNativeModule {
+    if (this.terminationFailed) throw new Error('session_termination_failed');
     if (this.platform !== 'android' || this.native === null) throw new Error('call_audio_unavailable');
     return this.native;
   }
 
   private key(responseId: string, streamId: number): string {
     return `${responseId}\u0000${streamId}`;
+  }
+
+  private isCurrentSession(sessionGeneration: number): boolean {
+    return this.sessionGeneration === sessionGeneration;
+  }
+
+  private resetSessionState(sessionGeneration: number): void {
+    this.recoveryBuffer.clear();
+    this.streams.clear();
+    this.ledger.clear();
+    this.sessionGeneration = sessionGeneration;
   }
 }
 
