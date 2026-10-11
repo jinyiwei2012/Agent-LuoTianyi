@@ -29,16 +29,39 @@ class UserResetReport:
 class UserResetService:
     """Best-effort, retry-safe orchestration for deleting all user-owned data."""
 
-    def __init__(self, *, conversation_service, vector_store, redis_buffer, media_store) -> None:
+    def __init__(
+        self,
+        *,
+        conversation_service,
+        vector_store,
+        redis_buffer,
+        media_store,
+        call_sessions=None,
+        call_maintenance_batches=None,
+    ) -> None:
         self._conversation_service = conversation_service
         self._vector_store = vector_store
         self._redis = redis_buffer
         self._media_store = media_store
+        self._call_sessions = call_sessions
+        self._call_maintenance_batches = call_maintenance_batches
 
     def reset(self, user_id: str) -> UserResetReport:
         steps = (
             self._run_count_step("conversations", lambda: self._conversation_service.reset_user_conversations(user_id)),
             self._run_count_step("vectors", lambda: self._vector_store.delete_user_records(user_id)),
+            self._run_count_step(
+                "call_sessions",
+                lambda: self._call_sessions.delete_by_user(user_id) if self._call_sessions is not None else 0,
+            ),
+            self._run_count_step(
+                "call_maintenance_batches",
+                lambda: (
+                    self._call_maintenance_batches.delete_by_user(user_id)
+                    if self._call_maintenance_batches is not None
+                    else 0
+                ),
+            ),
             self._run_void_step("cache", lambda: self._redis.clear_user(user_id)),
             self._run_media_step(user_id),
         )

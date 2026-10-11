@@ -57,6 +57,7 @@ def _to_record(row: CallSession) -> CallSessionRecord:
         maintenance_status=SettlementStatus(row.maintenance_status),
         conversation_id=UUID(row.conversation_id) if row.conversation_id else None,
         maintenance_turn_seq=row.maintenance_turn_seq,
+        settlement_input_digest=row.settlement_input_digest,
         created_at=_record_time(row.created_at),
         updated_at=_record_time(row.updated_at),
     )
@@ -80,6 +81,7 @@ def _values(record: CallSessionRecord) -> dict[str, object]:
         "maintenance_status": record.maintenance_status.value,
         "conversation_id": str(record.conversation_id) if record.conversation_id else None,
         "maintenance_turn_seq": record.maintenance_turn_seq,
+        "settlement_input_digest": record.settlement_input_digest,
         "created_at": _stored_time(record.created_at),
         "updated_at": _stored_time(record.updated_at),
     }
@@ -140,6 +142,33 @@ class SqlCallSessionRepository:
         finally:
             session.close()
 
+    def claim_settlement_input(self, call_id: UUID, *, digest: str) -> bool:
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise ValueError("digest must be lowercase SHA-256 hex")
+        session = self._sql_session_factory()
+        try:
+            result = session.execute(
+                update(CallSession)
+                .where(
+                    CallSession.call_id == str(call_id),
+                    CallSession.state == CallState.ENDED.value,
+                    CallSession.settlement_input_digest.is_(None),
+                )
+                .values(settlement_input_digest=digest)
+            )
+            if result.rowcount == 1:
+                session.commit()
+                return True
+            session.rollback()
+            row = session.get(CallSession, str(call_id))
+            if row is None or row.state != CallState.ENDED.value:
+                return False
+            if row.settlement_input_digest != digest:
+                raise ValueError("SETTLEMENT_INPUT_CONFLICT")
+            return True
+        finally:
+            session.close()
+
     def update_if_state(
         self,
         call_id: UUID,
@@ -153,7 +182,13 @@ class SqlCallSessionRepository:
         session = self._sql_session_factory()
         try:
             lifecycle_values = _values(record)
-            for field in ("summary_status", "maintenance_status", "conversation_id", "maintenance_turn_seq"):
+            for field in (
+                "summary_status",
+                "maintenance_status",
+                "conversation_id",
+                "maintenance_turn_seq",
+                "settlement_input_digest",
+            ):
                 lifecycle_values.pop(field)
             stored_updated_at = lifecycle_values.pop("updated_at")
             result = session.execute(
