@@ -19,6 +19,7 @@ class ActionKind(str, Enum):
     END_CALL = "end_call"
     ANSWER_CALL = "answer_call"
     FINALIZE_CALL = "finalize_call"
+    MINECRAFT_ACTION = "minecraft_action"
 
 
 class OutputDelivery(str, Enum):
@@ -96,6 +97,7 @@ class EffectKind(str, Enum):
     DYNAMIC_POST = "dynamic_post"
     DYNAMIC_COMMENT = "dynamic_comment"
     SONG_LEARNING_JOB = "song_learning_job"
+    MINECRAFT_ACTION_REQUEST = "minecraft_action_request"
 
 
 class ExecutionErrorCode(str, Enum):
@@ -113,3 +115,4 @@ class ExecutionErrorCode(str, Enum):
     AUDIO_GENERATION_FAILED = "AUDIO_GENERATION_FAILED"
     CANCELLED = "CANCELLED"
     INTERNAL_ERROR = "INTERNAL_ERROR"
+    MINECRAFT_ADMISSION_UNKNOWN = "MINECRAFT_ADMISSION_UNKNOWN"

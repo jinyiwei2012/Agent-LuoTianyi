@@ -12,7 +12,7 @@ import src.domain.agent as domain
 ENUMS = {
     "ActionKind": (
         "start_thinking say sing restore_expression write_diary publish_dynamic reply_dynamic request_song_learning "
-        "cognitive_maintenance reflection end_call answer_call finalize_call"
+        "cognitive_maintenance reflection end_call answer_call finalize_call minecraft_action"
     ),
     "OutputDelivery": "conversation ephemeral_reaction",
     "Visibility": "global private",
@@ -22,7 +22,7 @@ ENUMS = {
     "MessageEndStatus": "completed failed cancelled",
     "ExecutionStatus": "completed failed cancelled",
     "ActionExecutionStatus": "completed already_completed cancelled failed not_started",
-    "EffectKind": "dynamic_post dynamic_comment song_learning_job",
+    "EffectKind": "dynamic_post dynamic_comment song_learning_job minecraft_action_request",
     "AudioErrorCode": "EMPTY_AUDIO GENERATION_FAILED",
     "SinkRejectionCode": (
         "IDENTITY_MISMATCH CONTENT_CONFLICT STALE_INTERACTION UNSUPPORTED_OUTPUT SINK_CLOSED BACKPRESSURE_TIMEOUT"
@@ -30,6 +30,7 @@ ENUMS = {
     "ExecutionErrorCode": (
         "CONTRACT_MISMATCH UNSUPPORTED_ACTION UNSUPPORTED_OUTPUT STALE_INTERACTION SINK_CLOSED BACKPRESSURE_TIMEOUT "
         "DEPENDENCY_UNAVAILABLE PROVIDER_TIMEOUT AUDIO_EMPTY AUDIO_GENERATION_FAILED CANCELLED INTERNAL_ERROR"
+        " MINECRAFT_ADMISSION_UNKNOWN"
     ),
     "RealizationContractErrorCode": (
         "CONTRACT_INVALID_ACTION CONTRACT_INVALID_PLAN CONTRACT_INVALID_EXECUTION_CONTEXT CONTRACT_INVALID_OUTPUT "

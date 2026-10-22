@@ -1,8 +1,10 @@
 """不可变行动与计划；只校验本身的值，不执行行动。"""
 
+import math
 from abc import abstractmethod
 from dataclasses import dataclass
 from datetime import date
+from enum import Enum
 from typing import ClassVar
 from uuid import UUID
 
@@ -13,6 +15,7 @@ from ._realization_contract import RealizationContractErrorCode as _Code
 from ._realization_contract import _Value
 from .handle_input import PreprocessedInput
 from .maintenance import MaintenanceReason
+from .minecraft import is_minecraft_coordinate, is_minecraft_dimension, is_minecraft_public_message
 from .realization_enums import ActionKind, OutputDelivery, Visibility
 from .stimulus_values import MediaRef
 
@@ -58,6 +61,87 @@ class Action(_Value):
     @abstractmethod
     def kind(self) -> ActionKind:
         """返回具体行动固定的判别值。"""
+
+
+class MinecraftActionIntent(str, Enum):
+    """Minecraft v1允许的封闭动作提议，不是游戏命令文本。"""
+
+    QUERY = "QUERY"
+    PUBLIC_SAY = "PUBLIC_SAY"
+    LOOK = "LOOK"
+    BOUNDED_WALK = "BOUNDED_WALK"
+    STOP = "STOP"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class MinecraftAction(Action):
+    """带显式绑定身份的类型化 Minecraft 动作提议。"""
+
+    kind: ClassVar[ActionKind] = ActionKind.MINECRAFT_ACTION
+    request_id: str
+    world_id: str
+    body_id: str
+    session_epoch: int
+    intent: MinecraftActionIntent
+    basis_observation_id: str | None
+    public_message: str | None
+    target_dimension_id: str | None
+    target_x: float | None
+    target_y: float | None
+    target_z: float | None
+    maximum_distance: float | None
+    target_request_id: str | None
+
+    def __post_init__(self):
+        _Value.__post_init__(self)
+        self._require(isinstance(self.intent, MinecraftActionIntent), "Invalid Minecraft intent")
+        effect = self.intent in {
+            MinecraftActionIntent.PUBLIC_SAY,
+            MinecraftActionIntent.LOOK,
+            MinecraftActionIntent.BOUNDED_WALK,
+        }
+        self._require(
+            self.intent is MinecraftActionIntent.QUERY or (self.basis_observation_id is not None) == effect,
+            "Invalid Minecraft basis",
+        )
+        self._require(
+            (self.public_message is not None) == (self.intent is MinecraftActionIntent.PUBLIC_SAY),
+            "Invalid Minecraft message",
+        )
+        target_fields = (self.target_dimension_id, self.target_x, self.target_y, self.target_z)
+        has_target = all(value is not None for value in target_fields)
+        self._require(has_target or all(value is None for value in target_fields), "Invalid Minecraft target")
+        self._require(
+            has_target == (self.intent in {MinecraftActionIntent.LOOK, MinecraftActionIntent.BOUNDED_WALK}),
+            "Invalid Minecraft target",
+        )
+        self._require(
+            not has_target
+            or all(is_minecraft_coordinate(value) for value in (self.target_x, self.target_y, self.target_z)),
+            "Invalid Minecraft target",
+        )
+        self._require(not has_target or is_minecraft_dimension(self.target_dimension_id), "Invalid Minecraft target")
+        self._require(
+            (self.maximum_distance is not None) == (self.intent is MinecraftActionIntent.BOUNDED_WALK),
+            "Invalid Minecraft distance",
+        )
+        self._require(
+            (self.target_request_id is not None) == (self.intent is MinecraftActionIntent.STOP),
+            "Invalid Minecraft stop target",
+        )
+        self._require(
+            self.target_request_id is None or bool(self.target_request_id.strip()), "Invalid Minecraft stop target"
+        )
+        self._require(
+            self.public_message is None or is_minecraft_public_message(self.public_message), "Invalid Minecraft message"
+        )
+        if self.maximum_distance is not None:
+            self._require(
+                type(self.maximum_distance) is float
+                and math.isfinite(self.maximum_distance)
+                and 0 < self.maximum_distance <= 4,
+                "Invalid Minecraft distance",
+            )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
