@@ -16,7 +16,7 @@ from typing import Protocol
 
 import src.domain.agent as d
 from src.stage import WorldFactSink
-from src.world.world_settlements import FactSettlementSubscriber
+from src.world.world_settlements import FactHandlingOutcome, FactPlanOutcome, FactSettlementSubscriber
 
 
 class MinecraftAuthority(str, Enum):
@@ -38,6 +38,14 @@ class MinecraftFreshness(str, Enum):
 
     FRESH = "fresh"
     STALE = "stale"
+    UNKNOWN = "unknown"
+
+
+class MinecraftAdmission(str, Enum):
+    """Ingress result; UNKNOWN retains settlement ownership until the stage settles."""
+
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
     UNKNOWN = "unknown"
 
 
@@ -158,8 +166,9 @@ class MinecraftWorldTarget(Protocol):
 class MinecraftObservationAdapter:
     """Fail-closed ingress for fresh public Minecraft observations.
 
-    ``True`` means the stage accepted the observation for handling.  It is not
-    a durable-delivery or exactly-once acknowledgement.
+    ACCEPTED means the stage accepted the observation for handling. It is not a
+    durable-delivery or exactly-once acknowledgement. UNKNOWN means admission
+    could not be observed; its settlement registration is deliberately retained.
     """
 
     _OBSERVATION_KIND = "minecraft_public_snapshot"
@@ -170,34 +179,110 @@ class MinecraftObservationAdapter:
         scope: MinecraftScope,
         target: MinecraftWorldTarget,
         settlements: MinecraftSettlementPort,
+        max_in_flight: int = 8,
     ) -> None:
         if target.character_id != scope.character_id or target.world_id != scope.world_id:
             raise ValueError("Minecraft scope does not match the actual WorldStage target")
+        if type(max_in_flight) is not int or max_in_flight < 1:
+            raise ValueError("max_in_flight must be a positive integer")
         self._scope = scope
         self._target = target
         self._settlements = settlements
+        # This caps all owned registrations, including UNKNOWN outcomes. WorldStage
+        # admission is normally synchronous, so eight is conservative.
+        self._max_in_flight = max_in_flight
+        self._in_flight: dict[asyncio.Task[bool], str] = {}
+        self._owned: dict[str, _OwnedSubscriber] = {}
+        self._abandoned_unknown = 0
+        self._closed = False
 
-    async def submit(self, snapshot: MinecraftPublicSnapshot, subscriber: FactSettlementSubscriber) -> bool:
-        """Build, register, and submit one snapshot without retrying uncertain admission."""
+    async def submit(
+        self, snapshot: MinecraftPublicSnapshot, subscriber: FactSettlementSubscriber
+    ) -> MinecraftAdmission:
+        """Submit once; caller cancellation shields admission and preserves uncertain ownership."""
         if not isinstance(snapshot, MinecraftPublicSnapshot) or not self._is_permitted(snapshot):
-            return False
+            return MinecraftAdmission.REJECTED
+        if self._closed or len(self._owned) >= self._max_in_flight:
+            return MinecraftAdmission.REJECTED
         fact = self._build_fact(snapshot)
-        registered = False
+        owned = _OwnedSubscriber(self, fact.stimulus_id, subscriber)
         try:
-            self._settlements.register(fact.stimulus_id, subscriber)
-            registered = True
-            accepted = await self._target.fact_sink.submit(fact)
+            self._settlements.register(fact.stimulus_id, owned)
+        except Exception:
+            return MinecraftAdmission.REJECTED
+        self._owned[fact.stimulus_id] = owned
+        task = asyncio.create_task(self._target.fact_sink.submit(fact), name="minecraft-observation-admission")
+        self._in_flight[task] = fact.stimulus_id
+        task.add_done_callback(self._admission_done)
+        try:
+            accepted = await asyncio.shield(task)
         except asyncio.CancelledError:
-            if registered:
-                self._settlements.discard(fact.stimulus_id)
+            # The task continues and its callback decides known rejection versus
+            # unknown/accepted ownership. Never drop a possible settlement.
             raise
         except Exception:
-            if registered:
-                self._settlements.discard(fact.stimulus_id)
-            return False
-        if not accepted:
-            self._settlements.discard(fact.stimulus_id)
-        return accepted
+            return MinecraftAdmission.UNKNOWN
+        if accepted is True:
+            return MinecraftAdmission.ACCEPTED
+        if accepted is False:
+            self._discard_owned(fact.stimulus_id)
+            return MinecraftAdmission.REJECTED
+        return MinecraftAdmission.UNKNOWN
+
+    async def close(self) -> None:
+        """Stop new admission and cancel/drain submits without deleting unsettled registrations.
+
+        The owning WorldStage must settle/drain before explicit abandonment. This
+        method is not permission to discard observations while the stage is active.
+        """
+        self._closed = True
+        tasks = tuple(self._in_flight)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def abandon_after_stage_quiesced(self) -> int:
+        """Explicitly abandon retained unknown ownership after caller verified stage quiescence.
+
+        The caller must only use this after the owned WorldStage fully stopped and
+        drained. It is an audited count, not an automatic TTL cleanup.
+        """
+        abandoned = len(self._owned)
+        for stimulus_id in tuple(self._owned):
+            self._discard_owned(stimulus_id)
+        self._abandoned_unknown += abandoned
+        return abandoned
+
+    @property
+    def owned_observation_count(self) -> int:
+        """Number of registered observations still owned by this adapter."""
+        return len(self._owned)
+
+    @property
+    def abandoned_unknown_count(self) -> int:
+        """Cumulative explicit post-quiescence abandonments."""
+        return self._abandoned_unknown
+
+    def _admission_done(self, task: asyncio.Task[bool]) -> None:
+        stimulus_id = self._in_flight.pop(task, None)
+        if stimulus_id is None or task.cancelled():
+            return
+        try:
+            accepted = task.result()
+        except Exception:
+            return
+        if accepted is False:
+            self._discard_owned(stimulus_id)
+        # True, malformed results, and exceptions retain the registration:
+        # only an explicit False proves that this adapter's admission failed.
+
+    def _settled(self, stimulus_id: str) -> None:
+        self._owned.pop(stimulus_id, None)
+
+    def _discard_owned(self, stimulus_id: str) -> None:
+        if self._owned.pop(stimulus_id, None) is not None:
+            self._settlements.discard(stimulus_id)
 
     def _is_permitted(self, snapshot: MinecraftPublicSnapshot) -> bool:
         scope = self._scope
@@ -255,3 +340,36 @@ class MinecraftObservationAdapter:
         if snapshot.action_detail is not None:
             fields.append(f"detail={snapshot.action_detail}")
         return "Minecraft public snapshot: " + "; ".join(fields)
+
+
+class _OwnedSubscriber:
+    """Release adapter capacity exactly when settlement routing reaches its terminal point."""
+
+    def __init__(
+        self,
+        adapter: MinecraftObservationAdapter,
+        stimulus_id: str,
+        subscriber: FactSettlementSubscriber,
+    ) -> None:
+        self._adapter = adapter
+        self._stimulus_id = stimulus_id
+        self._subscriber = subscriber
+        self._pending_plan_ids: set[str] | None = None
+
+    def on_fact_handled(self, outcome: FactHandlingOutcome) -> None:
+        try:
+            self._subscriber.on_fact_handled(outcome)
+        finally:
+            if not outcome.plan_ids:
+                self._adapter._settled(self._stimulus_id)
+            else:
+                self._pending_plan_ids = set(outcome.plan_ids)
+
+    def on_fact_plan_executed(self, outcome: FactPlanOutcome) -> None:
+        try:
+            self._subscriber.on_fact_plan_executed(outcome)
+        finally:
+            if self._pending_plan_ids is not None:
+                self._pending_plan_ids.discard(outcome.plan.plan_id)
+                if not self._pending_plan_ids:
+                    self._adapter._settled(self._stimulus_id)

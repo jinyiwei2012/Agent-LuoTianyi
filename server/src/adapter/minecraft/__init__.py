@@ -6,6 +6,7 @@ public snapshot.
 """
 
 from .observation import (
+    MinecraftAdmission,
     MinecraftAuthority,
     MinecraftFreshness,
     MinecraftObservationAdapter,
@@ -17,6 +18,7 @@ from .observation import (
 
 __all__ = [
     "MinecraftAuthority",
+    "MinecraftAdmission",
     "MinecraftFreshness",
     "MinecraftObservationAdapter",
     "MinecraftPublicSnapshot",

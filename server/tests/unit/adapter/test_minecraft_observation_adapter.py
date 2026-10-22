@@ -7,6 +7,7 @@ import pytest
 
 import src.domain.agent as d
 from src.adapter.minecraft import (
+    MinecraftAdmission,
     MinecraftAuthority,
     MinecraftFreshness,
     MinecraftObservationAdapter,
@@ -94,7 +95,7 @@ async def test_builds_fixed_public_world_observation_and_registers_before_submit
     sink, settlements = Sink(), Settlements()
     adapter = MinecraftObservationAdapter(scope=scope(), target=Target(sink), settlements=settlements)
 
-    assert await adapter.submit(snapshot(), Subscriber()) is True
+    assert await adapter.submit(snapshot(), Subscriber()) is MinecraftAdmission.ACCEPTED
 
     fact = sink.facts[0]
     assert isinstance(fact, d.WorldObservation)
@@ -126,7 +127,7 @@ async def test_scope_or_privacy_mismatch_fails_closed_without_registering(change
     sink, settlements = Sink(), Settlements()
     adapter = MinecraftObservationAdapter(scope=scope(), target=Target(sink), settlements=settlements)
 
-    assert await adapter.submit(snapshot(**change), Subscriber()) is False
+    assert await adapter.submit(snapshot(**change), Subscriber()) is MinecraftAdmission.REJECTED
     assert sink.facts == []
     assert settlements.owners == {}
 
@@ -136,14 +137,14 @@ async def test_client_local_is_rejected_unless_explicitly_allowlisted():
     local = snapshot(authority=MinecraftAuthority.CLIENT_LOCAL)
     sink, settlements = Sink(), Settlements()
     adapter = MinecraftObservationAdapter(scope=scope(), target=Target(sink), settlements=settlements)
-    assert await adapter.submit(local, Subscriber()) is False
+    assert await adapter.submit(local, Subscriber()) is MinecraftAdmission.REJECTED
     assert (
         await MinecraftObservationAdapter(
             scope=scope(allow_client_local=True),
             target=Target(sink),
             settlements=settlements,
         ).submit(local, Subscriber())
-        is True
+        is MinecraftAdmission.ACCEPTED
     )
 
 
@@ -154,13 +155,13 @@ async def test_stage_rejection_and_exception_discard_only_own_successful_registr
     rejected = MinecraftObservationAdapter(
         scope=scope(), target=Target(rejected_sink), settlements=rejected_settlements
     )
-    assert await rejected.submit(snapshot(), subscriber) is False
+    assert await rejected.submit(snapshot(), subscriber) is MinecraftAdmission.REJECTED
     assert rejected_settlements.owners == {}
 
     broken_sink, broken_settlements = Sink(error=RuntimeError("boom")), Settlements()
     broken = MinecraftObservationAdapter(scope=scope(), target=Target(broken_sink), settlements=broken_settlements)
-    assert await broken.submit(snapshot(), subscriber) is False
-    assert broken_settlements.owners == {}
+    assert await broken.submit(snapshot(), subscriber) is MinecraftAdmission.UNKNOWN
+    assert len(broken_settlements.owners) == 1
 
     duplicate_settlements = Settlements()
     duplicate_sink = Sink()
@@ -168,10 +169,24 @@ async def test_stage_rejection_and_exception_discard_only_own_successful_registr
         scope=scope(), target=Target(duplicate_sink), settlements=duplicate_settlements
     )
     owner = Subscriber()
-    assert await duplicate.submit(snapshot(), owner) is True
-    assert await duplicate.submit(snapshot(), subscriber) is False
-    assert tuple(duplicate_settlements.owners.values()) == (owner,)
+    assert await duplicate.submit(snapshot(), owner) is MinecraftAdmission.ACCEPTED
+    assert await duplicate.submit(snapshot(), subscriber) is MinecraftAdmission.REJECTED
+    assert len(duplicate_settlements.owners) == 1
     assert duplicate_settlements.discarded == []
+
+
+@pytest.mark.asyncio
+async def test_unknown_admission_capacity_bounds_retained_subscriptions_before_registering():
+    settlements = Settlements()
+    adapter = MinecraftObservationAdapter(
+        scope=scope(), target=Target(Sink(error=RuntimeError("unknown"))), settlements=settlements, max_in_flight=2
+    )
+
+    assert await adapter.submit(snapshot(event_id="one"), Subscriber()) is MinecraftAdmission.UNKNOWN
+    assert await adapter.submit(snapshot(event_id="two"), Subscriber()) is MinecraftAdmission.UNKNOWN
+    assert await adapter.submit(snapshot(event_id="three"), Subscriber()) is MinecraftAdmission.REJECTED
+    assert len(settlements.owners) == 2
+    assert adapter.owned_observation_count == 2
 
 
 def test_invalid_timestamps_identifiers_and_revisions_are_rejected():
@@ -225,17 +240,32 @@ def test_target_must_be_the_scope_bound_actual_stage():
 
 
 @pytest.mark.asyncio
-async def test_cancellation_after_registration_discards_own_subscription():
-    class CancelledSink(Sink):
+async def test_caller_cancellation_after_stage_admission_keeps_settlement_owner():
+    class DelayedAcceptedSink(Sink):
+        def __init__(self):
+            super().__init__()
+            self.admitted = asyncio.Event()
+            self.release = asyncio.Event()
+
         async def submit(self, fact):
             self.facts.append(fact)
-            raise asyncio.CancelledError()
+            self.admitted.set()
+            await self.release.wait()
+            return True
 
     settlements = Settlements()
-    adapter = MinecraftObservationAdapter(scope=scope(), target=Target(CancelledSink()), settlements=settlements)
+    sink = DelayedAcceptedSink()
+    adapter = MinecraftObservationAdapter(scope=scope(), target=Target(sink), settlements=settlements)
+    submitter = asyncio.create_task(adapter.submit(snapshot(), Subscriber()))
+    await sink.admitted.wait()
+    submitter.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await adapter.submit(snapshot(), Subscriber())
-    assert settlements.owners == {}
+        await submitter
+    assert len(settlements.owners) == 1
+    sink.release.set()
+    await asyncio.sleep(0)
+    assert len(settlements.owners) == 1
+    await adapter.close()
 
 
 def test_stable_identity_is_unambiguous_when_ids_contain_old_delimiter():
