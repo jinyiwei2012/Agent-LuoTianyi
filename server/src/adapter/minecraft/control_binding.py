@@ -221,6 +221,15 @@ class ActiveBinding:
     controller_connection_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class ActiveBindingSnapshot:
+    """One immutable coordinator generation captured without awaiting."""
+
+    generation: int
+    active: ActiveBinding
+    server: AuthenticatedRoleConnection
+
+
 class MinecraftControlBindingCoordinator:
     """Single-event-loop owner of PREPARE→READY→COMMIT→ACTIVE coordination."""
 
@@ -250,6 +259,7 @@ class MinecraftControlBindingCoordinator:
         self._ingress: TypedMinecraftObservationIngress | None = None
         self._last_monotonic: float | None = None
         self._quarantined = False
+        self._generation = 0
 
     @property
     def active(self) -> ActiveBinding | None:
@@ -266,6 +276,14 @@ class MinecraftControlBindingCoordinator:
     @property
     def quarantined(self) -> bool:
         return self._quarantined
+
+    def active_snapshot(self) -> ActiveBindingSnapshot | None:
+        """Return one coherent current ACTIVE/server-origin snapshot."""
+        active = self._active
+        server = self._roles.get(_SERVER)
+        if active is None or server is None or server.connection_id != active.server_connection_id or self._quarantined:
+            return None
+        return ActiveBindingSnapshot(self._generation, active, server)
 
     async def register_authenticated(self, connection: AuthenticatedRoleConnection) -> None:
         expected = {_SERVER: self._policy.server_install_id, _CLIENT: self._policy.client_install_id}
@@ -429,6 +447,7 @@ class MinecraftControlBindingCoordinator:
         self._pending.pop(pending.binding.session_id, None)
         self._ingress = ingress
         self._quarantined = False
+        self._generation += 1
         return ingress
 
     async def check_timeouts(self) -> None:
@@ -505,6 +524,7 @@ class MinecraftControlBindingCoordinator:
         self._ingress = None
         self._pending.clear()
         self._quarantined = True
+        self._generation += 1
         return None if binding is None else BindingRevoke(binding=binding, reason=reason)
 
     async def _best_effort_revoke(self, command: BindingRevoke | None) -> None:
