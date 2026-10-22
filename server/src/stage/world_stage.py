@@ -171,6 +171,24 @@ class WorldStage:
         self._minecraft_observation_scope = scope
         self._minecraft_revision = None
 
+    def unbind_minecraft_observations(self, scope: d.MinecraftObservationScope) -> bool:
+        """Fence the matching trusted observation owner without claiming world quiescence."""
+        if not isinstance(scope, d.MinecraftObservationScope):
+            raise TypeError("scope must be MinecraftObservationScope")
+        if scope != self._minecraft_observation_scope:
+            return False
+        for request in self._requests.values():
+            if isinstance(request.stimulus, d.MinecraftObserved):
+                request.cancellation.cancel(d.CancellationReason.NO_LONGER_NEEDED)
+        self._pending = {
+            stimulus_id: stimulus
+            for stimulus_id, stimulus in self._pending.items()
+            if not isinstance(stimulus, d.MinecraftObserved)
+        }
+        self._minecraft_observation_scope = None
+        self._minecraft_revision = None
+        return True
+
     async def submit_minecraft_observation(
         self,
         fact: d.MinecraftObserved,
