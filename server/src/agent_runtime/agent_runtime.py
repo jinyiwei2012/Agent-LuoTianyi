@@ -39,6 +39,7 @@ from src.agent.handlers.stimulus.diary_due import DiaryPlanningDueHandler
 from src.agent.handlers.stimulus.dynamic_observed import DynamicObservedHandler
 from src.agent.handlers.stimulus.interaction import InteractionEndingHandler
 from src.agent.handlers.stimulus.minecraft import MinecraftObservedHandler
+from src.agent.handlers.stimulus.minecraft_outcome import MinecraftActionOutcomeHandler
 from src.agent.handlers.stimulus.proactive import FirstLoginHandler
 from src.agent.handlers.stimulus.relationship import NewRelationshipProposeHandler
 from src.agent.handlers.stimulus.router import StimulusRouter
@@ -293,6 +294,7 @@ class AgentRuntime:
                     ),
                 )
             )
+            registrations.append((StimulusKind.MINECRAFT_ACTION_OUTCOME_OBSERVED, MinecraftActionOutcomeHandler()))
         reserved_world_kinds = {
             StimulusKind.MINECRAFT_OBSERVED,
             StimulusKind.DYNAMIC_OBSERVED,

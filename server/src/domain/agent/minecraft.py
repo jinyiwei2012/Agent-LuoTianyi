@@ -42,6 +42,31 @@ class MinecraftCapabilityAvailability(str, Enum):
     UNKNOWN = "UNKNOWN"
 
 
+class MinecraftTerminalStatus(str, Enum):
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    TIMED_OUT = "TIMED_OUT"
+    CANCELLED = "CANCELLED"
+    DISCONNECTED = "DISCONNECTED"
+    UNKNOWN = "UNKNOWN"
+
+
+class MinecraftOutcomeKind(str, Enum):
+    SUMMARY = "SUMMARY"
+    PUBLIC_BROADCAST = "PUBLIC_BROADCAST"
+    ORIENTATION = "ORIENTATION"
+    POSITION = "POSITION"
+    STOPPED = "STOPPED"
+    UNDETERMINED = "UNDETERMINED"
+
+
+class MinecraftEffect(str, Enum):
+    NONE = "NONE"
+    PARTIAL = "PARTIAL"
+    COMPLETE = "COMPLETE"
+    UNKNOWN = "UNKNOWN"
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class MinecraftCapabilities:
     query: MinecraftCapabilityAvailability
@@ -121,6 +146,30 @@ class MinecraftBodyState:
             or not -90 <= self.pitch <= 90
         ):
             raise ValueError("invalid Minecraft orientation")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class MinecraftTerminalOutcome:
+    status: MinecraftTerminalStatus
+    reason: str | None
+    kind: MinecraftOutcomeKind
+    effect: MinecraftEffect
+    state: MinecraftBodyState | None
+    observation_id: str | None
+
+    def __post_init__(self):
+        if (
+            not isinstance(self.status, MinecraftTerminalStatus)
+            or not isinstance(self.kind, MinecraftOutcomeKind)
+            or not isinstance(self.effect, MinecraftEffect)
+            or (self.reason is not None and (not isinstance(self.reason, str) or not self.reason.strip()))
+            or (self.state is not None and not isinstance(self.state, MinecraftBodyState))
+            or (
+                self.observation_id is not None
+                and (not isinstance(self.observation_id, str) or not self.observation_id.strip())
+            )
+        ):
+            raise ValueError("invalid Minecraft terminal outcome")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

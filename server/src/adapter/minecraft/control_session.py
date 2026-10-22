@@ -20,6 +20,7 @@ from src.adapter.minecraft.control_binding import (
     ActiveBindingSnapshot,
     MinecraftControlBindingCoordinator,
 )
+from src.adapter.minecraft.terminal_ingress import MinecraftTerminalIngress, TerminalOutcomeSink
 
 _MAX_RETIRED = 2
 _RETIRED_SECONDS = 300.0
@@ -39,6 +40,7 @@ class _OwnedGeneration:
     retired_at: float | None = None
     current: bool = True
     closing: bool = False
+    terminal_ingress: MinecraftTerminalIngress | None = None
 
 
 class RuntimeMinecraftActionPort:
@@ -75,6 +77,8 @@ class MinecraftControlSession:
         monotonic_now: Callable[[], float],
         utc_now: Callable[[], datetime],
         admission_timeout_seconds: float = 5.0,
+        character_id: str = "luotianyi",
+        terminal_sink: TerminalOutcomeSink | None = None,
     ) -> None:
         if type(enabled) is not bool:
             raise TypeError("Minecraft control session enabled must be bool")
@@ -86,6 +90,8 @@ class MinecraftControlSession:
         self._monotonic_now = monotonic_now
         self._utc_now = utc_now
         self._admission_timeout_seconds = admission_timeout_seconds
+        self._character_id = character_id
+        self._terminal_sink = terminal_sink
         self._current: _OwnedGeneration | None = None
         self._retired: list[_OwnedGeneration] = []
         self._closed = False
@@ -154,6 +160,12 @@ class MinecraftControlSession:
             utc_now=self._utc_now,
             admission_timeout_seconds=self._admission_timeout_seconds,
         )
+        generation.terminal_ingress = MinecraftTerminalIngress(
+            ledger=ledger,
+            binding=snapshot.active.binding,
+            character_id=self._character_id,
+            sink=self._terminal_sink,
+        )
         self._current = generation
         self._prune_retired(now)
         return self.runtime_port
@@ -163,16 +175,29 @@ class MinecraftControlSession:
         if self._current is not None and not self._generation_is_current(self._current):
             await self._retire_current(self._monotonic())
 
-    def receive_authoritative(self, envelope, *, origin: TrustedServerOrigin) -> None:
+    async def receive_authoritative(self, envelope, *, origin: TrustedServerOrigin) -> None:
         current = self._current
         if self._generation_is_current(current) and envelope.session_id == current.context.binding.session_id:
             current.port.receive_authoritative(envelope, origin=origin)
+            if envelope.type == "receipt":
+                await current.terminal_ingress.emit(envelope)
             return
         for retired in self._retired:
             if envelope.session_id == retired.context.binding.session_id:
                 retired.ledger.ingest(envelope, origin=origin)
                 return
         raise ControlSessionError("authoritative message has no owned generation")
+
+    def history_outcome(self, envelope, *, origin: TrustedServerOrigin) -> d.MinecraftActionOutcomeObserved:
+        """Project an exact retired-session receipt for audit without current cognition."""
+        for retired in self._retired:
+            if envelope.session_id != retired.context.binding.session_id:
+                continue
+            retired.ledger.ingest(envelope, origin=origin)
+            if envelope.type != "receipt":
+                raise ControlSessionError("historical outcome requires a receipt")
+            return retired.terminal_ingress.fact(envelope)
+        raise ControlSessionError("historical receipt has no retired generation")
 
     async def close(self) -> None:
         if self._closed:
@@ -212,6 +237,7 @@ class MinecraftControlSession:
             return
         generation.closing = True
         try:
+            await generation.terminal_ingress.close()
             await generation.port.close()
         except asyncio.CancelledError:
             raise

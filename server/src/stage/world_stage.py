@@ -199,6 +199,16 @@ class WorldStage:
             return False
         return self._receive(fact, minecraft_scope=scope)
 
+    async def submit_minecraft_outcome(
+        self,
+        fact: d.MinecraftActionOutcomeObserved,
+        scope: d.MinecraftObservationScope,
+    ) -> bool:
+        """Submit a proven terminal outcome through the current trusted fence."""
+        if not isinstance(fact, d.MinecraftActionOutcomeObserved) or scope != self._minecraft_observation_scope:
+            return False
+        return self._receive(fact, minecraft_scope=scope)
+
     def _receive(
         self,
         fact: d.Stimulus,
@@ -215,7 +225,10 @@ class WorldStage:
             or fact.stimulus_id in self._pending
             or len(self._pending) >= self._config.max_stimuli
             or len(self._handles) >= self._config.max_stimuli
-            or (isinstance(fact, d.MinecraftObserved) and minecraft_scope != self._minecraft_observation_scope)
+            or (
+                isinstance(fact, (d.MinecraftObserved, d.MinecraftActionOutcomeObserved))
+                and minecraft_scope != self._minecraft_observation_scope
+            )
             or not self._owner_revision_is_current(fact)
         ):
             return False
@@ -261,6 +274,21 @@ class WorldStage:
                 )
                 return scope == self._minecraft_observation_scope and (
                     self._minecraft_revision is None or revision > self._minecraft_revision
+                )
+            case d.MinecraftActionOutcomeObserved(
+                body_id=body_id,
+                session_id=session_id,
+                session_epoch=session_epoch,
+                server_boot_id=server_boot_id,
+            ):
+                return (
+                    d.MinecraftObservationScope(
+                        body_id=body_id,
+                        session_id=session_id,
+                        session_epoch=session_epoch,
+                        server_boot_id=server_boot_id,
+                    )
+                    == self._minecraft_observation_scope
                 )
             case _:
                 return True

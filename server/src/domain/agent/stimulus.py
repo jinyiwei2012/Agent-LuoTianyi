@@ -23,7 +23,7 @@ from ._stimulus_contract import (
     _require_tuple_of,
     _StimulusMeta,
 )
-from .minecraft import MinecraftBodyState, MinecraftCapabilities, MinecraftUntrustedText
+from .minecraft import MinecraftBodyState, MinecraftCapabilities, MinecraftTerminalOutcome, MinecraftUntrustedText
 from .stimulus_values import (
     ActivityFact,
     BodyRegion,
@@ -63,6 +63,7 @@ class StimulusKind(str, Enum):
     DIARY_PLANNING_DUE = "diary_planning_due"
     WORLD_OBSERVATION = "world_observation"
     MINECRAFT_OBSERVED = "minecraft_observed"
+    MINECRAFT_ACTION_OUTCOME_OBSERVED = "minecraft_action_outcome_observed"
     DAILY_PLANNING_DUE = "daily_planning_due"
     ACTIVITY_DUE = "activity_due"
     ACTIVITY_STARTED = "activity_started"
@@ -457,6 +458,41 @@ class MinecraftObserved(Stimulus):
         _require_instance(self.capabilities, MinecraftCapabilities)
         _require_tuple_of(self.evidence_refs, EvidenceRef)
         _require_tuple_of(self.untrusted_text, MinecraftUntrustedText)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class MinecraftActionOutcomeObserved(Stimulus):
+    """Authoritative terminal world outcome, separate from dispatch completion."""
+
+    kind: ClassVar[StimulusKind] = StimulusKind.MINECRAFT_ACTION_OUTCOME_OBSERVED
+
+    receipt_id: str
+    request_id: str
+    local_action_id: str
+    body_id: str
+    session_id: str
+    session_epoch: int
+    server_boot_id: str
+    server_revision: int
+    server_tick: int
+    evidence_refs: tuple[EvidenceRef, ...]
+    outcome: MinecraftTerminalOutcome
+
+    def __post_init__(self) -> None:
+        Stimulus.__post_init__(self)
+        for value in (
+            self.receipt_id,
+            self.request_id,
+            self.local_action_id,
+            self.body_id,
+            self.session_id,
+            self.server_boot_id,
+        ):
+            _require_nonblank_string(value)
+        for value in (self.session_epoch, self.server_revision, self.server_tick):
+            _require_nonnegative_int(value)
+        _require_tuple_of(self.evidence_refs, EvidenceRef)
+        _require_instance(self.outcome, MinecraftTerminalOutcome)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

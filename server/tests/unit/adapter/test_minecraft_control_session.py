@@ -25,6 +25,7 @@ NOW = datetime(2026, 10, 23, tzinfo=timezone.utc)
 BODY = "10000000-0000-0000-0000-000000000001"
 BOOT = "20000000-0000-0000-0000-000000000002"
 GAME = "30000000-0000-0000-0000-000000000003"
+REQUEST = "f0000000-0000-0000-0000-00000000000f"
 
 
 class Clock:
@@ -56,6 +57,19 @@ class BlockingRevokeSender(Sender):
         self.revoked.append(requirement)
         self.revoke_entered.set()
         await self.release_revoke.wait()
+
+
+class BlockingTerminalSink:
+    def __init__(self):
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
+
+    async def submit(self, fact):
+        self.calls += 1
+        self.entered.set()
+        await self.release.wait()
+        return True
 
 
 class Coordinator:
@@ -147,6 +161,30 @@ def action_request(action_id="action"):
         scope=MinecraftBoundScope(world_id="world", body_id=BODY, session_epoch=1),
         intent=MinecraftIntent.QUERY,
         basis_observation_id=None,
+    )
+
+
+def canonical_request(selected):
+    return decode_message(
+        json.dumps(
+            {
+                "protocol": "luosandbox.minecraft.v1",
+                "type": "request",
+                "actorId": selected.actor_id,
+                "worldId": selected.world_id,
+                "bodyId": selected.body_id,
+                "sessionId": selected.session_id,
+                "sessionEpoch": selected.session_epoch,
+                "messageId": REQUEST,
+                "timestamp": "2026-10-23T00:00:00.000Z",
+                "payload": {
+                    "deadline": "2026-10-23T00:00:05.000Z",
+                    "basis": None,
+                    "intent": {"kind": "QUERY", "queryKind": "READ_ONLY_SUMMARY"},
+                },
+            },
+            separators=(",", ":"),
+        ).encode()
     )
 
 
@@ -298,11 +336,11 @@ async def test_cancelled_retirement_keeps_history_before_cleanup_await_and_route
     with pytest.raises(ControlSessionError):
         await owner.runtime_port.submit(action_request("cannot-revive"))
     trusted_origin = old.context.server_origin
-    owner.receive_authoritative(
+    await owner.receive_authoritative(
         authoritative("admission", "b0000000-0000-0000-0000-00000000000b", wire_id, selected),
         origin=trusted_origin,
     )
-    owner.receive_authoritative(
+    await owner.receive_authoritative(
         authoritative("receipt", "c0000000-0000-0000-0000-00000000000c", wire_id, selected),
         origin=trusted_origin,
     )
@@ -310,3 +348,38 @@ async def test_cancelled_retirement_keeps_history_before_cleanup_await_and_route
     await owner.synchronize()
     await owner.close()
     assert owner._retired.count(old) == 1
+
+
+@pytest.mark.asyncio
+async def test_retirement_closes_terminal_owner_without_resubmitting_old_fact_to_new_stage():
+    sink = BlockingTerminalSink()
+    coordinator, sender, clock = Coordinator(), Sender(), Clock()
+    owner = MinecraftControlSession(
+        enabled=True,
+        coordinator=coordinator,
+        sender=sender,
+        monotonic_now=clock,
+        utc_now=lambda: NOW,
+        admission_timeout_seconds=0.01,
+        terminal_sink=sink,
+    )
+    selected = binding("50000000-0000-0000-0000-000000000005", 1)
+    coordinator.snapshot = snapshot(1, selected)
+    await owner.activate(observation(selected))
+    generation = owner._current
+    generation.ledger.reserve_request(canonical_request(selected), local_action_id="local-action")
+    trusted_origin = generation.context.server_origin
+    generation.ledger.ingest(
+        authoritative("admission", "d0000000-0000-0000-0000-00000000000d", REQUEST, selected),
+        origin=trusted_origin,
+    )
+    terminal = authoritative("receipt", "e0000000-0000-0000-0000-00000000000e", REQUEST, selected)
+    generation.ledger.ingest(terminal, origin=trusted_origin)
+    projection = asyncio.create_task(generation.terminal_ingress.emit(terminal))
+    await sink.entered.wait()
+    coordinator.snapshot = None
+    await owner.synchronize()
+    with pytest.raises(asyncio.CancelledError):
+        await projection
+    assert generation.terminal_ingress.owned_count == 1
+    assert sink.calls == 1
