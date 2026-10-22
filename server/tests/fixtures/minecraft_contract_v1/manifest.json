@@ -1,0 +1,387 @@
+{
+  "version": "minecraft-contract-v1",
+  "specSha256": "7ee44ed20446533628e745ba591e14392af9f1b8e7ba44c2155b3bf72d34f1cb",
+  "schemaSha256": "169436217dac379ed2c13b9c19218405dfbe564fde68ff821fe112a0d843c0d7",
+  "fixtures": [
+    {
+      "path": "valid/admission_accepted.json",
+      "sha256": "958a9ce02fae5552498454c2f7b18f81639da2deae7a8d5d14b8a4a1e9e8246d",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "admission"
+    },
+    {
+      "path": "valid/admission_rejected.json",
+      "sha256": "eeb247b1ae5b5953149b4833b76bb57b9b3ef15653910610ca5f2e15d8d68ddb",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "admission"
+    },
+    {
+      "path": "valid/cancel_emergency.json",
+      "sha256": "a53f0ede7f16e8bd29437a866f08a176717cad0f587f38c75ac637f9ed037dee",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "cancel"
+    },
+    {
+      "path": "valid/cancel_result_emergency.json",
+      "sha256": "748ff1f9d53f6d2588498ba79fe9cac22e40b2758e9285a004822bd76dcb2787",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "cancel_result"
+    },
+    {
+      "path": "valid/cancel_result_requested.json",
+      "sha256": "3a88cc37b71abe018b56b30c512f4d270eb95b6d3a3ba129ac920b51ed0f5069",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "cancel_result"
+    },
+    {
+      "path": "valid/cancel_target.json",
+      "sha256": "f73ddedd3fd1b89b83fe0dda1515320271620f454ee93f0411fca3c272bc5992",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "cancel"
+    },
+    {
+      "path": "valid/observation_decimal_positions.json",
+      "sha256": "3cb3cb7ba780e5560652dc369b4f21a8c2afacfa2401f06a30766ae7ed608dd9",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "observation"
+    },
+    {
+      "path": "valid/observation_public_current.json",
+      "sha256": "2302631c7fca8d7125250ebc6e78d10effda43382f4baa0f7ed3e2809c73f636",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "observation"
+    },
+    {
+      "path": "valid/receipt_cancelled.json",
+      "sha256": "7c76b36ad2cc4921c97a05b125fe29c42fc52f536d088f8583ce98ba3e459357",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "receipt"
+    },
+    {
+      "path": "valid/receipt_disconnected.json",
+      "sha256": "7cd85527b8f3cd88dd184319409a57ea60bdf6901c5dc8744b42a9904983b361",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "receipt"
+    },
+    {
+      "path": "valid/receipt_failed.json",
+      "sha256": "efb2c2076691d27b7db3f3f6fbcd5c129419d44ede784c14a4addc7945af84b7",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "receipt"
+    },
+    {
+      "path": "valid/receipt_succeeded.json",
+      "sha256": "8c2a794246102154b13c6648866fd3e22902aed080671aa8dfe2aaa2e39f1d4f",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "receipt"
+    },
+    {
+      "path": "valid/receipt_timed_out.json",
+      "sha256": "c32ae317f2cf229522350f0b6cb8a7ebdb3c130478b4754946c95e71695de32b",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "receipt"
+    },
+    {
+      "path": "valid/receipt_unknown.json",
+      "sha256": "af666ce02a32e5967bd931f7b5b09aec3453aab7d08eea76579107045b74ca6a",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "receipt"
+    },
+    {
+      "path": "valid/reconcile_admission_rejected.json",
+      "sha256": "c4d6057514166bd0ab2342a8e26a4f630a5fca5a579d2a0fe7ad2423e5e8e603",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "reconcile_result"
+    },
+    {
+      "path": "valid/reconcile_blocked.json",
+      "sha256": "66df619f7c154ee6ea7b37ca0a36479f05b4343e436a4a00f54161e884436f63",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "reconcile_result"
+    },
+    {
+      "path": "valid/reconcile_in_flight.json",
+      "sha256": "2d167a578e8f5d6fc62112f90d92c9f1afb9f36440cc3693f573d3d61ffcc28d",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "reconcile_result"
+    },
+    {
+      "path": "valid/reconcile_known.json",
+      "sha256": "1c5ea4fe458b6f64f6197455aa2dbfa98c9d778e8cad9672dcff24dfdeb72f55",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "reconcile_result"
+    },
+    {
+      "path": "valid/reconcile_quiescent.json",
+      "sha256": "662a12475bc69ceb7f968743c874cad6696c9d9884b75972834fc0c862212d6a",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "reconcile_result"
+    },
+    {
+      "path": "valid/reconcile_rejected.json",
+      "sha256": "c790a12b7c909b618d7e32284b22077f66b475377d7844890bfbdbf65eece5bf",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "reconcile_result"
+    },
+    {
+      "path": "valid/reconcile_request.json",
+      "sha256": "19d231303ce191c6434a684242007a84b8217f4c706075d6a92a90769e5920a4",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "reconcile"
+    },
+    {
+      "path": "valid/reconcile_unknown.json",
+      "sha256": "38a239c292cb53dce5ed6a86587026bda91b34295b3aab7d9f5d0068d9f5004e",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "reconcile_result"
+    },
+    {
+      "path": "valid/request_look.json",
+      "sha256": "08d43da5d4b64934617b5b59c8826dd6f4b12b144e8904afd3ae48ea725ee222",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "request"
+    },
+    {
+      "path": "valid/request_query_bootstrap.json",
+      "sha256": "7db7486c5022014c4ff788dbe14140214043f356624744908f8a5d75ea0e85f2",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "request"
+    },
+    {
+      "path": "valid/request_say.json",
+      "sha256": "87e01d7d92493afbd2ea14369efd7634ad8cdd5ded829d0706dc921b297904f4",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "request"
+    },
+    {
+      "path": "valid/request_walk.json",
+      "sha256": "4c4201f525e5f44869486f22ec1f1da3866fb4c2333fd07ebfb35979a6c38189",
+      "expectedLayer": "schema",
+      "expectedResult": "accept",
+      "type": "request"
+    },
+    {
+      "path": "invalid/admission_accepted_reason.json",
+      "sha256": "c5bbfe0e99d304fb5f881cb9c55e0612a6e7b3922e68731e70d7615723958fc0",
+      "expectedLayer": "schema",
+      "expectedResult": "reject",
+      "type": "admission"
+    },
+    {
+      "path": "invalid/admission_rejected_target_terminal.json",
+      "sha256": "a413d0865d553827a0ce5bd62f21a273201d3cb1eeb62e7804a77a29baf50e59",
+      "expectedLayer": "schema",
+      "expectedResult": "reject",
+      "type": "admission"
+    },
+    {
+      "path": "invalid/cancel_emergency_target.json",
+      "sha256": "678af480060afe6fdf8318e327ffb3941f56c3d30bdef98ee359248d0b4880b5",
+      "expectedLayer": "schema",
+      "expectedResult": "reject",
+      "type": "cancel"
+    },
+    {
+      "path": "invalid/cancel_result_already_terminal_backpressure.json",
+      "sha256": "5e9f623b916761b5037e384821a3eb6ec986637b86a0b9b6cd6d109ffe174951",
+      "expectedLayer": "schema",
+      "expectedResult": "reject",
+      "type": "cancel_result"
+    },
+    {
+      "path": "invalid/cancel_result_not_found_backpressure.json",
+      "sha256": "5f70cc60e2c9c271389c577998661a97ec61c77ba60c3637a765d1e55cfe6956",
+      "expectedLayer": "schema",
+      "expectedResult": "reject",
+      "type": "cancel_result"
+    },
+    {
+      "path": "invalid/cancel_target_null.json",
+      "sha256": "16a27cfb449317dfd5393ae7e29f49384c5768809926f787a8d7874404599bd2",
+      "expectedLayer": "schema",
+      "expectedResult": "reject",
+      "type": "cancel"
+    },
+    {
+      "path": "invalid/dimension_uppercase.json",
+      "sha256": "0d53b3951d0165ff33c18217b1ebd640d7e42777fad1d9ab8402a3aa70fabee5",
+      "expectedLayer": "schema",
+      "expectedResult": "reject",
+      "type": "observation"
+    },
+    {
+      "path": "invalid/i63_boolean.json",
+      "sha256": "947b0e67818910f21225a628ca6846f00bb0221e580f5437c9c2b49ea795534b",
+      "expectedLayer": "schema",
+      "expectedResult": "reject",
+      "type": "request"
+    },
+    {
+      "path": "invalid/invalid_utc_year0000.json",
+      "sha256": "c46ea7d4ecf7281bcb7dd813c04211e19aa27451104a444ea36147cd57d88c7f",
+      "expectedLayer": "schema",
+      "expectedResult": "reject",
+      "type": "admission"
+    },
+    {
+      "path": "invalid/observation_client_source.json",
+      "sha256": "47ebe9451e22bc96c9844837969c503eb71eb65888fca05f09b8030ae5db6e14",
+      "expectedLayer": "schema",
+      "expectedResult": "reject",
+      "type": "observation"
+    },
+    {
+      "path": "invalid/receipt_cancelled_missing_evidence.json",
+      "sha256": "182a8b3b0c5b7826f78984bff45e91bec4aacb816c0576921812f2516a0dbc8f",
+      "expectedLayer": "schema",
+      "expectedResult": "reject",
+      "type": "receipt"
+    },
+    {
+      "path": "invalid/receipt_disconnected_missing_evidence.json",
+      "sha256": "98a14b7603980e5a2b892a8ec7cf104ec0b1ea5e5489b46b363ec932d468842d",
+      "expectedLayer": "schema",
+      "expectedResult": "reject",
+      "type": "receipt"
+    },
+    {
+      "path": "invalid/receipt_succeeded_missing_evidence.json",
+      "sha256": "45d3ebf46c519d030e03a2fe7f73b80eb1d9670588fa3421f244c60927896940",
+      "expectedLayer": "schema",
+      "expectedResult": "reject",
+      "type": "receipt"
+    },
+    {
+      "path": "invalid/receipt_succeeded_undetermined.json",
+      "sha256": "319f5a7ead0a975fbedb284b054eb6ba402a6458c03b616eff627bad1e1b75f7",
+      "expectedLayer": "schema",
+      "expectedResult": "reject",
+      "type": "receipt"
+    },
+    {
+      "path": "invalid/receipt_timed_out_missing_evidence.json",
+      "sha256": "aedc04a6342bf2d15f47c80b70ad4e9036757a97cff1cb36f8f1fcc6018af9ca",
+      "expectedLayer": "schema",
+      "expectedResult": "reject",
+      "type": "receipt"
+    },
+    {
+      "path": "invalid/receipt_unknown_wrong_outcome.json",
+      "sha256": "5dcd7da0aa1c730cafeb8a9d11f8a2322d9877884e3c9304f8ac078fae677ac9",
+      "expectedLayer": "schema",
+      "expectedResult": "reject",
+      "type": "receipt"
+    },
+    {
+      "path": "invalid/reconcile_known_missing_receipt.json",
+      "sha256": "acf0779f828094f46c32144d5e07111e89d3b7945ab9deaebe2d30a5c1f25839",
+      "expectedLayer": "schema",
+      "expectedResult": "reject",
+      "type": "reconcile_result"
+    },
+    {
+      "path": "invalid/reconcile_quiescent_target.json",
+      "sha256": "5f6d63f8b875e02ba232c838519f1023eb2d9d6c884cfd5a76f2a3b5cafcb33d",
+      "expectedLayer": "schema",
+      "expectedResult": "reject",
+      "type": "reconcile_result"
+    },
+    {
+      "path": "invalid/reconcile_rejected_target_terminal.json",
+      "sha256": "17e42720b914b84661db0b8329bb9e27b4c29571fbd662c3b4d1d79d03ca17fa",
+      "expectedLayer": "schema",
+      "expectedResult": "reject",
+      "type": "reconcile_result"
+    },
+    {
+      "path": "invalid/request_look_null_basis.json",
+      "sha256": "ce85dcdf85504c68309ce3878a217309952a042d979c2940b119397e28a84032",
+      "expectedLayer": "schema",
+      "expectedResult": "reject",
+      "type": "request"
+    },
+    {
+      "path": "invalid/request_say_null_basis.json",
+      "sha256": "e19276db00905a892f94a220d592ee6fc07cd5f772fd55344ab3f8e41e4f990b",
+      "expectedLayer": "schema",
+      "expectedResult": "reject",
+      "type": "request"
+    },
+    {
+      "path": "invalid/request_stop_intent.json",
+      "sha256": "247876bf0cb2c4648ef8253a8ad3593e26c1c94f682ed66c8eefb84149810ff2",
+      "expectedLayer": "schema",
+      "expectedResult": "reject",
+      "type": "request"
+    },
+    {
+      "path": "invalid/request_walk_null_basis.json",
+      "sha256": "b1f4bf35098fd5943e3ae8ab06561077d6ced077f8e341672f4d0a1ca88114cb",
+      "expectedLayer": "schema",
+      "expectedResult": "reject",
+      "type": "request"
+    },
+    {
+      "path": "invalid/semantic_cancel_self_reference.json",
+      "sha256": "8eecdce8744ea4faee2e4c0465abdcae8b54851836732b4aef0ff6ae9ddc3688",
+      "expectedLayer": "semantic",
+      "expectedResult": "reject",
+      "type": "cancel"
+    },
+    {
+      "path": "invalid/unknown_envelope_key.json",
+      "sha256": "504599b7734ba99409f6137a4348011ea91ad612f2abe5c7e61110ca44193600",
+      "expectedLayer": "schema",
+      "expectedResult": "reject",
+      "type": "request"
+    },
+    {
+      "path": "invalid/unknown_receipt_reason.json",
+      "sha256": "46e599f736c9a9d04a646f0e9eb6c9a2be9caf6ebd2a79ea3d039cc3a66ced6d",
+      "expectedLayer": "schema",
+      "expectedResult": "reject",
+      "type": "receipt"
+    }
+  ],
+  "rawFixtures": [
+    {
+      "path": "invalid/raw_invalid_utf8.hex",
+      "sha256": "7b786ff0c7896c217c3b19529b2a977c772b769cfc29b695e4a756be17c071fa",
+      "expectedLayer": "parser",
+      "expectedResult": "reject",
+      "errorCategory": "INVALID_UTF8"
+    },
+    {
+      "path": "invalid/raw_i63_exponent.txt",
+      "sha256": "d2a1b56ea2d93385f8bdc6b1c1459e1dd67c84c68266ba46bb19ce97b83c908e",
+      "expectedLayer": "semantic",
+      "expectedResult": "reject",
+      "errorCategory": "I63_LEXICAL"
+    }
+  ]
+}
