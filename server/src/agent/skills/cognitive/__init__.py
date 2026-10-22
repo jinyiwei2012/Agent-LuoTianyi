@@ -5,6 +5,7 @@ from src.agent.skills.contracts import ComposedReply, ComposedResponse, ReplyDra
 from .audio_understanding import AudioUnderstandingResult, AudioUnderstandingSkill
 from .image_understanding import ImageUnderstandingSkill
 from .intentional_memory import ExplicitMemoryIntentSkill
+from .minecraft_decision import MinecraftDecisionSkill
 from .response_composition import ResponseCompositionSkill
 from .response_generation import CharacterReplyGenerator
 from .song_entity_linker import SongEntityLinker
@@ -19,6 +20,7 @@ __all__ = [
     "ComposedResponse",
     "ExplicitMemoryIntentSkill",
     "ImageUnderstandingSkill",
+    "MinecraftDecisionSkill",
     "ReplyDraft",
     "ResponseCompositionSkill",
     "TopicExtractionSkill",

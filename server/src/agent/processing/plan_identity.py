@@ -27,6 +27,8 @@ _types = {
         d.EndCall,
         d.AnswerCall,
         d.FinalizeCall,
+        d.MinecraftAction,
+        d.MinecraftActionIntent,
         d.MaintenanceReason,
         d.PreprocessedInput,
         d.MediaRef,

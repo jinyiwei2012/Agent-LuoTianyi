@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
+import src.domain.agent as d
 from src.domain.agent import CancellationToken
 from src.domain.memory_context import MemoryHit
 
@@ -55,6 +56,13 @@ class CharacterNarrative:
             raise ValueError("角色名称不能为空")
         if not isinstance(self.persona, str) or not isinstance(self.speaking_style, str):
             raise TypeError("角色人设与表达风格必须是字符串")
+
+
+@dataclass(frozen=True, slots=True)
+class MinecraftDecision:
+    """A fail-closed decision: no action means the observation is declined."""
+
+    action: d.MinecraftAction | None = None
 
 
 @dataclass(frozen=True)

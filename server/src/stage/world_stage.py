@@ -59,6 +59,8 @@ class WorldStage:
         self._state = StageState.ONLINE
         self._revision = 0
         self._world_revision = 0
+        self._minecraft_observation_scope: d.MinecraftObservationScope | None = None
+        self._minecraft_revision: int | None = None
         self._activity_id: str | None = None
         self._activity_revision: int | None = None
         self._planning_cycle_id: str | None = None
@@ -66,8 +68,10 @@ class WorldStage:
         self._pending: dict[str, d.Stimulus] = {}
         self._requests: dict[str, d.HandleStimulusRequest] = {}
         self._handles: dict[str, asyncio.Task[None]] = {}
-        self._plans: asyncio.Queue[tuple[d.ActionPlan, d.CancellationToken]] = asyncio.Queue(
-            maxsize=self._config.max_plans,
+        self._plans: asyncio.Queue[tuple[d.ActionPlan, d.CancellationToken, d.MinecraftObservationScope | None]] = (
+            asyncio.Queue(
+                maxsize=self._config.max_plans,
+            )
         )
         self._execution: d.ExecutionContext | None = None
         self._output_sink = NoChannelOutputSink()
@@ -140,7 +144,49 @@ class WorldStage:
     def execution_worker(self) -> asyncio.Task[None]:
         return self._worker
 
-    def _receive(self, fact: d.Stimulus) -> bool:
+    @property
+    def minecraft_observation_scope(self) -> d.MinecraftObservationScope | None:
+        return self._minecraft_observation_scope
+
+    def bind_minecraft_observations(self, scope: d.MinecraftObservationScope) -> None:
+        """Install a trusted authenticated owner fence or explicitly replace it.
+
+        The external binding owner must authenticate the server and prove the
+        prior body fence quiescent before replacing a non-equal scope. Stage
+        cancels old pending cognition and queued plans but cannot prove an
+        already dispatched world effect stopped.
+        """
+        if not isinstance(scope, d.MinecraftObservationScope):
+            raise TypeError("scope must be MinecraftObservationScope")
+        if scope == self._minecraft_observation_scope:
+            return
+        for request in self._requests.values():
+            if isinstance(request.stimulus, d.MinecraftObserved):
+                request.cancellation.cancel(d.CancellationReason.NO_LONGER_NEEDED)
+        self._pending = {
+            stimulus_id: stimulus
+            for stimulus_id, stimulus in self._pending.items()
+            if not isinstance(stimulus, d.MinecraftObserved)
+        }
+        self._minecraft_observation_scope = scope
+        self._minecraft_revision = None
+
+    async def submit_minecraft_observation(
+        self,
+        fact: d.MinecraftObserved,
+        scope: d.MinecraftObservationScope,
+    ) -> bool:
+        """Submit through the currently installed trusted owner fence."""
+        if not isinstance(fact, d.MinecraftObserved) or scope != self._minecraft_observation_scope:
+            return False
+        return self._receive(fact, minecraft_scope=scope)
+
+    def _receive(
+        self,
+        fact: d.Stimulus,
+        *,
+        minecraft_scope: d.MinecraftObservationScope | None = None,
+    ) -> bool:
         if (
             not isinstance(fact, d.Stimulus)
             or self._state is not StageState.ONLINE
@@ -151,6 +197,7 @@ class WorldStage:
             or fact.stimulus_id in self._pending
             or len(self._pending) >= self._config.max_stimuli
             or len(self._handles) >= self._config.max_stimuli
+            or (isinstance(fact, d.MinecraftObserved) and minecraft_scope != self._minecraft_observation_scope)
             or not self._owner_revision_is_current(fact)
         ):
             return False
@@ -181,6 +228,22 @@ class WorldStage:
                     or self._activity_revision is None
                     or revision >= self._activity_revision
                 )
+            case d.MinecraftObserved(
+                body_id=body_id,
+                session_id=session_id,
+                session_epoch=session_epoch,
+                server_boot_id=server_boot_id,
+                server_revision=revision,
+            ):
+                scope = d.MinecraftObservationScope(
+                    body_id=body_id,
+                    session_id=session_id,
+                    session_epoch=session_epoch,
+                    server_boot_id=server_boot_id,
+                )
+                return scope == self._minecraft_observation_scope and (
+                    self._minecraft_revision is None or revision > self._minecraft_revision
+                )
             case _:
                 return True
 
@@ -190,6 +253,10 @@ class WorldStage:
                 self._world_revision = revision
             case d.ActivityObservation(activity_id=activity_id, activity_revision=revision):
                 self._activity_id, self._activity_revision = activity_id, revision
+            case d.MinecraftObserved(
+                server_revision=revision,
+            ):
+                self._minecraft_revision = revision
             case _:
                 return
 
@@ -251,11 +318,16 @@ class WorldStage:
         if not task.cancelled() and task.exception() is not None:
             self._logger.error("WorldStage completion failed request=%s", request_id)
 
-    def _enqueue_plan(self, plan: d.ActionPlan, token: d.CancellationToken) -> None:
+    def _enqueue_plan(
+        self,
+        plan: d.ActionPlan,
+        token: d.CancellationToken,
+        minecraft_scope: d.MinecraftObservationScope | None = None,
+    ) -> None:
         if self._state is not StageState.ONLINE:
             raise d.SinkRejectedError("stage is closed", code=d.SinkRejectionCode.SINK_CLOSED)
         try:
-            self._plans.put_nowait((plan, token))
+            self._plans.put_nowait((plan, token, minecraft_scope))
         except asyncio.QueueFull as error:
             raise d.SinkRejectedError(
                 "plan queue is full",
@@ -264,9 +336,13 @@ class WorldStage:
 
     async def _execution_worker(self) -> None:
         while True:
-            plan, handle_token = await self._plans.get()
+            plan, handle_token, minecraft_scope = await self._plans.get()
             try:
-                if handle_token.is_cancelled or self._state is not StageState.ONLINE:
+                if (
+                    handle_token.is_cancelled
+                    or self._state is not StageState.ONLINE
+                    or (minecraft_scope is not None and minecraft_scope != self._minecraft_observation_scope)
+                ):
                     continue
                 context = d.ExecutionContext(
                     execution_id=str(uuid4()),

@@ -8,6 +8,7 @@ from src.agent.processing.plan_emitter import PlanEmitter
 
 WORLD_ACTIVITY_STIMULUS_KINDS: Final = (
     d.StimulusKind.WORLD_OBSERVATION,
+    d.StimulusKind.MINECRAFT_OBSERVED,
     d.StimulusKind.ACTIVITY_OBSERVATION,
     d.StimulusKind.DYNAMIC_OBSERVED,
     d.StimulusKind.DIARY_PLANNING_DUE,

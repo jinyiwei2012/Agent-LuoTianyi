@@ -85,6 +85,15 @@ from .maintenance import (
     MaintenanceReport,
     MaintenanceStatus,
 )
+from .minecraft import (
+    MinecraftBodyState,
+    MinecraftCapabilities,
+    MinecraftCapabilityAvailability,
+    MinecraftObservationScope,
+    MinecraftPosition,
+    MinecraftUntrustedText,
+    is_minecraft_coordinate,
+)
 from .realization_enums import (
     ActionExecutionStatus,
     ActionKind,
@@ -124,6 +133,7 @@ from .stimulus import (
     InteractionDeadline,
     InteractionEnding,
     InteractionEndingReason,
+    MinecraftObserved,
     NewRelationshipPropose,
     ProactivePromptDue,
     SongKnowledgeDiscovered,
@@ -261,6 +271,14 @@ __all__ = (
     "InteractionDeadline",
     "InteractionEnding",
     "InteractionEndingReason",
+    "MinecraftObserved",
+    "MinecraftBodyState",
+    "MinecraftCapabilities",
+    "MinecraftCapabilityAvailability",
+    "MinecraftObservationScope",
+    "MinecraftPosition",
+    "MinecraftUntrustedText",
+    "is_minecraft_coordinate",
     "NewRelationshipPropose",
     "MediaRef",
     "ProactivePromptDue",

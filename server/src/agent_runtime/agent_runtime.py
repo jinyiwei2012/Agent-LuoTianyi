@@ -10,6 +10,7 @@ from src.agent.handlers.action.call_settlement import FinalizeCallHandler
 from src.agent.handlers.action.cognitive_maintenance import CognitiveMaintenanceActionHandler
 from src.agent.handlers.action.dynamic import PublishDynamicHandler
 from src.agent.handlers.action.dynamic_reply import ReplyDynamicHandler
+from src.agent.handlers.action.minecraft import MinecraftActionHandler
 from src.agent.handlers.action.restore_expression import RestoreExpressionHandler
 from src.agent.handlers.action.router import ActionRouter
 from src.agent.handlers.action.say import SayHandler
@@ -37,6 +38,7 @@ from src.agent.handlers.stimulus.citywalk import (
 from src.agent.handlers.stimulus.diary_due import DiaryPlanningDueHandler
 from src.agent.handlers.stimulus.dynamic_observed import DynamicObservedHandler
 from src.agent.handlers.stimulus.interaction import InteractionEndingHandler
+from src.agent.handlers.stimulus.minecraft import MinecraftObservedHandler
 from src.agent.handlers.stimulus.proactive import FirstLoginHandler
 from src.agent.handlers.stimulus.relationship import NewRelationshipProposeHandler
 from src.agent.handlers.stimulus.router import StimulusRouter
@@ -49,11 +51,12 @@ from src.agent.handlers.stimulus.world_activity import (
 )
 from src.agent.skills import SharedSkills
 from src.agent.skills.adapters.memory import AgentMemory
-from src.agent.skills.cognitive import CharacterReplyGenerator
+from src.agent.skills.cognitive import CharacterReplyGenerator, MinecraftDecisionSkill
 from src.agent.skills.contracts import CharacterNarrative
 from src.agent.skills.expression.prepared_speech import PreparedSpeechCatalog
 from src.agent_runtime.character_registry import CharacterRegistry
 from src.domain.agent import ActionKind, StimulusKind
+from src.domain.agent.minecraft import MinecraftActionPort
 from src.infrastructure.media import MediaResolver
 from src.infrastructure.persistence.database.vector_store import (
     clear_vector_store,
@@ -107,6 +110,7 @@ class AgentRuntime:
         database_manager: DatabaseManager,
         *,
         media_resolver: MediaResolver,
+        minecraft_action_port: MinecraftActionPort | None = None,
     ) -> None:
         """初始化启用角色及注册表，为门面注入数据库会话工厂；初始化失败回滚资源。"""
         self.logger = get_logger(__name__)
@@ -114,6 +118,7 @@ class AgentRuntime:
         self.llm_service = llm_service
         self.media_resolver = media_resolver
         self.database_manager = database_manager
+        self._minecraft_action_port = minecraft_action_port
         self._shutdown_lock = asyncio.Lock()
         self._shutdown_complete = False
         self._shutdown_task: asyncio.Task | None = None
@@ -138,6 +143,8 @@ class AgentRuntime:
                 )
                 for character_id, generator in self.reply_generators.items()
             }
+            self._minecraft_character_id, minecraft_model = self._configure_minecraft(llm_service)
+            self._minecraft_decision = MinecraftDecisionSkill(minecraft_model, narratives)
             touch_configs = {
                 character_id: self.character_registry.get(character_id).reflex.get("touch", {}).get("fast_reply", {})
                 for character_id in self.character_memories
@@ -276,7 +283,18 @@ class AgentRuntime:
                 ),
             ),
         ]
+        if character_id == self._minecraft_character_id:
+            registrations.append(
+                (
+                    StimulusKind.MINECRAFT_OBSERVED,
+                    MinecraftObservedHandler(
+                        self._minecraft_decision,
+                        world_id=self._minecraft_action_port.scope.world_id,
+                    ),
+                )
+            )
         reserved_world_kinds = {
+            StimulusKind.MINECRAFT_OBSERVED,
             StimulusKind.DYNAMIC_OBSERVED,
             StimulusKind.DIARY_PLANNING_DUE,
             StimulusKind.SONG_KNOWLEDGE_DISCOVERED,
@@ -303,36 +321,57 @@ class AgentRuntime:
         character_id: str,
     ) -> ActionRouter:
         """登记一个角色可实现的行动。"""
-        return ActionRouter(
+        registrations = [
             (
-                (
-                    ActionKind.SAY,
-                    SayHandler(character_id, self.skills.speaking, self.skills.prepared_speech),
-                ),
-                (ActionKind.SING, SingHandler(character_id, self.skills.singing)),
-                (ActionKind.RESTORE_EXPRESSION, RestoreExpressionHandler()),
-                (ActionKind.PUBLISH_DYNAMIC, PublishDynamicHandler(character_id, self.skills.dynamic_publishing)),
-                (
-                    ActionKind.REQUEST_SONG_LEARNING,
-                    RequestSongLearningHandler(character_id, self.skills.song_learning),
-                ),
-                (
-                    ActionKind.REPLY_DYNAMIC,
-                    ReplyDynamicHandler(character_id, self.skills.dynamic_reply),
-                ),
-                (ActionKind.WRITE_DIARY, WriteDiaryHandler(character_id, self.skills.diary_writing)),
-                (
-                    ActionKind.COGNITIVE_MAINTENANCE,
-                    CognitiveMaintenanceActionHandler(character_id, self.skills.cognitive_maintenance),
-                ),
-                (ActionKind.ANSWER_CALL, AnswerCallHandler()),
-                (ActionKind.END_CALL, EndCallHandler()),
-                (
-                    ActionKind.FINALIZE_CALL,
-                    FinalizeCallHandler(character_id, self.skills.call_maintenance, self.skills.call_summary),
-                ),
-            )
-        )
+                ActionKind.SAY,
+                SayHandler(character_id, self.skills.speaking, self.skills.prepared_speech),
+            ),
+            (ActionKind.SING, SingHandler(character_id, self.skills.singing)),
+            (ActionKind.RESTORE_EXPRESSION, RestoreExpressionHandler()),
+            (ActionKind.PUBLISH_DYNAMIC, PublishDynamicHandler(character_id, self.skills.dynamic_publishing)),
+            (
+                ActionKind.REQUEST_SONG_LEARNING,
+                RequestSongLearningHandler(character_id, self.skills.song_learning),
+            ),
+            (
+                ActionKind.REPLY_DYNAMIC,
+                ReplyDynamicHandler(character_id, self.skills.dynamic_reply),
+            ),
+            (ActionKind.WRITE_DIARY, WriteDiaryHandler(character_id, self.skills.diary_writing)),
+            (
+                ActionKind.COGNITIVE_MAINTENANCE,
+                CognitiveMaintenanceActionHandler(character_id, self.skills.cognitive_maintenance),
+            ),
+            (ActionKind.ANSWER_CALL, AnswerCallHandler()),
+            (ActionKind.END_CALL, EndCallHandler()),
+            (
+                ActionKind.FINALIZE_CALL,
+                FinalizeCallHandler(character_id, self.skills.call_maintenance, self.skills.call_summary),
+            ),
+        ]
+        if character_id == self._minecraft_character_id:
+            registrations.append((ActionKind.MINECRAFT_ACTION, MinecraftActionHandler(self._minecraft_action_port)))
+        return ActionRouter(registrations)
+
+    def _configure_minecraft(self, llm_service: LLMService) -> tuple[str | None, object | None]:
+        config = self.config.get("agent", {}).get("minecraft", {})
+        if not isinstance(config, dict):
+            raise TypeError("agent.minecraft must be a dictionary")
+        enabled = config.get("enabled", False)
+        if type(enabled) is not bool:
+            raise TypeError("agent.minecraft.enabled must be a bool")
+        if not enabled:
+            if self._minecraft_action_port is not None:
+                raise ValueError("minecraft_action_port requires agent.minecraft.enabled=true")
+            return None, None
+        if self._minecraft_action_port is None:
+            raise ValueError("enabled Minecraft cognition requires minecraft_action_port")
+        character_id = config.get("character_id")
+        if character_id not in self.character_memories:
+            raise ValueError("agent.minecraft.character_id must name an enabled character")
+        module_config = config.get("llm_module")
+        model = None if module_config is None else llm_service.register_llm_module("minecraft_decision", module_config)
+        return character_id, model
 
     def _shared_call_recall_model(self, llm_service: LLMService) -> object | None:
         config = self.config.get("agent", {}).get("call_recall", {})

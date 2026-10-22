@@ -16,7 +16,12 @@ class _WorldStagePort(Protocol):
 
     def _receive(self, fact: d.Stimulus) -> bool: ...
 
-    def _enqueue_plan(self, plan: d.ActionPlan, token: d.CancellationToken) -> None: ...
+    def _enqueue_plan(
+        self,
+        plan: d.ActionPlan,
+        token: d.CancellationToken,
+        minecraft_scope: d.MinecraftObservationScope | None = None,
+    ) -> None: ...
 
 
 class WorldFactSink(Protocol):
@@ -70,6 +75,14 @@ class _WorldPlanSink:
                 "plan identity mismatch",
                 code=d.SinkRejectionCode.IDENTITY_MISMATCH,
             )
-        stage._enqueue_plan(plan, request.cancellation)
+        minecraft_scope = None
+        if isinstance(request.stimulus, d.MinecraftObserved):
+            minecraft_scope = d.MinecraftObservationScope(
+                body_id=request.stimulus.body_id,
+                session_id=request.stimulus.session_id,
+                session_epoch=request.stimulus.session_epoch,
+                server_boot_id=request.stimulus.server_boot_id,
+            )
+        stage._enqueue_plan(plan, request.cancellation, minecraft_scope)
         self.ids.append(plan.plan_id)
         return d.PlanReceipt(plan_id=plan.plan_id, status=d.PlanAcceptanceStatus.ACCEPTED)

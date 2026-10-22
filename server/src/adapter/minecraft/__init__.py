@@ -15,6 +15,7 @@ from .observation import (
     MinecraftVisibility,
     MinecraftWorldTarget,
 )
+from .typed_ingress import MinecraftObservationBinding, TypedMinecraftObservationIngress
 
 __all__ = [
     "MinecraftAuthority",
@@ -25,4 +26,6 @@ __all__ = [
     "MinecraftScope",
     "MinecraftWorldTarget",
     "MinecraftVisibility",
+    "MinecraftObservationBinding",
+    "TypedMinecraftObservationIngress",
 ]

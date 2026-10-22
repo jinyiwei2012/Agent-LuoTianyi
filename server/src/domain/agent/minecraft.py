@@ -36,6 +36,55 @@ class MinecraftIntent(str, Enum):
     STOP = "STOP"
 
 
+class MinecraftCapabilityAvailability(str, Enum):
+    AVAILABLE = "AVAILABLE"
+    UNAVAILABLE = "UNAVAILABLE"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class MinecraftCapabilities:
+    query: MinecraftCapabilityAvailability
+    public_say: MinecraftCapabilityAvailability
+    look: MinecraftCapabilityAvailability
+    bounded_walk: MinecraftCapabilityAvailability
+    stop: MinecraftCapabilityAvailability
+
+    def __post_init__(self):
+        if any(
+            not isinstance(value, MinecraftCapabilityAvailability)
+            for value in (self.query, self.public_say, self.look, self.bounded_walk, self.stop)
+        ):
+            raise ValueError("invalid Minecraft capabilities")
+
+    def availability(self, intent: MinecraftIntent) -> MinecraftCapabilityAvailability:
+        return {
+            MinecraftIntent.QUERY: self.query,
+            MinecraftIntent.PUBLIC_SAY: self.public_say,
+            MinecraftIntent.LOOK: self.look,
+            MinecraftIntent.BOUNDED_WALK: self.bounded_walk,
+            MinecraftIntent.STOP: self.stop,
+        }[intent]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class MinecraftUntrustedText:
+    event_id: str
+    text: str
+
+    def __post_init__(self):
+        if (
+            not isinstance(self.event_id, str)
+            or not self.event_id.strip()
+            or not isinstance(self.text, str)
+            or not self.text
+            or "\0" in self.text
+            or len(self.text) > 1024
+            or len(self.text.encode("utf-8")) > 4096
+        ):
+            raise ValueError("invalid Minecraft untrusted text")
+
+
 class MinecraftPortAdmission(str, Enum):
     ACCEPTED = "accepted"
     DECLINED = "declined"
@@ -87,6 +136,27 @@ class MinecraftBoundScope:
             or self.session_epoch < 0
         ):
             raise ValueError("invalid bound scope")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class MinecraftObservationScope:
+    """Trusted Stage owner fence for one authenticated server boot."""
+
+    body_id: str
+    session_id: str
+    session_epoch: int
+    server_boot_id: str
+
+    def __post_init__(self):
+        if (
+            any(
+                not isinstance(value, str) or not value.strip()
+                for value in (self.body_id, self.session_id, self.server_boot_id)
+            )
+            or type(self.session_epoch) is not int
+            or self.session_epoch < 0
+        ):
+            raise ValueError("invalid Minecraft observation scope")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
