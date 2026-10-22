@@ -179,8 +179,7 @@ class MinecraftControlSession:
         current = self._current
         if self._generation_is_current(current) and envelope.session_id == current.context.binding.session_id:
             current.port.receive_authoritative(envelope, origin=origin)
-            if envelope.type == "receipt":
-                await current.terminal_ingress.emit(envelope)
+            await self._project_joined_terminal(current, envelope)
             return
         for retired in self._retired:
             if envelope.session_id == retired.context.binding.session_id:
@@ -188,15 +187,17 @@ class MinecraftControlSession:
                 return
         raise ControlSessionError("authoritative message has no owned generation")
 
-    def history_outcome(self, envelope, *, origin: TrustedServerOrigin) -> d.MinecraftActionOutcomeObserved:
+    def history_outcome(self, envelope, *, origin: TrustedServerOrigin) -> d.MinecraftActionOutcomeObserved | None:
         """Project an exact retired-session receipt for audit without current cognition."""
         for retired in self._retired:
             if envelope.session_id != retired.context.binding.session_id:
                 continue
             retired.ledger.ingest(envelope, origin=origin)
-            if envelope.type != "receipt":
-                raise ControlSessionError("historical outcome requires a receipt")
-            return retired.terminal_ingress.fact(envelope)
+            request_id = self._affected_request_id(envelope)
+            if request_id is None:
+                return None
+            record = retired.ledger.record(request_id)
+            return None if record.receipt is None else retired.terminal_ingress.fact(record.receipt)
         raise ControlSessionError("historical receipt has no retired generation")
 
     async def close(self) -> None:
@@ -210,6 +211,23 @@ class MinecraftControlSession:
         if not self._generation_is_current(current):
             raise ControlSessionError("Minecraft action port has no current generation")
         return current.port
+
+    async def _project_joined_terminal(self, generation: _OwnedGeneration, envelope) -> None:
+        request_id = self._affected_request_id(envelope)
+        if request_id is None:
+            return
+        record = generation.ledger.record(request_id)
+        if record.admission is None or record.admission.payload["decision"] != "ACCEPTED" or record.receipt is None:
+            return
+        if not self._generation_is_current(generation):
+            return
+        await generation.terminal_ingress.emit(record.receipt)
+
+    @staticmethod
+    def _affected_request_id(envelope) -> str | None:
+        if envelope.type in {"admission", "receipt"}:
+            return envelope.payload["requestId"]
+        return None
 
     def _context_for(self, generation: _OwnedGeneration) -> ActiveActionContext | None:
         return generation.context if self._generation_is_current(generation) else None

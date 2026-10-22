@@ -201,6 +201,15 @@ def session(enabled=True, sender=None):
     return owner, coordinator, sender, clock
 
 
+class CountingTerminalSink:
+    def __init__(self):
+        self.facts = []
+
+    async def submit(self, fact):
+        self.facts.append(fact)
+        return True
+
+
 def authoritative(kind, message_id, request_id, selected):
     payload = {
         "requestId": request_id,
@@ -383,3 +392,65 @@ async def test_retirement_closes_terminal_owner_without_resubmitting_old_fact_to
         await projection
     assert generation.terminal_ingress.owned_count == 1
     assert sink.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("order", [("receipt", "admission"), ("admission", "receipt")])
+async def test_control_session_projects_joined_terminal_once_for_both_delivery_orders(order):
+    sink = CountingTerminalSink()
+    coordinator, sender, clock = Coordinator(), Sender(), Clock()
+    owner = MinecraftControlSession(
+        enabled=True,
+        coordinator=coordinator,
+        sender=sender,
+        monotonic_now=clock,
+        utc_now=lambda: NOW,
+        admission_timeout_seconds=0.01,
+        terminal_sink=sink,
+    )
+    selected = binding("50000000-0000-0000-0000-000000000005", 1)
+    coordinator.snapshot = snapshot(1, selected)
+    await owner.activate(observation(selected))
+    generation = owner._current
+    generation.ledger.reserve_request(canonical_request(selected), local_action_id="local-action")
+    messages = {
+        "admission": authoritative("admission", "11000000-0000-0000-0000-000000000011", REQUEST, selected),
+        "receipt": authoritative("receipt", "12000000-0000-0000-0000-000000000012", REQUEST, selected),
+    }
+    trusted_origin = generation.context.server_origin
+    await owner.receive_authoritative(messages[order[0]], origin=trusted_origin)
+    assert sink.facts == []
+    await owner.receive_authoritative(messages[order[1]], origin=trusted_origin)
+    await owner.receive_authoritative(messages["receipt"], origin=trusted_origin)
+    assert len(sink.facts) == 1
+    assert sink.facts[0].outcome.status is d.MinecraftTerminalStatus.UNKNOWN
+    assert generation.ledger.effect_fence_quarantined
+
+
+@pytest.mark.asyncio
+async def test_retired_out_of_order_history_never_enters_current_sink_and_is_available_only_after_join():
+    sink = CountingTerminalSink()
+    coordinator, sender, clock = Coordinator(), Sender(), Clock()
+    owner = MinecraftControlSession(
+        enabled=True,
+        coordinator=coordinator,
+        sender=sender,
+        monotonic_now=clock,
+        utc_now=lambda: NOW,
+        admission_timeout_seconds=0.01,
+        terminal_sink=sink,
+    )
+    selected = binding("50000000-0000-0000-0000-000000000005", 1)
+    coordinator.snapshot = snapshot(1, selected)
+    await owner.activate(observation(selected))
+    generation = owner._current
+    generation.ledger.reserve_request(canonical_request(selected), local_action_id="local-action")
+    coordinator.snapshot = None
+    await owner.synchronize()
+    trusted_origin = generation.context.server_origin
+    terminal = authoritative("receipt", "13000000-0000-0000-0000-000000000013", REQUEST, selected)
+    accepted = authoritative("admission", "14000000-0000-0000-0000-000000000014", REQUEST, selected)
+    assert owner.history_outcome(terminal, origin=trusted_origin) is None
+    fact = owner.history_outcome(accepted, origin=trusted_origin)
+    assert isinstance(fact, d.MinecraftActionOutcomeObserved)
+    assert sink.facts == []
