@@ -227,3 +227,14 @@ def test_consume_holds_lock_through_proof_and_ready_construction(monkeypatch):
     replacement.join(timeout=2)
     assert not consumer.is_alive() and not replacement.is_alive()
     assert len(result) == 1 and begin_finished.is_set()
+
+
+def test_discard_removes_only_owned_connection_and_is_idempotent():
+    pending = PendingHandshakes()
+    pending.begin("one", CTX, PEER, NOW, now=0, utc_now=NOW)
+    pending.begin("two", CTX, PEER, NOW, now=0, utc_now=NOW)
+    assert pending.discard("one") is True
+    assert pending.discard("one") is False
+    with pytest.raises(ControlAuthError):
+        pending.consume("one", CID, proof("PEER_PROOF"), KEY, now=1, utc_now=NOW)
+    assert pending.discard("two") is True

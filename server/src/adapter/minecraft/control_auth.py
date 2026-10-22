@@ -291,6 +291,13 @@ class PendingHandshakes:
             )
             return AuthenticatedHandshake(context=pending.context, challenge_id=pending.challenge_id, ready_proof=ready)
 
+    def discard(self, connection_id: str) -> bool:
+        """Remove only this connection's pending challenge; repeated calls are safe."""
+        if not _ascii_id(connection_id):
+            raise ControlAuthError("invalid connection id")
+        with self._lock:
+            return self._items.pop(connection_id, None) is not None
+
     def _prune_locked(self, now: float) -> None:
         for connection_id, pending in tuple(self._items.items()):
             if now >= pending.deadline:
