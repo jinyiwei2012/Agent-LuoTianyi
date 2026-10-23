@@ -190,7 +190,15 @@ class MinecraftAuthenticatedTransport:
             self._release(connection_id, role)
             await _safe_close(websocket, 1001, "FEATURE_DISABLED")
             raise cancellation
-        except (TransportError, ControlAuthError, TimeoutError, asyncio.TimeoutError, ValueError, TypeError):
+        except (
+            TransportError,
+            ControlAuthError,
+            TimeoutError,
+            asyncio.TimeoutError,
+            ValueError,
+            TypeError,
+            RuntimeError,
+        ):
             self._release(connection_id, role)
             await _safe_close(websocket, 1008, "FEATURE_DISABLED")
         finally:
@@ -198,33 +206,69 @@ class MinecraftAuthenticatedTransport:
 
     async def _heartbeat_loop(self, websocket: WebSocketPort) -> None:
         last_receive = self._monotonic()
-        loop_deadline = asyncio.get_running_loop().time() + _CONTROL_LOST_SECONDS
+        loop = asyncio.get_running_loop()
+        loop_deadline = loop.time() + _CONTROL_LOST_SECONDS
         inbound_sequence = -1
-        outbound_sequence = 0
-        while True:
-            remaining = min(
-                _CONTROL_LOST_SECONDS - (self._monotonic() - last_receive),
-                loop_deadline - asyncio.get_running_loop().time(),
-            )
-            if remaining <= 0:
-                raise TransportError("heartbeat timeout")
-            try:
-                message = await self._receive(websocket, timeout=min(_HEARTBEAT_SECONDS, remaining))
-            except TimeoutError:
-                await self._send(
-                    websocket,
-                    _dump({"security": _SECURITY, "kind": "HEARTBEAT", "sequence": outbound_sequence}),
-                    timeout=remaining,
+        sender = asyncio.create_task(self._heartbeat_sender(websocket), name="minecraft-heartbeat-send")
+        receive: asyncio.Task[dict] | None = None
+        try:
+            while True:
+                remaining = min(
+                    _CONTROL_LOST_SECONDS - (self._monotonic() - last_receive),
+                    loop_deadline - loop.time(),
                 )
-                outbound_sequence += 1
-                continue
-            _exact(message, {"security", "kind", "sequence"}, "HEARTBEAT")
-            sequence = message["sequence"]
-            if type(sequence) is not int or not 0 <= sequence <= (1 << 63) - 1 or sequence <= inbound_sequence:
-                raise TransportError("invalid heartbeat sequence")
-            inbound_sequence = sequence
-            last_receive = self._monotonic()
-            loop_deadline = asyncio.get_running_loop().time() + _CONTROL_LOST_SECONDS
+                if remaining <= 0:
+                    raise TransportError("heartbeat timeout")
+                receive = asyncio.create_task(self._receive(websocket, timeout=remaining))
+                done, _ = await asyncio.wait((receive, sender), return_when=asyncio.FIRST_COMPLETED)
+                if sender in done:
+                    receive.cancel()
+                    await asyncio.gather(receive, return_exceptions=True)
+                    receive = None
+                    sender.result()
+                    raise TransportError("heartbeat sender stopped")
+                message = receive.result()
+                receive = None
+                _exact(message, {"security", "kind", "sequence"}, "HEARTBEAT")
+                sequence = message["sequence"]
+                if type(sequence) is not int or not 0 <= sequence <= (1 << 63) - 1 or sequence <= inbound_sequence:
+                    raise TransportError("invalid heartbeat sequence")
+                inbound_sequence = sequence
+                last_receive = self._monotonic()
+                loop_deadline = loop.time() + _CONTROL_LOST_SECONDS
+        finally:
+            children = tuple(task for task in (receive, sender) if task is not None)
+            for task in children:
+                task.cancel()
+            cleanup = asyncio.create_task(self._drain_heartbeat_children(children), name="minecraft-heartbeat-cleanup")
+            cancellation: asyncio.CancelledError | None = None
+            while not cleanup.done():
+                try:
+                    await asyncio.sleep(0)
+                except asyncio.CancelledError as error:
+                    cancellation = cancellation or error
+            cleanup.result()
+            if cancellation is not None:
+                raise cancellation
+
+    @staticmethod
+    async def _drain_heartbeat_children(children: tuple[asyncio.Task, ...]) -> None:
+        if children:
+            await asyncio.gather(*children, return_exceptions=True)
+
+    async def _heartbeat_sender(self, websocket: WebSocketPort) -> None:
+        sequence = 0
+        loop = asyncio.get_running_loop()
+        next_send = loop.time() + _HEARTBEAT_SECONDS
+        while True:
+            await asyncio.sleep(max(0.0, next_send - loop.time()))
+            await self._send(
+                websocket,
+                _dump({"security": _SECURITY, "kind": "HEARTBEAT", "sequence": sequence}),
+                timeout=_CONTROL_LOST_SECONDS,
+            )
+            sequence += 1
+            next_send += _HEARTBEAT_SECONDS
 
     async def _receive(self, websocket: WebSocketPort, *, timeout: float) -> dict:
         if timeout <= 0:
