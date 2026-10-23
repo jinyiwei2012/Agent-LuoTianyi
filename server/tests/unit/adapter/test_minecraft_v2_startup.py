@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from src.adapter.minecraft.control_auth import ControlAuthContext, compute_proof
+from src.adapter.minecraft.control_auth import ControlAuthContext, ControlAuthError, PendingHandshakes, compute_proof
 from src.adapter.minecraft.deployment_acl import TrustedDeploymentAclPolicy, inspect_handle_security_descriptor
 from src.adapter.minecraft.deployment_files import (
     DeploymentFileProvision,
@@ -364,7 +364,197 @@ def test_context_manager_closes_on_ordinary_and_fatal_body_exception(provisioned
     assert not replacement.is_provisioned
 
 
-def _provision_from(filesystem):
+def test_existing_pending_v2_flow_mints_full_handshake_and_derives_matching_keys(provisioned_peer):
+    peer, _verified, _files = provisioned_peer
+    pending = PendingHandshakes()
+    connection_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    item, hub_proof = pending.begin_v2(
+        connection_id,
+        peer,
+        PEER_NONCE,
+        ISSUED_AT,
+        hub_nonce=HUB_NONCE,
+        challenge_id=CHALLENGE_ID,
+        now=0,
+        utc_now=ISSUED_AT,
+    )
+    assert hub_proof == compute_proof(PSK, "HUB_PROOF", peer.context, *_values())
+    peer_proof = compute_proof(PSK, "PEER_PROOF", peer.context, *_values())
+    authenticated = pending.consume_v2(
+        connection_id,
+        CHALLENGE_ID,
+        peer_proof,
+        peer,
+        expected_context=peer.context,
+        now=1,
+        utc_now=ISSUED_AT,
+    )
+    assert authenticated.has_full_provenance
+    assert authenticated.connection_id == connection_id
+    assert authenticated.context is peer.context
+    assert authenticated.peer_nonce == PEER_NONCE and authenticated.hub_nonce == HUB_NONCE
+    assert authenticated.issued_at == ISSUED_AT and authenticated.expires_at == EXPIRES_AT
+    assert authenticated.ready_proof == compute_proof(PSK, "READY_PROOF", peer.context, *_values())
+    transcript_value = AuthenticatedTranscript(
+        context=authenticated.context,
+        peer_nonce=authenticated.peer_nonce,
+        hub_nonce=authenticated.hub_nonce,
+        challenge_id=authenticated.challenge_id,
+        issued_at=authenticated.issued_at,
+        expires_at=authenticated.expires_at,
+    )
+    actual = peer.derive_session_keys(transcript_value)
+    expected = PostAuthSessionKeys(transcript_value, PSK)
+    try:
+        message = b"pending-consumed-v2-frame"
+        assert actual.mac("PEER_TO_HUB", message) == expected.mac("PEER_TO_HUB", message)
+        assert actual.mac("HUB_TO_PEER", message) == expected.mac("HUB_TO_PEER", message)
+    finally:
+        actual.close()
+        expected.close()
+    assert item._v2_credential is peer
+    assert not hasattr(item, "role_psk") and PSK.hex() not in repr(item)
+    with pytest.raises(ControlAuthError):
+        pending.consume_v2(
+            connection_id,
+            CHALLENGE_ID,
+            peer_proof,
+            peer,
+            expected_context=peer.context,
+            now=1,
+            utc_now=ISSUED_AT,
+        )
+
+
+def test_v2_wrong_proof_credential_and_context_consume_only_correct_connection(provisioned_peer):
+    peer, verified, _files = provisioned_peer
+    other = _provision_from(verified, key_id="role-key-1")
+    connection_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    other_connection = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeef"
+    try:
+        pending = PendingHandshakes()
+        pending.begin_v2(
+            connection_id,
+            peer,
+            PEER_NONCE,
+            ISSUED_AT,
+            hub_nonce=HUB_NONCE,
+            challenge_id=CHALLENGE_ID,
+            now=0,
+            utc_now=ISSUED_AT,
+        )
+        with pytest.raises(ControlAuthError):
+            pending.consume_v2(
+                other_connection,
+                CHALLENGE_ID,
+                "A" * 43,
+                peer,
+                expected_context=peer.context,
+                now=1,
+                utc_now=ISSUED_AT,
+            )
+        proof = compute_proof(PSK, "PEER_PROOF", peer.context, *_values())
+        assert pending.consume_v2(
+            connection_id,
+            CHALLENGE_ID,
+            proof,
+            peer,
+            expected_context=peer.context,
+            now=1,
+            utc_now=ISSUED_AT,
+        ).has_full_provenance
+
+        equal_but_distinct_context = ControlAuthContext(
+            peer_role=peer.context.peer_role,
+            peer_install_id=peer.context.peer_install_id,
+            hub_install_id=peer.context.hub_install_id,
+            key_id=peer.context.key_id,
+            protocol=peer.context.protocol,
+            mod_hash=peer.context.mod_hash,
+            config_hash=peer.context.config_hash,
+            binding_hash=peer.context.binding_hash,
+        )
+        assert equal_but_distinct_context == peer.context and equal_but_distinct_context is not peer.context
+        for failure in ("proof", "credential", "context"):
+            pending.begin_v2(
+                connection_id,
+                peer,
+                PEER_NONCE,
+                ISSUED_AT,
+                hub_nonce=HUB_NONCE,
+                challenge_id=CHALLENGE_ID,
+                now=2,
+                utc_now=ISSUED_AT,
+            )
+            with pytest.raises(ControlAuthError):
+                pending.consume_v2(
+                    connection_id,
+                    CHALLENGE_ID,
+                    "A" * 43 if failure == "proof" else proof,
+                    other if failure == "credential" else peer,
+                    expected_context=equal_but_distinct_context if failure == "context" else peer.context,
+                    now=3,
+                    utc_now=ISSUED_AT,
+                )
+            with pytest.raises(ControlAuthError):
+                pending.consume_v2(
+                    connection_id,
+                    CHALLENGE_ID,
+                    proof,
+                    peer,
+                    expected_context=peer.context,
+                    now=3,
+                    utc_now=ISSUED_AT,
+                )
+    finally:
+        other.close()
+
+
+def test_closed_v2_credential_rejects_begin_and_consume(provisioned_peer):
+    peer, verified, _files = provisioned_peer
+    connection_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    peer.close()
+    with pytest.raises(ControlAuthError):
+        PendingHandshakes().begin_v2(
+            connection_id,
+            peer,
+            PEER_NONCE,
+            ISSUED_AT,
+            hub_nonce=HUB_NONCE,
+            challenge_id=CHALLENGE_ID,
+            now=0,
+            utc_now=ISSUED_AT,
+        )
+    replacement = _provision_from(verified)
+    pending = PendingHandshakes()
+    try:
+        pending.begin_v2(
+            connection_id,
+            replacement,
+            PEER_NONCE,
+            ISSUED_AT,
+            hub_nonce=HUB_NONCE,
+            challenge_id=CHALLENGE_ID,
+            now=0,
+            utc_now=ISSUED_AT,
+        )
+        proof = compute_proof(PSK, "PEER_PROOF", replacement.context, *_values())
+        replacement.close()
+        with pytest.raises(ControlAuthError):
+            pending.consume_v2(
+                connection_id,
+                CHALLENGE_ID,
+                proof,
+                replacement,
+                expected_context=replacement.context,
+                now=1,
+                utc_now=ISSUED_AT,
+            )
+    finally:
+        replacement.close()
+
+
+def _provision_from(filesystem, *, key_id="role-key-test"):
     snapshot = filesystem.snapshot if isinstance(filesystem, VerifiedDeploymentFilesystem) else filesystem
     if isinstance(snapshot, DeploymentFileSnapshot):
         role = snapshot.peer_role
@@ -382,6 +572,6 @@ def _provision_from(filesystem):
         expected_peer_install_id=peer_id,
         expected_hub_install_id=hub_id,
         expected_config_hash=config_hash,
-        key_id="role-key-test",
+        key_id=key_id,
         role_psk=PSK,
     )

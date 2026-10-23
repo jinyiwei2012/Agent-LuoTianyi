@@ -72,6 +72,7 @@ class PendingChallenge:
     expires_at: datetime
     issued_monotonic: float
     deadline: float
+    _v2_credential: object | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "peer_nonce", _bytes32(self.peer_nonce, "nonce"))
@@ -284,6 +285,62 @@ class PendingHandshakes:
             self._items[connection_id] = pending
         return pending
 
+    def begin_v2(
+        self,
+        connection_id: str,
+        credential,
+        peer_nonce: bytes,
+        issued_at: datetime,
+        *,
+        hub_nonce: bytes | None = None,
+        challenge_id: str | None = None,
+        now: float | None = None,
+        utc_now: datetime,
+    ) -> tuple[PendingChallenge, str]:
+        """Publish one shared pending challenge after fixed credential-backed proof creation."""
+        from .v2_startup import ProvisionedV2Peer, V2StartupError
+
+        if type(credential) is not ProvisionedV2Peer or not _v2_uuid(connection_id):
+            raise ControlAuthError("invalid v2 hello")
+        current = _monotonic(now)
+        issued = _utc_datetime(issued_at)
+        _validate_issued_clock(issued, _trusted_utc_now(utc_now))
+        nonce = secrets.token_bytes(32) if hub_nonce is None else _bytes32(hub_nonce, "nonce")
+        cid = str(uuid4()) if challenge_id is None else challenge_id
+        if not _v2_uuid(cid):
+            raise ControlAuthError("invalid v2 challenge")
+        pending = PendingChallenge(
+            connection_id=connection_id,
+            challenge_id=cid,
+            context=credential.context,
+            peer_nonce=peer_nonce,
+            hub_nonce=nonce,
+            issued_at=issued,
+            expires_at=issued + _CHALLENGE_LIFETIME,
+            issued_monotonic=current,
+            deadline=current + _CHALLENGE_LIFETIME.total_seconds(),
+            _v2_credential=credential,
+        )
+        try:
+            with credential._owner._lock:
+                if not credential.is_provisioned:
+                    raise ControlAuthError("invalid v2 credential")
+                hub_proof = credential.compute_hub_proof(
+                    pending.peer_nonce,
+                    pending.hub_nonce,
+                    pending.challenge_id,
+                    pending.issued_at,
+                    pending.expires_at,
+                )
+                with self._lock:
+                    self._prune_locked(current)
+                    if connection_id in self._items or len(self._items) >= self._maximum:
+                        raise ControlAuthError("pending capacity")
+                    self._items[connection_id] = pending
+        except V2StartupError as error:
+            raise ControlAuthError("invalid v2 credential") from error
+        return pending, hub_proof
+
     def consume(
         self,
         connection_id: str,
@@ -305,6 +362,7 @@ class PendingHandshakes:
             pending = self._items.pop(connection_id, None)
             if (
                 pending is None
+                or pending._v2_credential is not None
                 or pending.challenge_id != challenge_id
                 or current < pending.issued_monotonic
                 or current >= pending.deadline
@@ -338,6 +396,59 @@ class PendingHandshakes:
             )
             return AuthenticatedHandshake._from_consumed_pending(pending, ready)
 
+    def consume_v2(
+        self,
+        connection_id: str,
+        challenge_id: str,
+        peer_proof: str,
+        credential,
+        *,
+        expected_context: ControlAuthContext,
+        now: float | None = None,
+        utc_now: datetime,
+    ) -> AuthenticatedHandshake:
+        """Consume shared pending state through its exact provisioned v2 credential."""
+        from .v2_startup import ProvisionedV2Peer, V2StartupError
+
+        current = _monotonic(now)
+        trusted_utc_now = _trusted_utc_now(utc_now)
+        if type(credential) is not ProvisionedV2Peer or not _v2_uuid(connection_id) or not _v2_uuid(challenge_id):
+            raise ControlAuthError("v2 proof rejected")
+        if expected_context is not credential.context:
+            with self._lock:
+                self._prune_locked(current)
+                self._items.pop(connection_id, None)
+            raise ControlAuthError("v2 proof rejected")
+        try:
+            with credential._owner._lock:
+                with self._lock:
+                    self._prune_locked(current)
+                    pending = self._items.pop(connection_id, None)
+                    if (
+                        pending is None
+                        or pending._v2_credential is not credential
+                        or pending.context is not credential.context
+                        or pending.challenge_id != challenge_id
+                        or current < pending.issued_monotonic
+                        or current >= pending.deadline
+                        or not _valid_at_wall_clock(pending, trusted_utc_now)
+                        or not credential.is_provisioned
+                    ):
+                        raise ControlAuthError("v2 proof rejected")
+                    ready = credential.verify_peer_proof_and_ready(
+                        peer_proof,
+                        pending.peer_nonce,
+                        pending.hub_nonce,
+                        pending.challenge_id,
+                        pending.issued_at,
+                        pending.expires_at,
+                    )
+                    if not credential.is_provisioned:
+                        raise ControlAuthError("v2 proof rejected")
+                    return AuthenticatedHandshake._from_consumed_pending(pending, ready.proof)
+        except V2StartupError as error:
+            raise ControlAuthError("v2 proof rejected") from error
+
     def discard(self, connection_id: str) -> bool:
         """Remove only this connection's pending challenge; repeated calls are safe."""
         if not _ascii_id(connection_id):
@@ -363,6 +474,10 @@ def _bytes32(value: object, description: str) -> bytes:
 
 def _uuid(value: object) -> bool:
     return type(value) is str and _UUID_RE.fullmatch(value) is not None
+
+
+def _v2_uuid(value: object) -> bool:
+    return _uuid(value) and value != "00000000-0000-0000-0000-000000000000"
 
 
 def _monotonic(value: float | None) -> float:
