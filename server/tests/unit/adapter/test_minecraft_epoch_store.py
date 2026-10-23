@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,44 @@ class _CountingLock(_Lock):
         super().close()
 
 
+class _FailBeforeReleaseLock(_CountingLock):
+    def close(self) -> None:
+        self.closes += 1
+        raise EpochStoreError("injected close failure")
+
+
+class _ReleaseThenFailLock(_CountingLock):
+    def close(self) -> None:
+        self.closes += 1
+        self._locks.discard(self._path)
+        raise EpochStoreError("injected post-release failure")
+
+
+class _FatalLock(_CountingLock):
+    def __init__(self, locks: set[Path], path: Path, fatal=KeyboardInterrupt()):
+        super().__init__(locks, path)
+        self.fatal = fatal
+
+    def close(self) -> None:
+        self.closes += 1
+        raise self.fatal
+
+
+class _ReentrantLock(_CountingLock):
+    def __init__(self, locks: set[Path], path: Path):
+        super().__init__(locks, path)
+        self.store = None
+        self.nested_errors = []
+
+    def close(self) -> None:
+        self.closes += 1
+        try:
+            self.store.close()
+        except EpochStoreError as error:
+            self.nested_errors.append(str(error))
+        self._locks.discard(self._path)
+
+
 class _TestPlatform:
     """Test double only; it is not evidence of Windows ACL or VFS guarantees."""
 
@@ -54,9 +93,10 @@ class _TestPlatform:
 
 
 class _CountingPlatform(_TestPlatform):
-    def __init__(self, *, fail_lock: bool = False):
+    def __init__(self, *, fail_lock: bool = False, lock_type=_CountingLock):
         super().__init__()
         self.fail_lock = fail_lock
+        self.lock_type = lock_type
         self.handle: _CountingLock | None = None
 
     def acquire_lock(self, lock_path: Path) -> LockHandle:
@@ -65,7 +105,7 @@ class _CountingPlatform(_TestPlatform):
         if lock_path in self.locks:
             raise EpochStoreError("lock conflict")
         self.locks.add(lock_path)
-        self.handle = _CountingLock(self.locks, lock_path)
+        self.handle = self.lock_type(self.locks, lock_path)
         return self.handle
 
 
@@ -180,6 +220,110 @@ def test_close_is_idempotent_and_rejects_reads_and_commits_without_database_chan
     reopened = EpochStore.open(tmp_path / "epoch", platform=port)
     assert reopened.read_candidate().next_epoch == 1
     reopened.close()
+
+
+@pytest.mark.parametrize("lock_type", [_FailBeforeReleaseLock, _ReleaseThenFailLock])
+def test_close_failure_permanently_disables_operations_and_never_retries_uncertain_cleanup(tmp_path, lock_type):
+    port = _CountingPlatform(lock_type=lock_type)
+    store = EpochStore.provision(tmp_path / "epoch", PROVISION, BODY, platform=port)
+    candidate = store.read_candidate()
+    with pytest.raises(EpochStoreError, match="cleanup outcome is unknown"):
+        store.close()
+    with pytest.raises(EpochStoreError, match="disabled"):
+        store.read_candidate()
+    with pytest.raises(EpochStoreError, match="disabled"):
+        store.commit_ready(candidate, ready(candidate))
+    with pytest.raises(EpochStoreError, match="cleanup outcome is unknown"):
+        store.close()
+    assert port.handle is not None and port.handle.closes == 1
+
+
+def test_concurrent_successful_close_is_serialized_and_attempted_once(tmp_path):
+    port = _CountingPlatform()
+    store = EpochStore.provision(tmp_path / "epoch", PROVISION, BODY, platform=port)
+    errors = []
+
+    def close():
+        try:
+            store.close()
+        except Exception as error:  # pragma: no cover - assertion records unexpected errors
+            errors.append(error)
+
+    threads = [threading.Thread(target=close) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert port.handle is not None and port.handle.closes == 1
+
+
+@pytest.mark.parametrize("fatal_type", [KeyboardInterrupt, SystemExit])
+def test_store_fatal_close_exit_disables_operations_and_never_retries(tmp_path, fatal_type):
+    class FatalTypeLock(_FatalLock):
+        def __init__(self, locks, path):
+            super().__init__(locks, path, fatal_type())
+
+    port = _CountingPlatform(lock_type=FatalTypeLock)
+    store = EpochStore.provision(tmp_path / "epoch", PROVISION, BODY, platform=port)
+    candidate = store.read_candidate()
+    caught = None
+    try:
+        store.close()
+    except BaseException as error:
+        caught = error
+    assert type(caught) is fatal_type
+    with pytest.raises(EpochStoreError, match="disabled"):
+        store.read_candidate()
+    with pytest.raises(EpochStoreError, match="disabled"):
+        store.commit_ready(candidate, ready(candidate))
+    with pytest.raises(EpochStoreError, match="cleanup outcome is unknown"):
+        store.close()
+    assert port.handle is not None and port.handle.closes == 1
+
+
+def test_store_reentrant_close_cannot_revive_unknown_cleanup(tmp_path):
+    port = _CountingPlatform(lock_type=_ReentrantLock)
+    store = EpochStore.provision(tmp_path / "epoch", PROVISION, BODY, platform=port)
+    assert isinstance(port.handle, _ReentrantLock)
+    port.handle.store = store
+    with pytest.raises(EpochStoreError, match="cleanup outcome is unknown"):
+        store.close()
+    with pytest.raises(EpochStoreError, match="cleanup outcome is unknown"):
+        store.close()
+    assert port.handle.closes == 1
+    assert port.handle.nested_errors == ["epoch store cleanup outcome is unknown"]
+
+
+def test_provision_failure_with_lock_cleanup_failure_reports_unknown_once(tmp_path, monkeypatch):
+    port = _CountingPlatform(lock_type=_FailBeforeReleaseLock)
+    root = tmp_path / "epoch"
+
+    def fail_marker(*_args, **_kwargs):
+        raise OSError("injected marker failure")
+
+    monkeypatch.setattr(Path, "write_bytes", fail_marker)
+    with pytest.raises(EpochStoreError, match="store provision cleanup outcome is unknown"):
+        EpochStore.provision(root, PROVISION, BODY, platform=port)
+    assert port.handle is not None and port.handle.closes == 1
+    with pytest.raises(EpochStoreError):
+        EpochStore.open(root, platform=port)
+    with pytest.raises(EpochStoreError):
+        EpochStore.provision(root, PROVISION, BODY, platform=port)
+    assert port.handle.closes == 1
+
+
+def test_open_validation_failure_with_lock_cleanup_failure_reports_unknown_once(tmp_path, monkeypatch):
+    root = tmp_path / "epoch"
+    provision_port = _CountingPlatform()
+    store = EpochStore.provision(root, PROVISION, BODY, platform=provision_port)
+    store.close()
+    open_port = _CountingPlatform(lock_type=_FailBeforeReleaseLock)
+    monkeypatch.setattr(EpochStore, "_read_row", lambda _self: (_ for _ in ()).throw(EpochStoreError("invalid row")))
+    with pytest.raises(EpochStoreError, match="store open cleanup outcome is unknown"):
+        EpochStore.open(root, platform=open_port)
+    assert open_port.handle is not None and open_port.handle.closes == 1
 
 
 def test_provision_failure_releases_lock_and_partial_install_cannot_open_or_reprovision(tmp_path, monkeypatch):

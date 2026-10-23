@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import threading
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
@@ -82,6 +83,8 @@ class WindowsLockHandle:
 
     def __init__(self, handle: int):
         self._handle: int | None = handle
+        self._close_state = "ACTIVE"
+        self._close_lock = threading.RLock()
 
     @classmethod
     def acquire(cls, lock_path: Path) -> "WindowsLockHandle":
@@ -104,11 +107,28 @@ class WindowsLockHandle:
         return cls(handle)
 
     def close(self) -> None:
-        if self._handle is None:
-            return
-        handle, self._handle = self._handle, None
-        if not _kernel32().CloseHandle(handle):
-            raise EpochStoreError("Windows epoch lock close failed")
+        with self._close_lock:
+            if self._close_state == "RELEASED":
+                return
+            if self._close_state != "ACTIVE":
+                self._close_state = "CLEANUP_UNKNOWN"
+                raise EpochStoreError("Windows epoch lock cleanup outcome is unknown")
+            self._close_state = "CLOSE_IN_PROGRESS"
+            handle = self._handle
+            try:
+                released = bool(_kernel32().CloseHandle(handle))
+            except BaseException as error:
+                self._close_state = "CLEANUP_UNKNOWN"
+                if not isinstance(error, Exception):
+                    raise
+                raise EpochStoreError("Windows epoch lock cleanup outcome is unknown") from error
+            if self._close_state != "CLOSE_IN_PROGRESS" or not released:
+                # Keep the numeric value for diagnostics only. CloseHandle may have
+                # invalidated it despite reporting failure, so it must never be retried.
+                self._close_state = "CLEANUP_UNKNOWN"
+                raise EpochStoreError("Windows epoch lock cleanup outcome is unknown")
+            self._handle = None
+            self._close_state = "RELEASED"
 
 
 def _kernel32():

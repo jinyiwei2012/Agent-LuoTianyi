@@ -106,6 +106,9 @@ class EpochStore:
         self._identity = identity
         self._disabled = False
         self._closed = False
+        self._resource_released = False
+        self._cleanup_unknown = False
+        self._close_in_progress = False
         self._operation_lock = threading.RLock()
 
     @classmethod
@@ -140,11 +143,14 @@ class EpochStore:
                 connection.close()
             return cls(root, port, lock, (provision_id, body_id))
         except Exception as error:
+            cleanup_failed = False
             if lock is not None:
                 try:
                     lock.close()
                 except Exception:
-                    pass
+                    cleanup_failed = True
+            if cleanup_failed:
+                raise EpochStoreError("store provision cleanup outcome is unknown") from error
             if isinstance(error, EpochStoreError):
                 raise
             raise EpochStoreError("provision failed") from error
@@ -162,17 +168,38 @@ class EpochStore:
         store = cls(root, port, lock, identity)
         try:
             store._read_row()
-        except Exception:
-            lock.close()
+        except Exception as error:
+            try:
+                lock.close()
+            except Exception:
+                raise EpochStoreError("store open cleanup outcome is unknown") from error
             raise
         return store
 
     def close(self) -> None:
         with self._operation_lock:
-            if self._closed:
+            if self._resource_released:
                 return
+            if self._cleanup_unknown or self._close_in_progress:
+                self._cleanup_unknown = True
+                raise EpochStoreError("epoch store cleanup outcome is unknown")
+            # Operational authority is permanently removed before cleanup starts.
             self._closed = True
-            self._lock.close()
+            self._close_in_progress = True
+            try:
+                self._lock.close()
+            except BaseException as error:
+                self._close_in_progress = False
+                self._cleanup_unknown = True
+                if not isinstance(error, Exception):
+                    raise
+                raise EpochStoreError("epoch store cleanup outcome is unknown") from error
+            if self._cleanup_unknown or not self._close_in_progress:
+                self._close_in_progress = False
+                self._cleanup_unknown = True
+                raise EpochStoreError("epoch store cleanup outcome is unknown")
+            self._close_in_progress = False
+            self._resource_released = True
 
     def read_candidate(self) -> EpochCandidate:
         with self._operation_lock:
