@@ -19,6 +19,7 @@ from src.adapter.minecraft.control_auth import (
     b32_encode,
     compute_proof,
 )
+from src.adapter.minecraft.current_roles import AuthenticatedControlRoleOwner, CurrentRoleError
 
 _SECURITY = "luosandbox.control-auth.v1"
 _SUBPROTOCOL = "luosandbox.minecraft.v1"
@@ -40,7 +41,12 @@ class AllowedPeer:
     key: bytes
 
     def __post_init__(self) -> None:
-        if self.context.peer_role not in _ROLES or not isinstance(self.key, bytes) or len(self.key) != 32:
+        if (
+            self.context.peer_role not in _ROLES
+            or self.context.protocol != _SUBPROTOCOL
+            or not isinstance(self.key, bytes)
+            or len(self.key) != 32
+        ):
             raise ValueError("invalid transport peer")
 
 
@@ -90,7 +96,7 @@ class MinecraftAuthenticatedTransport:
         self._nonce = nonce
         self._challenge_id = challenge_id
         self._pending = PendingHandshakes(maximum=4)
-        self._roles: dict[str, tuple[str, str]] = {}
+        self._roles = AuthenticatedControlRoleOwner(tuple(item.context for item in peers), hub_install_id)
         self._unauthenticated: set[str] = set()
         self._last_monotonic: float | None = None
         self._clock_failed = False
@@ -99,7 +105,7 @@ class MinecraftAuthenticatedTransport:
 
     @property
     def active_roles(self) -> tuple[str, ...]:
-        return tuple(sorted(role for role, (_connection, state) in self._roles.items() if state == "AUTHENTICATED"))
+        return self._roles.active_roles()
 
     @property
     def pending_count(self) -> int:
@@ -107,18 +113,16 @@ class MinecraftAuthenticatedTransport:
 
     async def handle(self, websocket: WebSocketPort) -> None:
         connection_id = str(uuid4())
-        role = None
+        reservation = None
+        lease = None
         try:
             self._reserve_unauthenticated(connection_id)
             loop_deadline = asyncio.get_running_loop().time() + 5.0
             await websocket.accept(subprotocol=_SUBPROTOCOL)
             hello = await self._receive(websocket, timeout=self._remaining(loop_deadline))
             peer = self._hello_peer(hello)
-            role = peer.context.peer_role
             self._admit_attempt(peer.context.peer_install_id)
-            if role in self._roles:
-                raise TransportError("authenticated role already connected")
-            self._roles[role] = (connection_id, "HANDSHAKING")
+            reservation = self._roles.reserve(peer.context, connection_id)
             issued = self._trusted_utc()
             peer_nonce = b32_decode(hello["peerNonce"])
             pending = self._pending.begin(
@@ -131,6 +135,7 @@ class MinecraftAuthenticatedTransport:
                 now=self._monotonic(),
                 utc_now=issued,
             )
+            self._roles.bind_challenge(reservation, pending.challenge_id)
             await self._send(
                 websocket,
                 _dump(
@@ -181,13 +186,11 @@ class MinecraftAuthenticatedTransport:
                 ),
                 timeout=self._remaining(loop_deadline),
             )
-            if self._roles.get(role) != (connection_id, "HANDSHAKING"):
-                raise TransportError("role reservation lost")
-            self._roles[role] = (connection_id, "AUTHENTICATED")
+            lease = self._roles.promote(reservation, handshake)
             self._unauthenticated.discard(connection_id)
             await self._heartbeat_loop(websocket)
         except asyncio.CancelledError as cancellation:
-            self._release(connection_id, role)
+            self._release(connection_id, lease or reservation)
             await _safe_close(websocket, 1001, "FEATURE_DISABLED")
             raise cancellation
         except (
@@ -198,11 +201,12 @@ class MinecraftAuthenticatedTransport:
             ValueError,
             TypeError,
             RuntimeError,
+            CurrentRoleError,
         ):
-            self._release(connection_id, role)
+            self._release(connection_id, lease or reservation)
             await _safe_close(websocket, 1008, "FEATURE_DISABLED")
         finally:
-            self._release(connection_id, role)
+            self._release(connection_id, lease or reservation)
 
     async def _heartbeat_loop(self, websocket: WebSocketPort) -> None:
         last_receive = self._monotonic()
@@ -340,11 +344,11 @@ class MinecraftAuthenticatedTransport:
             raise TransportError("unauthenticated connection capacity")
         self._unauthenticated.add(connection_id)
 
-    def _release(self, connection_id: str, role: str | None) -> None:
+    def _release(self, connection_id: str, token) -> None:
         self._pending.discard(connection_id)
         self._unauthenticated.discard(connection_id)
-        if role is not None and self._roles.get(role, (None, None))[0] == connection_id:
-            self._roles.pop(role, None)
+        if token is not None:
+            self._roles.withdraw(token)
 
     @staticmethod
     def _remaining(loop_deadline: float) -> float:

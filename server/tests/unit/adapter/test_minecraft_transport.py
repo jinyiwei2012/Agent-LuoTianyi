@@ -149,6 +149,22 @@ def test_frozen_timeout_constants_are_exact():
     assert math.isfinite(module._HEARTBEAT_SECONDS) and math.isfinite(module._CONTROL_LOST_SECONDS)
 
 
+def test_transport_rejects_v2_peer_until_manifest_assembly_exists():
+    selected = context()
+    v2 = ControlAuthContext(
+        peer_role=selected.peer_role,
+        peer_install_id=selected.peer_install_id,
+        hub_install_id=selected.hub_install_id,
+        key_id=selected.key_id,
+        protocol="LUO_CONTROL_POSTAUTH_V2",
+        mod_hash=selected.mod_hash,
+        config_hash=selected.config_hash,
+        binding_hash=selected.binding_hash,
+    )
+    with pytest.raises(ValueError, match="invalid transport peer"):
+        AllowedPeer(v2, KEY)
+
+
 @pytest.mark.asyncio
 async def test_valid_handshake_emits_challenge_ready_then_effect_message_is_feature_disabled():
     selected = context()

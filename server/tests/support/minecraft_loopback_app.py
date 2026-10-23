@@ -11,6 +11,7 @@ import conftest  # noqa: F401
 from fastapi import FastAPI
 
 from src.adapter.minecraft import control_auth
+from src.adapter.minecraft import current_roles
 from src.adapter.minecraft import transport as transport_module
 from src.adapter.minecraft.control_auth import ControlAuthContext
 from src.adapter.minecraft.transport import AllowedPeer, MinecraftAuthenticatedTransport
@@ -68,7 +69,17 @@ async def status() -> dict[str, object]:
             "python:src/adapter/minecraft/control_auth.py": sha256(
                 Path(control_auth.__file__).read_bytes()
             ).hexdigest(),
+            "python:src/adapter/minecraft/current_roles.py": sha256(
+                Path(current_roles.__file__).read_bytes()
+            ).hexdigest(),
             "python:src/web/minecraft.py": sha256(Path(minecraft_module.__file__).read_bytes()).hexdigest(),
             "python:tests/support/minecraft_loopback_app.py": sha256(Path(__file__).read_bytes()).hexdigest(),
+        },
+        "loadedModulePaths": {
+            "python:src/adapter/minecraft/transport.py": str(Path(transport_module.__file__).resolve()),
+            "python:src/adapter/minecraft/control_auth.py": str(Path(control_auth.__file__).resolve()),
+            "python:src/adapter/minecraft/current_roles.py": str(Path(current_roles.__file__).resolve()),
+            "python:src/web/minecraft.py": str(Path(minecraft_module.__file__).resolve()),
+            "python:tests/support/minecraft_loopback_app.py": str(Path(__file__).resolve()),
         },
     }

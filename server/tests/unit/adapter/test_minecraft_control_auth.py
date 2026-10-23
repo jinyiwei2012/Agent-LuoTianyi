@@ -33,6 +33,8 @@ KEY = bytes(range(32))
 PEER = b"\x11" * 32
 HUB = b"\x22" * 32
 CID = "00000000-0000-4000-8000-000000000001"
+CONN = "00000000-0000-4000-8000-000000000010"
+SECOND = "00000000-0000-4000-8000-000000000011"
 
 
 def proof(label: str, context: ControlAuthContext = CTX, key: bytes = KEY) -> str:
@@ -84,15 +86,17 @@ def test_utc_and_monotonic_inputs_fail_closed():
 
 def test_success_consumes_state_and_returns_immutable_ready_context():
     pending = PendingHandshakes()
-    item = pending.begin("conn", CTX, PEER, NOW, hub_nonce=HUB, challenge_id=CID, now=0, utc_now=NOW)
-    auth = pending.consume("conn", CID, proof("PEER_PROOF"), KEY, expected_context=CTX, now=1, utc_now=NOW)
+    item = pending.begin(CID, CTX, PEER, NOW, hub_nonce=HUB, challenge_id=CID, now=0, utc_now=NOW)
+    auth = pending.consume(CID, CID, proof("PEER_PROOF"), KEY, expected_context=CTX, now=1, utc_now=NOW)
     assert isinstance(auth, AuthenticatedHandshake)
     assert auth.context is CTX
+    assert auth.connection_id == CID and auth.peer_nonce == PEER and auth.hub_nonce == HUB
+    assert auth.issued_at == NOW and auth.expires_at == EXPIRES and auth.has_full_provenance
     assert verify_proof(auth.ready_proof, KEY, "READY_PROOF", CTX, PEER, HUB, CID, NOW, item.expires_at)
     with pytest.raises((AttributeError, TypeError)):
         auth.challenge_id = "changed"  # type: ignore[misc]
     with pytest.raises(ControlAuthError):
-        pending.consume("conn", CID, proof("PEER_PROOF"), KEY, now=1, utc_now=NOW)
+        pending.consume(CID, CID, proof("PEER_PROOF"), KEY, now=1, utc_now=NOW)
 
 
 def test_invalid_proof_and_context_mismatch_consume_pending_state():
@@ -119,13 +123,13 @@ def test_invalid_proof_and_context_mismatch_consume_pending_state():
 
 def test_expired_slots_recover_and_cross_connection_proof_is_rejected():
     pending = PendingHandshakes(maximum=1)
-    pending.begin("first", CTX, PEER, NOW, hub_nonce=HUB, challenge_id=CID, now=0, utc_now=NOW)
-    pending.begin("second", CTX, PEER, NOW, hub_nonce=HUB, challenge_id=CID, now=5, utc_now=NOW)
+    pending.begin(CONN, CTX, PEER, NOW, hub_nonce=HUB, challenge_id=CID, now=0, utc_now=NOW)
+    pending.begin(SECOND, CTX, PEER, NOW, hub_nonce=HUB, challenge_id=CID, now=5, utc_now=NOW)
     with pytest.raises(ControlAuthError):
-        pending.consume("first", CID, proof("PEER_PROOF"), KEY, now=5, utc_now=NOW)
+        pending.consume(CONN, CID, proof("PEER_PROOF"), KEY, now=5, utc_now=NOW)
     with pytest.raises(ControlAuthError):
         pending.consume("second-other", CID, proof("PEER_PROOF"), KEY, now=5, utc_now=NOW)
-    assert pending.consume("second", CID, proof("PEER_PROOF"), KEY, now=5, utc_now=NOW).challenge_id == CID
+    assert pending.consume(SECOND, CID, proof("PEER_PROOF"), KEY, now=5, utc_now=NOW).challenge_id == CID
 
 
 def test_wall_clock_future_and_expiry_are_rejected_when_caller_supplies_it():
@@ -152,8 +156,8 @@ def test_trusted_utc_is_required_and_monotonic_rollback_consumes_challenge():
 
 def test_secret_bearing_dataclasses_do_not_expose_values_in_repr():
     pending = PendingHandshakes()
-    item = pending.begin("conn", CTX, PEER, NOW, hub_nonce=HUB, challenge_id=CID, now=0, utc_now=NOW)
-    auth = pending.consume("conn", CID, proof("PEER_PROOF"), KEY, now=1, utc_now=NOW)
+    item = pending.begin(CONN, CTX, PEER, NOW, hub_nonce=HUB, challenge_id=CID, now=0, utc_now=NOW)
+    auth = pending.consume(CONN, CID, proof("PEER_PROOF"), KEY, now=1, utc_now=NOW)
     for value in (CTX, item, auth):
         rendered = repr(value)
         assert PEER.hex() not in rendered
@@ -194,7 +198,7 @@ def test_concurrent_begin_never_exceeds_four_and_same_connection_has_one_winner(
 
 def test_consume_holds_lock_through_proof_and_ready_construction(monkeypatch):
     pending = PendingHandshakes()
-    pending.begin("conn", CTX, PEER, NOW, hub_nonce=HUB, challenge_id=CID, now=0, utc_now=NOW)
+    pending.begin(CONN, CTX, PEER, NOW, hub_nonce=HUB, challenge_id=CID, now=0, utc_now=NOW)
     entered = Event()
     release = Event()
     original_verify = control_auth.verify_proof
@@ -208,7 +212,7 @@ def test_consume_holds_lock_through_proof_and_ready_construction(monkeypatch):
     monkeypatch.setattr(control_auth, "verify_proof", blocking_verify)
 
     def consume() -> None:
-        result.append(pending.consume("conn", CID, proof("PEER_PROOF"), KEY, now=1, utc_now=NOW))
+        result.append(pending.consume(CONN, CID, proof("PEER_PROOF"), KEY, now=1, utc_now=NOW))
 
     consumer = Thread(target=consume)
     consumer.start()
@@ -216,7 +220,7 @@ def test_consume_holds_lock_through_proof_and_ready_construction(monkeypatch):
     begin_finished = Event()
 
     def begin_replacement() -> None:
-        pending.begin("conn", CTX, PEER, NOW, now=2, utc_now=NOW)
+        pending.begin(CONN, CTX, PEER, NOW, now=2, utc_now=NOW)
         begin_finished.set()
 
     replacement = Thread(target=begin_replacement)

@@ -13,7 +13,8 @@ import re
 import secrets
 import struct
 import threading
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from time import monotonic
@@ -28,6 +29,7 @@ _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 _I63_MAX = (1 << 63) - 1
 _CHALLENGE_LIFETIME = timedelta(seconds=5)
 _MAX_CLOCK_SKEW = timedelta(seconds=1)
+_CONSUMED_PROVENANCE = object()
 
 
 class ControlAuthError(ValueError):
@@ -83,6 +85,51 @@ class AuthenticatedHandshake:
     context: ControlAuthContext
     challenge_id: str
     ready_proof: str
+    connection_id: str = field(init=False, default="")
+    peer_nonce: bytes = field(init=False, default=b"")
+    hub_nonce: bytes = field(init=False, default=b"")
+    issued_at: datetime | None = field(init=False, default=None)
+    expires_at: datetime | None = field(init=False, default=None)
+    _provenance: object | None = field(init=False, default=None, repr=False, compare=False)
+
+    @property
+    def has_full_provenance(self) -> bool:
+        return (
+            self._provenance is _CONSUMED_PROVENANCE
+            and _uuid(self.connection_id)
+            and _uuid(self.challenge_id)
+            and len(self.peer_nonce) == 32
+            and len(self.hub_nonce) == 32
+            and self.issued_at is not None
+            and self.expires_at is not None
+        )
+
+    def __copy__(self):
+        return AuthenticatedHandshake(
+            context=self.context, challenge_id=self.challenge_id, ready_proof=self.ready_proof
+        )
+
+    def __deepcopy__(self, memo):
+        return AuthenticatedHandshake(
+            context=deepcopy(self.context, memo),
+            challenge_id=self.challenge_id,
+            ready_proof=self.ready_proof,
+        )
+
+    @classmethod
+    def _from_consumed_pending(cls, pending: PendingChallenge, ready_proof: str):
+        value = cls(
+            context=pending.context,
+            challenge_id=pending.challenge_id,
+            ready_proof=ready_proof,
+        )
+        object.__setattr__(value, "connection_id", pending.connection_id)
+        object.__setattr__(value, "peer_nonce", bytes(pending.peer_nonce))
+        object.__setattr__(value, "hub_nonce", bytes(pending.hub_nonce))
+        object.__setattr__(value, "issued_at", pending.issued_at)
+        object.__setattr__(value, "expires_at", pending.expires_at)
+        object.__setattr__(value, "_provenance", _CONSUMED_PROVENANCE)
+        return value
 
 
 # Keep the initial narrow name available to callers that already imported it.
@@ -289,7 +336,7 @@ class PendingHandshakes:
                 pending.issued_at,
                 pending.expires_at,
             )
-            return AuthenticatedHandshake(context=pending.context, challenge_id=pending.challenge_id, ready_proof=ready)
+            return AuthenticatedHandshake._from_consumed_pending(pending, ready)
 
     def discard(self, connection_id: str) -> bool:
         """Remove only this connection's pending challenge; repeated calls are safe."""
