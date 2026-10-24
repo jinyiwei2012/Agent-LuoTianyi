@@ -2,6 +2,7 @@ import json
 import sqlite3
 import threading
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -17,6 +18,454 @@ from src.adapter.minecraft.epoch_store import (
 
 PROVISION = "00000000-0000-4000-8000-000000000001"
 BODY = "00000000-0000-4000-8000-000000000002"
+
+
+def _custody_policy(path):
+    from src.adapter.minecraft.epoch_store import TrustedEpochPolicy
+
+    sid = b"\x01\x01\x00\x00\x00\x00\x00\x05\x12\x00\x00\x00"
+    return TrustedEpochPolicy(str(path), 1, 2, sid, (sid,), (sid,), (sid,), PROVISION, BODY)
+
+
+class _Lease:
+    def __init__(self, marker):
+        self.marker = marker
+        self.closes = 0
+        self.checks = 0
+        self.failure = None
+        self.on_close = lambda: None
+
+    def read_marker(self):
+        self.checks += 1
+        return self.marker
+
+    def validate(self):
+        self.checks += 1
+
+    def close(self):
+        self.closes += 1
+        self.on_close()
+        if self.failure is not None:
+            raise self.failure
+
+
+def _custody_fixture(tmp_path):
+    from src.adapter.minecraft.epoch_store import EpochOpenAttemptReceipt
+
+    root = tmp_path / "custody"
+    legacy = EpochStore.provision(root, PROVISION, BODY, platform=_TestPlatform())
+    legacy.close()
+    lease = _Lease((root / "provision.json").read_bytes())
+
+    class Port:
+        def acquire(self, policy, receipt):
+            receipt._register(lease)
+            return lease
+
+    receipt = EpochOpenAttemptReceipt()
+    store = EpochStore.open_with_custody(_custody_policy(root), custody=Port(), receipt=receipt)
+    return store, lease, receipt
+
+
+def test_custody_actual_store_transfer_read_cas_close(tmp_path):
+    store, lease, receipt = _custody_fixture(tmp_path)
+    assert receipt.snapshot().state == "TRANSFERRED"
+    assert receipt.snapshot().retained_resources == 0
+    candidate = store.read_candidate()
+    result = store.commit_ready(candidate, VerifiedReadyContext(PROVISION, BODY, 0, 0, 1, "test-only"))
+    assert result.last_epoch == 1
+    assert lease.checks > 10
+    store.close()
+    store.close()
+    assert lease.closes == 1
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "relative",
+        "C:relative",
+        r"\\host\share",
+        r"\\?\C:\root",
+        r"C:\root\..\x",
+        r"C:\root.\x",
+        r"C:\CON\x",
+        r"C:\root:x",
+    ],
+)
+def test_custody_policy_rejects_original_lexical_alias(raw):
+    with pytest.raises(EpochStoreError):
+        _custody_policy(raw)
+
+
+def test_custody_receipt_single_use_invalid_input_before_acquire():
+    from src.adapter.minecraft.epoch_store import EpochOpenAttemptReceipt
+
+    receipt = EpochOpenAttemptReceipt()
+    custody = Mock()
+    with pytest.raises(EpochStoreError):
+        EpochStore.open_with_custody(None, custody=custody, receipt=receipt)
+    assert receipt.snapshot().state == "RELEASED"
+    with pytest.raises(EpochStoreError):
+        EpochStore.open_with_custody(None, custody=custody, receipt=receipt)
+    custody.acquire.assert_not_called()
+
+
+@pytest.mark.parametrize("fatal", [False, True])
+def test_custody_partial_acquire_retains_unknown_and_preserves_fatal(fatal):
+    from src.adapter.minecraft.epoch_store import EpochOpenAttemptReceipt, EpochOpenCleanupError
+
+    lease = _Lease(b"")
+    original = KeyboardInterrupt() if fatal else RuntimeError()
+    lease.failure = RuntimeError()
+
+    class Port:
+        def acquire(self, policy, receipt):
+            receipt._register(lease)
+            raise original
+
+    receipt = EpochOpenAttemptReceipt()
+    with pytest.raises(BaseException) as caught:
+        EpochStore.open_with_custody(_custody_policy(r"C:\test"), custody=Port(), receipt=receipt)
+    assert caught.value is original if fatal else isinstance(caught.value, EpochOpenCleanupError)
+    assert receipt.snapshot().state == "UNKNOWN"
+    assert receipt.snapshot().retained_resources == 1
+    assert lease.closes == 1
+
+
+@pytest.mark.parametrize("fatal", [False, True])
+def test_custody_connection_close_unknown_no_readback_unlock_or_retry(tmp_path, monkeypatch, fatal):
+    import src.adapter.minecraft.epoch_store as module
+
+    store, lease, receipt = _custody_fixture(tmp_path)
+    connection = Mock()
+    original = KeyboardInterrupt() if fatal else RuntimeError()
+    connection.close.side_effect = original
+    monkeypatch.setattr(module, "_connect_rw", lambda path: connection)
+    monkeypatch.setattr(module, "_configure", lambda value: None)
+    monkeypatch.setattr(module, "_read_row", lambda *args: module._Row(1, PROVISION, BODY, 0, 0, b""))
+    with pytest.raises(BaseException) as caught:
+        store.read_candidate()
+    if fatal:
+        assert caught.value is original
+    assert store.cleanup_evidence().retained_resources == 2
+    assert receipt.snapshot().state == "TRANSFERRED"
+    with pytest.raises(EpochStoreError):
+        store.close()
+    with pytest.raises(EpochStoreError):
+        store.read_candidate()
+    connection.close.assert_called_once()
+    assert lease.closes == 0
+
+
+def test_custody_close_reentry_terminal_unknown_once(tmp_path):
+    store, lease, _ = _custody_fixture(tmp_path)
+
+    def reenter():
+        with pytest.raises(EpochStoreError):
+            store.close()
+
+    lease.on_close = reenter
+    with pytest.raises(EpochStoreError):
+        store.close()
+    with pytest.raises(EpochStoreError):
+        store.close()
+    assert lease.closes == 1
+
+
+def test_custody_legacy_provision_rejects_new_inputs_before_directory(monkeypatch):
+    import src.adapter.minecraft.epoch_store as module
+
+    directory = Mock(side_effect=AssertionError("must not resolve"))
+    monkeypatch.setattr(module, "_directory", directory)
+    with pytest.raises(EpochStoreError):
+        EpochStore.provision(_custody_policy(r"C:\test"), PROVISION, BODY)
+
+    class Port:
+        def acquire(self, policy, receipt):
+            raise AssertionError()
+
+    with pytest.raises(EpochStoreError):
+        EpochStore.provision(r"C:\test", PROVISION, BODY, platform=Port())
+    directory.assert_not_called()
+
+
+@pytest.mark.parametrize("boundary", ["BEGIN IMMEDIATE", "COMMIT", "POST_COMMIT", "READBACK"])
+def test_custody_commit_boundaries_disable_without_retry(tmp_path, monkeypatch, boundary):
+    import src.adapter.minecraft.epoch_store as module
+
+    store, lease, _ = _custody_fixture(tmp_path)
+    candidate = store.read_candidate()
+    actual = module._connect_rw
+    events = []
+    connections = []
+    original_validate = lease.validate
+
+    def validate():
+        if boundary == "POST_COMMIT" and "COMMIT" in events:
+            raise RuntimeError("postcommit")
+        original_validate()
+
+    lease.validate = validate
+
+    class Connection:
+        def __init__(self, raw):
+            self.raw = raw
+            self.closes = 0
+
+        def execute(self, sql, *args):
+            events.append(sql)
+            if sql == boundary:
+                raise RuntimeError("boundary")
+            return self.raw.execute(sql, *args)
+
+        def close(self):
+            self.closes += 1
+            self.raw.close()
+
+    def connect(path):
+        if boundary == "READBACK" and connections:
+            raise RuntimeError("readback")
+        connection = Connection(actual(path))
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(module, "_connect_rw", connect)
+    with pytest.raises(EpochStoreError):
+        store.commit_ready(candidate, VerifiedReadyContext(PROVISION, BODY, 0, 0, 1, "mock"))
+    assert all(connection.closes == 1 for connection in connections)
+    assert "ROLLBACK" not in events  # BEGIN failure is before a begun transaction; other failures after attempt
+    assert store.cleanup_evidence().transaction_unknown == (boundary != "BEGIN IMMEDIATE")
+    before = len(connections)
+    with pytest.raises(EpochStoreError):
+        store.commit_ready(candidate, VerifiedReadyContext(PROVISION, BODY, 0, 0, 1, "mock"))
+    assert len(connections) == before
+    store.close()
+    assert lease.closes == 1
+
+
+def test_custody_cleanup_fatal_outranks_ordinary_and_first_fatal_wins():
+    from src.adapter.minecraft.epoch_store import EpochOpenAttemptReceipt
+
+    first = KeyboardInterrupt()
+    second = SystemExit()
+    ordinary = RuntimeError()
+    leases = [_Lease(b""), _Lease(b"")]
+    leases[0].failure = second
+    leases[1].failure = first
+
+    class Port:
+        def acquire(self, policy, receipt):
+            for lease in leases:
+                receipt._register(lease)
+            raise ordinary
+
+    receipt = EpochOpenAttemptReceipt()
+    with pytest.raises(KeyboardInterrupt) as caught:
+        EpochStore.open_with_custody(_custody_policy(r"C:\test"), custody=Port(), receipt=receipt)
+    assert caught.value is first
+    assert [lease.closes for lease in leases] == [1, 1]
+    assert receipt.snapshot().retained_resources == 2
+
+
+def test_custody_failed_open_connection_keeps_dependent_lease(monkeypatch):
+    import src.adapter.minecraft.epoch_store as module
+
+    lease = _Lease(json.dumps(dict(version=1, provisionId=PROVISION, bodyId=BODY)).encode())
+    connection = Mock()
+    connection.close.side_effect = RuntimeError()
+
+    class Port:
+        def acquire(self, policy, receipt):
+            receipt._register(lease)
+            return lease
+
+    receipt = module.EpochOpenAttemptReceipt()
+    monkeypatch.setattr(module, "_connect_rw", lambda path: connection)
+    monkeypatch.setattr(module, "_configure", lambda connection: (_ for _ in ()).throw(ValueError()))
+    with pytest.raises(module.EpochOpenCleanupError):
+        EpochStore.open_with_custody(_custody_policy(r"C:\test"), custody=Port(), receipt=receipt)
+    assert receipt.snapshot().state == "UNKNOWN"
+    assert receipt.snapshot().retained_resources == 2
+    connection.close.assert_called_once()
+    assert lease.closes == 0
+
+
+def test_custody_marker_is_after_lease_and_rechecked_before_connect(tmp_path, monkeypatch):
+    import src.adapter.minecraft.epoch_store as module
+
+    store, lease, _ = _custody_fixture(tmp_path)
+    lease.marker = b"{}"
+    connect = Mock(side_effect=AssertionError("no connect after marker mismatch"))
+    monkeypatch.setattr(module, "_connect_rw", connect)
+    with pytest.raises(EpochStoreError):
+        store.read_candidate()
+    connect.assert_not_called()
+    store.close()
+    assert lease.closes == 1
+
+
+def test_custody_reentrant_connection_close_quarantines_without_duplicate(tmp_path, monkeypatch):
+    import src.adapter.minecraft.epoch_store as module
+
+    store, lease, _ = _custody_fixture(tmp_path)
+    raw = module._connect_rw(store._directory / "epochs.sqlite3")
+    closes = []
+
+    class Connection:
+        def execute(self, *args):
+            return raw.execute(*args)
+
+        def close(self):
+            closes.append(1)
+            with pytest.raises(EpochStoreError):
+                store.close()
+            raw.close()
+
+    monkeypatch.setattr(module, "_connect_rw", lambda path: Connection())
+    with pytest.raises(EpochStoreError):
+        store.read_candidate()
+    with pytest.raises(EpochStoreError):
+        store.close()
+    assert closes == [1]
+    assert lease.closes == 0
+
+
+@pytest.mark.parametrize("fatal", [False, True])
+def test_custody_receipt_cleanup_closes_registration_window_before_callback(fatal):
+    from src.adapter.minecraft.epoch_store import EpochOpenAttemptReceipt
+
+    receipt = EpochOpenAttemptReceipt()
+    lease = _Lease(b"")
+    attempted_acquisition = []
+    original = KeyboardInterrupt() if fatal else RuntimeError()
+
+    def callback():
+        # Port checks permission before obtaining any new resource: no orphan-on-reject.
+        with pytest.raises(EpochStoreError):
+            receipt._registration_window()
+        with pytest.raises(EpochStoreError):
+            receipt._register(lease)
+        with pytest.raises(EpochStoreError):
+            receipt._claim(object())
+        with pytest.raises(EpochStoreError):
+            receipt._finish("TRANSFERRED", object())
+        assert attempted_acquisition == []
+
+    lease.on_close = callback
+
+    class Port:
+        def acquire(self, policy, context):
+            context._registration_window()
+            context._register(lease)
+            raise original
+
+    with pytest.raises(BaseException) as caught:
+        EpochStore.open_with_custody(_custody_policy(r"C:\test"), custody=Port(), receipt=receipt)
+    if fatal:
+        assert caught.value is original
+    assert receipt.snapshot().state == "RELEASED"
+    assert receipt.snapshot().retained_resources == 0
+    assert lease.closes == 1
+    with pytest.raises(EpochStoreError):
+        receipt._finish("IN_PROGRESS", object())
+
+
+@pytest.mark.parametrize("callback", ["validate", "read_marker"])
+@pytest.mark.parametrize("nested", ["read", "commit"])
+@pytest.mark.parametrize("outer", ["read", "commit"])
+def test_custody_unified_operation_guard_rejects_caught_callback_reentry(
+    tmp_path, monkeypatch, callback, nested, outer
+):
+    import src.adapter.minecraft.epoch_store as module
+
+    store, lease, _ = _custody_fixture(tmp_path)
+    candidate = store.read_candidate()
+    ready = VerifiedReadyContext(PROVISION, BODY, 0, 0, 1, "mock")
+    connect = Mock(side_effect=AssertionError("nested/disabled operation must not connect"))
+    monkeypatch.setattr(module, "_connect_rw", connect)
+    original = getattr(lease, callback)
+
+    def reenter():
+        with pytest.raises(EpochStoreError):
+            store.read_candidate() if nested == "read" else store.commit_ready(candidate, ready)
+        return original()
+
+    setattr(lease, callback, reenter)
+    with pytest.raises(EpochStoreError):
+        store.read_candidate() if outer == "read" else store.commit_ready(candidate, ready)
+    connect.assert_not_called()
+    assert store.cleanup_evidence().state == "UNKNOWN"
+    assert not store.cleanup_evidence().transaction_unknown
+    with pytest.raises(EpochStoreError):
+        store.close()
+    assert lease.closes == 0
+
+
+def test_custody_reentry_with_owned_connection_never_replaces_closes_or_rolls_back(tmp_path, monkeypatch):
+    import src.adapter.minecraft.epoch_store as module
+
+    store, lease, _ = _custody_fixture(tmp_path)
+    candidate = store.read_candidate()
+    ready = VerifiedReadyContext(PROVISION, BODY, 0, 0, 1, "mock")
+    connection = Mock()
+    connection.execute.return_value = Mock()
+    connect = Mock(return_value=connection)
+    monkeypatch.setattr(module, "_connect_rw", connect)
+    monkeypatch.setattr(module, "_configure", lambda conn: None)
+    original = lease.validate
+    checks = []
+
+    def validate():
+        checks.append(1)
+        if len(checks) == 4:  # after BEGIN, outer already owns its one connection
+            with pytest.raises(EpochStoreError):
+                store.read_candidate()
+        original()
+
+    lease.validate = validate
+    with pytest.raises(EpochStoreError):
+        store.commit_ready(candidate, ready)
+    connect.assert_called_once()
+    connection.close.assert_not_called()
+    assert [args[0][0] for args in connection.execute.call_args_list] == ["BEGIN IMMEDIATE"]
+    assert store.cleanup_evidence().retained_resources == 2
+    with pytest.raises(EpochStoreError):
+        store.close()
+    assert lease.closes == 0
+
+
+def test_custody_precommit_update_failure_rolls_back_once_with_outer_guard(tmp_path, monkeypatch):
+    import src.adapter.minecraft.epoch_store as module
+
+    store, lease, _ = _custody_fixture(tmp_path)
+    candidate = store.read_candidate()
+    actual = module._connect_rw
+    events = []
+
+    class Connection:
+        def __init__(self, raw):
+            self.raw = raw
+
+        def execute(self, sql, *args):
+            events.append(sql)
+            if sql.startswith("UPDATE"):
+                raise RuntimeError("update failed before commit")
+            return self.raw.execute(sql, *args)
+
+        def close(self):
+            events.append("CLOSE")
+            self.raw.close()
+
+    monkeypatch.setattr(module, "_connect_rw", lambda path: Connection(actual(path)))
+    with pytest.raises(EpochStoreError):
+        store.commit_ready(candidate, VerifiedReadyContext(PROVISION, BODY, 0, 0, 1, "mock"))
+    assert events.count("ROLLBACK") == 1
+    assert events.count("CLOSE") == 1
+    assert "COMMIT" not in events
+    assert not store.cleanup_evidence().transaction_unknown
+    store.close()
+    assert lease.closes == 1
 
 
 class _Lock:

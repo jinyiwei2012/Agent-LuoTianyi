@@ -13,7 +13,13 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 
-from src.adapter.minecraft.epoch_store import EpochStoreError, PlatformCapability
+from src.adapter.minecraft.epoch_store import (
+    EpochOpenAttemptReceipt,
+    EpochOpenLease,
+    EpochStoreError,
+    PlatformCapability,
+    TrustedEpochPolicy,
+)
 
 _GENERIC_READ = 0x80000000
 _GENERIC_WRITE = 0x40000000
@@ -42,6 +48,10 @@ class WindowsEpochPlatform:
     this bounded module intentionally does not evaluate owner/DACL/ACE semantics,
     ``capability`` always remains unverified even on a suitable local volume.
     """
+
+    def acquire(self, policy: TrustedEpochPolicy, receipt: EpochOpenAttemptReceipt) -> EpochOpenLease:
+        # Deliberately no legacy probe, native call, fallback or lease factory.
+        raise EpochStoreError("native epoch lifetime custody is unsupported")
 
     def capability(self, directory: Path) -> PlatformCapability:
         facts = self.volume_facts(directory)

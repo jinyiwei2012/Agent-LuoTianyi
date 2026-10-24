@@ -8,6 +8,34 @@ from src.adapter.minecraft.epoch_platform import WindowsEpochPlatform, WindowsLo
 from src.adapter.minecraft.epoch_store import EpochStoreError
 
 
+def test_custody_native_unsupported_has_zero_native_or_legacy_calls(monkeypatch):
+    from src.adapter.minecraft.epoch_store import EpochOpenAttemptReceipt, EpochStore, TrustedEpochPolicy
+
+    sid = b"\x01\x01\x00\x00\x00\x00\x00\x05\x12\x00\x00\x00"
+    policy = TrustedEpochPolicy(
+        r"C:\test",
+        1,
+        2,
+        sid,
+        (sid,),
+        (sid,),
+        (sid,),
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000002",
+    )
+
+    def forbidden(*args):
+        raise AssertionError("native/legacy fallback")
+
+    monkeypatch.setattr(epoch_platform, "_kernel32", forbidden)
+    for name in ("capability", "volume_facts", "acquire_lock"):
+        monkeypatch.setattr(WindowsEpochPlatform, name, forbidden)
+    receipt = EpochOpenAttemptReceipt()
+    with pytest.raises(EpochStoreError, match="unsupported"):
+        EpochStore.open_with_custody(policy, custody=WindowsEpochPlatform(), receipt=receipt)
+    assert receipt.snapshot().state == "RELEASED"
+
+
 class _Kernel:
     def __init__(self, result=1, error=None):
         self.result = result
