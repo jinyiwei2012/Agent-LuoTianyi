@@ -398,6 +398,43 @@ async def route_status() -> dict[str, object]:
     }
 
 
+@app.get("/minecraft/v2/test-verified-proof-status")
+async def verified_proof_status() -> dict[str, object]:
+    transport = app.state.transport
+    candidates = transport._body_routes.candidates()
+    payloads = [record.payload for record in transport._body_routes._routes.values()]
+    return {
+        "nonAuthoritativeCandidateCount": len(candidates),
+        "routeNoticeStructureValid": all(
+            _valid_notice(payload) for payload in payloads
+        ),
+        "routeNoticeSha256": [sha256(payload).hexdigest() for payload in payloads[:2]],
+        "coordinatorPresent": transport._binding is not None,
+    }
+
+
+def _valid_notice(raw: bytes) -> bool:
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError, TypeError):
+        return False
+    return (
+        type(value) is dict
+        and set(value)
+        == {
+            "security",
+            "kind",
+            "serverBootId",
+            "gameConnectionId",
+            "bodyId",
+            "gameNonce",
+        }
+        and value["security"] == "luosandbox.control-auth.v1"
+        and value["kind"] == "BODY_BIND_NOTICE"
+        and all(type(item) is str for item in value.values())
+    )
+
+
 @app.post("/minecraft/v2/test-shutdown")
 async def shutdown(request: Request) -> JSONResponse:
     if (
