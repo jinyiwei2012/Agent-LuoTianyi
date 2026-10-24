@@ -10,6 +10,7 @@ from src.adapter.minecraft.epoch_worker import (
     EpochCommitRequest,
     EpochJobHandle,
     EpochPreflightRequest,
+    EpochPreflightSnapshot,
     EpochWorkerConfig,
     EpochWorkerError,
     EpochWorkerState,
@@ -44,6 +45,8 @@ class Platform:
 
 def preflight():
     return EpochPreflightRequest(
+        provision_id=PROVISION,
+        body_id=BODY,
         coordinator_generation=1,
         route_id=ROUTE,
         server_connection_id=SERVER,
@@ -133,11 +136,148 @@ def test_config_and_request_types_are_exact():
     for bad in (True, 1.0, "1", None):
         with pytest.raises(ValueError):
             EpochPreflightRequest(
+                provision_id=PROVISION,
+                body_id=BODY,
                 coordinator_generation=bad,
                 route_id=ROUTE,
                 server_connection_id=SERVER,
                 controller_connection_id=CLIENT,
             )
+
+
+@pytest.mark.asyncio
+async def test_validate_preflight_is_exact_nonconsuming_and_callback_free(tmp_path):
+    worker = MinecraftEpochStoreWorker(
+        EpochWorkerConfig(
+            mode="PROVISION",
+            directory=(tmp_path / "epoch").resolve(),
+            platform=Platform(),
+            provision_id=PROVISION,
+            body_id=BODY,
+        )
+    )
+    await worker.start()
+    handle = worker.submit_preflight(preflight())
+    assert not worker.validates_preflight(
+        EpochPreflightSnapshot(PROVISION, BODY, 0, 0, 1, 1, ROUTE, SERVER, CLIENT, object(), object()),
+        provision_id=PROVISION,
+        body_id=BODY,
+        coordinator_generation=1,
+        route_id=ROUTE,
+        server_connection_id=SERVER,
+        controller_connection_id=CLIENT,
+    )
+    await worker.wait(handle)
+    snapshot = worker.take_preflight(handle)
+    expected = dict(
+        provision_id=PROVISION,
+        body_id=BODY,
+        coordinator_generation=1,
+        route_id=ROUTE,
+        server_connection_id=SERVER,
+        controller_connection_id=CLIENT,
+    )
+    assert worker.validates_preflight(snapshot, **expected)
+    assert worker.validates_preflight(snapshot, **expected)
+    assert worker.outstanding_count == 1
+    for key, value in (
+        ("provision_id", BODY),
+        ("body_id", PROVISION),
+        ("coordinator_generation", 2),
+        ("route_id", SERVER),
+        ("server_connection_id", CLIENT),
+        ("controller_connection_id", SERVER),
+    ):
+        changed = dict(expected)
+        changed[key] = value
+        assert not worker.validates_preflight(snapshot, **changed)
+    assert not worker.validates_preflight(copy.copy(snapshot), **expected)
+    worker.mark_obsolete(snapshot)
+    assert not worker.validates_preflight(snapshot, **expected)
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_preflight_requested_identity_must_match_actual_store(tmp_path):
+    worker = MinecraftEpochStoreWorker(
+        EpochWorkerConfig(
+            mode="PROVISION",
+            directory=(tmp_path / "epoch").resolve(),
+            platform=Platform(),
+            provision_id=PROVISION,
+            body_id=BODY,
+        )
+    )
+    await worker.start()
+    wrong = EpochPreflightRequest(
+        provision_id="60000000-0000-4000-8000-000000000006",
+        body_id=BODY,
+        coordinator_generation=1,
+        route_id=ROUTE,
+        server_connection_id=SERVER,
+        controller_connection_id=CLIENT,
+    )
+    handle = worker.submit_preflight(wrong)
+    with pytest.raises(EpochWorkerError, match="job failed"):
+        await worker.wait(handle)
+    assert worker.state is EpochWorkerState.UNAVAILABLE
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_malicious_snapshot_identity_hash_and_attributes_are_never_invoked(tmp_path):
+    worker = MinecraftEpochStoreWorker(
+        EpochWorkerConfig(
+            mode="PROVISION",
+            directory=(tmp_path / "epoch").resolve(),
+            platform=Platform(),
+            provision_id=PROVISION,
+            body_id=BODY,
+        )
+    )
+    await worker.start()
+    handle = worker.submit_preflight(preflight())
+    await worker.wait(handle)
+    genuine = worker.take_preflight(handle)
+
+    class Explosive:
+        def __hash__(self):
+            raise AssertionError("hash callback")
+
+        def __eq__(self, other):
+            raise AssertionError("equality callback")
+
+    forged = EpochPreflightSnapshot(
+        genuine.provision_id,
+        genuine.body_id,
+        genuine.expected_last_epoch,
+        genuine.expected_generation,
+        genuine.next_epoch,
+        genuine.coordinator_generation,
+        genuine.route_id,
+        genuine.server_connection_id,
+        genuine.controller_connection_id,
+        [],
+        Explosive(),
+    )
+    expected = dict(
+        provision_id=PROVISION,
+        body_id=BODY,
+        coordinator_generation=1,
+        route_id=ROUTE,
+        server_connection_id=SERVER,
+        controller_connection_id=CLIENT,
+    )
+    assert worker.validates_preflight(forged, **expected) is False
+
+    class SnapshotSubclass(EpochPreflightSnapshot):
+        def __getattribute__(self, name):
+            raise AssertionError("attribute callback")
+
+    subclass = object.__new__(SnapshotSubclass)
+    assert worker.validates_preflight(subclass, **expected) is False
+    worker.mark_obsolete(genuine)
+    await worker.close()
 
 
 @pytest.mark.asyncio

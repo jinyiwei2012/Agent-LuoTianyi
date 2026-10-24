@@ -59,12 +59,16 @@ class EpochWorkerConfig:
 
 @dataclass(frozen=True, slots=True, kw_only=True, repr=False)
 class EpochPreflightRequest:
+    provision_id: str
+    body_id: str
     coordinator_generation: int
     route_id: str
     server_connection_id: str
     controller_connection_id: str
 
     def __post_init__(self) -> None:
+        if not _uuid(self.provision_id) or not _uuid(self.body_id):
+            raise ValueError("invalid epoch worker identity")
         _correlation(
             self.coordinator_generation, self.route_id, self.server_connection_id, self.controller_connection_id
         )
@@ -245,18 +249,21 @@ class MinecraftEpochStoreWorker:
 
     def submit_commit(self, request: EpochCommitRequest) -> EpochJobHandle:
         self._owner()
-        if self._state is not EpochWorkerState.AVAILABLE or not isinstance(request, EpochCommitRequest):
+        if self._state is not EpochWorkerState.AVAILABLE or type(request) is not EpochCommitRequest:
             raise EpochWorkerError("epoch worker is unavailable")
         snapshot = request.preflight
-        old = self._jobs.get(snapshot._job_identity)
-        if (
-            old is None
-            or old.kind != "PREFLIGHT"
-            or old.phase != "DELIVERED"
-            or old.result is not snapshot
-            or snapshot._store_identity is not self._store_identity
-            or not _request_matches_snapshot(request, snapshot)
-        ):
+        if type(snapshot) is not EpochPreflightSnapshot:
+            raise EpochWorkerError("preflight lease is not current")
+        old = self._validated_preflight_job(
+            snapshot,
+            provision_id=snapshot.provision_id,
+            body_id=snapshot.body_id,
+            coordinator_generation=request.coordinator_generation,
+            route_id=request.route_id,
+            server_connection_id=request.server_connection_id,
+            controller_connection_id=request.controller_connection_id,
+        )
+        if old is None:
             raise EpochWorkerError("preflight lease is not current")
         identity = object()
         job = _OwnerJob(identity, "COMMIT", request, self._loop.create_future(), candidate=old.candidate)
@@ -269,6 +276,42 @@ class MinecraftEpochStoreWorker:
             self._jobs[old.identity] = old
             raise EpochWorkerError("epoch worker queue unavailable") from None
         return EpochJobHandle(identity)
+
+    def validates_preflight(
+        self,
+        snapshot: EpochPreflightSnapshot,
+        *,
+        provision_id: str,
+        body_id: str,
+        coordinator_generation: int,
+        route_id: str,
+        server_connection_id: str,
+        controller_connection_id: str,
+    ) -> bool:
+        self._owner()
+        if (
+            type(snapshot) is not EpochPreflightSnapshot
+            or not _uuid(provision_id)
+            or not _uuid(body_id)
+            or type(coordinator_generation) is not int
+            or not 0 <= coordinator_generation <= _I63_MAX
+            or not _uuid(route_id)
+            or not _uuid(server_connection_id)
+            or not _uuid(controller_connection_id)
+        ):
+            return False
+        return (
+            self._validated_preflight_job(
+                snapshot,
+                provision_id=provision_id,
+                body_id=body_id,
+                coordinator_generation=coordinator_generation,
+                route_id=route_id,
+                server_connection_id=server_connection_id,
+                controller_connection_id=controller_connection_id,
+            )
+            is not None
+        )
 
     async def wait(self, handle: EpochJobHandle) -> None:
         self._owner()
@@ -445,7 +488,13 @@ class MinecraftEpochStoreWorker:
     def _execute(self, store: EpochStore, command: _Command) -> _Completion:
         try:
             if command.kind == "PREFLIGHT":
-                return _Completion(command.identity, command.kind, store.read_candidate())
+                candidate = store.read_candidate()
+                if (
+                    candidate.provision_id != command.request.provision_id
+                    or candidate.body_id != command.request.body_id
+                ):
+                    return _Completion(command.identity, command.kind, failed=True)
+                return _Completion(command.identity, command.kind, candidate)
             request = command.request
             candidate = command.candidate
             committed = store.commit_ready(
@@ -559,6 +608,46 @@ class MinecraftEpochStoreWorker:
         job = self._jobs.get(handle._identity)
         if job is None:
             raise EpochWorkerError("epoch job is not current")
+        return job
+
+    def _validated_preflight_job(
+        self,
+        snapshot: EpochPreflightSnapshot,
+        *,
+        provision_id: str,
+        body_id: str,
+        coordinator_generation: int,
+        route_id: str,
+        server_connection_id: str,
+        controller_connection_id: str,
+    ) -> _OwnerJob | None:
+        if self._state is not EpochWorkerState.AVAILABLE or type(snapshot) is not EpochPreflightSnapshot:
+            return None
+        job = next(
+            (
+                candidate
+                for candidate in self._jobs.values()
+                if candidate.kind == "PREFLIGHT" and candidate.result is snapshot
+            ),
+            None,
+        )
+        if (
+            job is None
+            or job.phase != "DELIVERED"
+            or job.failed
+            or snapshot._job_identity is not job.identity
+            or snapshot._store_identity is not self._store_identity
+            or snapshot.provision_id != provision_id
+            or snapshot.body_id != body_id
+            or snapshot.coordinator_generation != coordinator_generation
+            or snapshot.route_id != route_id
+            or snapshot.server_connection_id != server_connection_id
+            or snapshot.controller_connection_id != controller_connection_id
+        ):
+            return None
+        with self._claim_lock:
+            if job.identity in self._obsolete:
+                return None
         return job
 
     def _bind_owner(self) -> None:

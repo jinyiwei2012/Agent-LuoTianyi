@@ -68,6 +68,8 @@ class _LockOnlyVerifiedPlatform:
 
 def _preflight():
     return EpochPreflightRequest(
+        provision_id=PROVISION,
+        body_id=BODY,
         coordinator_generation=1,
         route_id=ROUTE,
         server_connection_id=SERVER,
