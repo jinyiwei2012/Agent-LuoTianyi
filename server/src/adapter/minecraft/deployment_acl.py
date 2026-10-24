@@ -9,6 +9,7 @@ from __future__ import annotations
 import ctypes
 import os
 import struct
+import threading
 from ctypes import wintypes
 from dataclasses import dataclass
 
@@ -99,7 +100,84 @@ def assess_descriptor(
     return DeploymentAclAssessment(True, "deployment handle owner and protected DACL match policy")
 
 
-def inspect_handle_security_descriptor(handle: int, *, _api=None) -> HandleSecurityDescriptor:
+@dataclass(frozen=True, slots=True)
+class DescriptorAllocationEvidence:
+    state: str
+    retained: bool
+    reason: str
+
+
+class DescriptorAllocationReceipt:
+    """Single-use LocalFree owner. UNKNOWN must be retained; never exposes a native pointer."""
+
+    def __init__(self):
+        self.__state = "FRESH"
+        self.__descriptor = ctypes.c_void_p()
+        self.__owner = ctypes.c_void_p()
+        self.__dacl = ctypes.c_void_p()
+        self.__api = None
+        self.__reason = "NONE"
+        self.__lock = threading.RLock()
+
+    def snapshot(self):
+        with self.__lock:
+            return DescriptorAllocationEvidence(self.__state, bool(self.__descriptor.value), self.__reason)
+
+    def _query(self, handle, api):
+        with self.__lock:
+            if self.__state != "FRESH":
+                raise DeploymentAclError("descriptor allocation is single use")
+            self.__state = "QUERYING"
+            self.__api = api
+        try:
+            status = api.get_security_info_owned(handle, self.__owner, self.__dacl, self.__descriptor)
+        except BaseException:
+            with self.__lock:
+                self.__state = "UNKNOWN" if self.__state != "QUERYING" or self.__descriptor.value else "RELEASED"
+                self.__reason = "OPAQUE_QUERY_UNKNOWN" if self.__descriptor.value else "QUERY_FAILED"
+            raise
+        with self.__lock:
+            if self.__state != "QUERYING" or status or not self.__descriptor.value:
+                self.__state = "UNKNOWN" if self.__state != "QUERYING" or self.__descriptor.value else "RELEASED"
+                self.__reason = "OPAQUE_QUERY_UNKNOWN" if self.__descriptor.value else "QUERY_FAILED"
+                raise DeploymentAclError(
+                    "descriptor query cleanup outcome is unknown"
+                    if self.__descriptor.value
+                    else "descriptor query failed"
+                )
+            self.__state = "OWNED"
+            return self.__descriptor.value, self.__owner.value, self.__dacl.value
+
+    def close(self):
+        with self.__lock:
+            if self.__state == "RELEASED":
+                return
+            if self.__state != "OWNED":
+                self.__state = "UNKNOWN"
+                self.__reason = "OPAQUE_OR_REENTRANT_CLEANUP"
+                raise DeploymentAclError("descriptor cleanup outcome is unknown")
+            self.__state = "FREE_IN_PROGRESS"
+            pointer, api = self.__descriptor.value, self.__api
+        try:
+            api.local_free(pointer)
+        except BaseException:
+            with self.__lock:
+                self.__state = "UNKNOWN"
+                self.__reason = "LOCAL_FREE_UNKNOWN"
+            raise
+        with self.__lock:
+            if self.__state != "FREE_IN_PROGRESS":
+                self.__state = "UNKNOWN"
+                raise DeploymentAclError("descriptor cleanup outcome is unknown")
+            self.__descriptor.value = None
+            self.__owner.value = self.__dacl.value = None
+            self.__api = None
+            self.__state = "RELEASED"
+
+
+def inspect_handle_security_descriptor(
+    handle: int, *, allocation: DescriptorAllocationReceipt | None = None, _api=None
+) -> HandleSecurityDescriptor:
     """Inspect a caller-owned file handle; this function never closes the handle."""
     if os.name != "nt" and _api is None:
         raise DeploymentAclError("Windows deployment ACL inspection is unavailable")
@@ -108,31 +186,51 @@ def inspect_handle_security_descriptor(handle: int, *, _api=None) -> HandleSecur
     primary: BaseException | None = None
     result = None
     try:
-        descriptor, owner, dacl = api.get_security_info(handle)
-        if not descriptor or not owner:
-            raise DeploymentAclError("deployment owner or descriptor is absent")
-        present, actual_dacl = api.get_dacl(descriptor)
-        if not present or not actual_dacl or actual_dacl != dacl:
-            raise DeploymentAclError("deployment DACL is absent or null")
-        control = api.get_control(descriptor)
-        owner_sid = api.sid_bytes(owner)
-        aces = api.aces(actual_dacl)
-        result = HandleSecurityDescriptor(owner_sid, bool(control & _SE_DACL_PROTECTED), aces)
+        if allocation is None:
+            descriptor, owner, dacl = api.get_security_info(handle)
+        else:
+            if type(allocation) is not DescriptorAllocationReceipt:
+                raise DeploymentAclError("invalid descriptor allocation receipt")
+            descriptor, owner, dacl = allocation._query(handle, api)
+        result = _parse_descriptor(api, descriptor, owner, dacl)
     except BaseException as error:
         primary = error
     cleanup_unknown = False
     if descriptor:
         try:
-            api.local_free(descriptor)
+            if allocation is None:
+                api.local_free(descriptor)
+            else:
+                allocation.close()
         except BaseException as error:
             cleanup_unknown = True
-            primary = _remember(primary, error)
-    if cleanup_unknown:
+            if allocation is not None:
+                if primary is None or isinstance(primary, Exception) and not isinstance(error, Exception):
+                    primary = error
+            else:
+                primary = _remember(primary, error)
+    _inspection_failure(allocation, primary, cleanup_unknown)
+    assert result is not None
+    return result
+
+
+def _parse_descriptor(api, descriptor, owner, dacl):
+    if not descriptor or not owner:
+        raise DeploymentAclError("deployment owner or descriptor is absent")
+    present, actual_dacl = api.get_dacl(descriptor)
+    if not present or not actual_dacl or actual_dacl != dacl:
+        raise DeploymentAclError("deployment DACL is absent or null")
+    control = api.get_control(descriptor)
+    return HandleSecurityDescriptor(api.sid_bytes(owner), bool(control & _SE_DACL_PROTECTED), api.aces(actual_dacl))
+
+
+def _inspection_failure(allocation, primary, cleanup_unknown):
+    if allocation is not None and primary is not None and not isinstance(primary, Exception):
+        raise primary
+    if cleanup_unknown or allocation is not None and allocation.snapshot().state == "UNKNOWN":
         _raise(primary, "deployment descriptor cleanup outcome is unknown")
     if primary is not None:
         _raise(primary, "deployment ACL inspection failed")
-    assert result is not None
-    return result
 
 
 def inspect_and_assess_handle(
@@ -152,6 +250,18 @@ def _canonical_sid(value: object) -> bytes:
 
 
 class _WindowsSecurityApi:
+    def get_security_info_owned(self, handle, owner, dacl, descriptor):
+        return _advapi32().GetSecurityInfo(
+            handle,
+            _SE_FILE_OBJECT,
+            _OWNER_SECURITY_INFORMATION | _DACL_SECURITY_INFORMATION,
+            ctypes.byref(owner),
+            None,
+            ctypes.byref(dacl),
+            None,
+            ctypes.byref(descriptor),
+        )
+
     def get_security_info(self, handle: int):
         owner = ctypes.c_void_p()
         dacl = ctypes.c_void_p()

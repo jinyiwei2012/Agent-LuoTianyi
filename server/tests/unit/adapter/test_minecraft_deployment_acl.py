@@ -24,6 +24,123 @@ OWNER = sid(100)
 OTHER = sid(200)
 
 
+@pytest.mark.parametrize(
+    "status,pointer,throws", [(0, None, False), (5, None, False), (5, None, True), (0, 7, False), (5, 7, True)]
+)
+def test_owned_query_reentrant_close_is_sticky_unknown(status, pointer, throws):
+    from src.adapter.minecraft.deployment_acl import DescriptorAllocationReceipt
+
+    receipt = DescriptorAllocationReceipt()
+
+    class ReentrantApi(Api):
+        def get_security_info_owned(self, handle, owner, dacl, allocation):
+            with pytest.raises(DeploymentAclError):
+                receipt.close()
+            allocation.value = pointer
+            if throws:
+                raise RuntimeError("query")
+            return status
+
+    api = ReentrantApi()
+    with pytest.raises(DeploymentAclError, match="cleanup outcome is unknown"):
+        inspect_handle_security_descriptor(1, allocation=receipt, _api=api)
+    assert receipt.snapshot().state == "UNKNOWN"
+    assert api.frees == 0
+
+
+@pytest.mark.parametrize("failure,pointer", [(False, True), (True, False), (True, True)])
+def test_owned_descriptor_query_and_opaque_failure_never_free_invalid_pointer(failure, pointer):
+    from src.adapter.minecraft.deployment_acl import DescriptorAllocationReceipt
+
+    receipt = DescriptorAllocationReceipt()
+
+    class OwnedApi(Api):
+        def get_security_info_owned(self, handle, owner, dacl, allocation):
+            assert receipt.snapshot().state == "QUERYING"
+            allocation.value = 1 if pointer else None
+            owner.value = 1
+            dacl.value = 2
+            return 5 if failure else 0
+
+    api = OwnedApi()
+    if failure:
+        with pytest.raises(DeploymentAclError):
+            inspect_handle_security_descriptor(7, allocation=receipt, _api=api)
+        assert receipt.snapshot().state == ("UNKNOWN" if pointer else "RELEASED")
+        assert api.frees == 0
+    else:
+        inspect_handle_security_descriptor(7, allocation=receipt, _api=api)
+        assert receipt.snapshot().state == "RELEASED"
+        receipt.close()
+        assert api.frees == 1
+
+
+def test_owned_descriptor_free_unknown_and_first_fatal_identity():
+    from src.adapter.minecraft.deployment_acl import DescriptorAllocationReceipt
+
+    receipt = DescriptorAllocationReceipt()
+    fatal = KeyboardInterrupt()
+
+    class OwnedApi(Api):
+        def get_security_info_owned(self, handle, owner, dacl, allocation):
+            allocation.value = 1
+            owner.value = 1
+            dacl.value = 2
+            return 0
+
+        def get_dacl(self, descriptor):
+            assert receipt.snapshot().state == "OWNED"
+            raise fatal
+
+    api = OwnedApi(free_error=SystemExit())
+    with pytest.raises(KeyboardInterrupt) as caught:
+        inspect_handle_security_descriptor(7, allocation=receipt, _api=api)
+    assert caught.value is fatal
+    assert receipt.snapshot().state == "UNKNOWN"
+    with pytest.raises(DeploymentAclError):
+        receipt.close()
+    assert api.frees == 1
+
+
+def test_owned_descriptor_throw_populated_is_opaque_and_reentry_free_once():
+    from src.adapter.minecraft.deployment_acl import DescriptorAllocationReceipt
+
+    receipt = DescriptorAllocationReceipt()
+    fatal = KeyboardInterrupt()
+
+    class ThrowApi(Api):
+        def get_security_info_owned(self, handle, owner, dacl, allocation):
+            allocation.value = 99
+            raise fatal
+
+    api = ThrowApi()
+    with pytest.raises(KeyboardInterrupt) as caught:
+        inspect_handle_security_descriptor(1, allocation=receipt, _api=api)
+    assert caught.value is fatal and receipt.snapshot().state == "UNKNOWN" and api.frees == 0
+    with pytest.raises(DeploymentAclError):
+        receipt.close()
+    assert api.frees == 0
+
+    receipt = DescriptorAllocationReceipt()
+
+    class ReenterApi(Api):
+        def get_security_info_owned(self, handle, owner, dacl, allocation):
+            allocation.value = 1
+            owner.value = 1
+            dacl.value = 2
+            return 0
+
+        def local_free(self, pointer):
+            self.frees += 1
+            with pytest.raises(DeploymentAclError):
+                receipt.close()
+
+    api = ReenterApi()
+    with pytest.raises(DeploymentAclError, match="cleanup outcome is unknown"):
+        inspect_handle_security_descriptor(1, allocation=receipt, _api=api)
+    assert api.frees == 1 and receipt.snapshot().state == "UNKNOWN"
+
+
 def policy(*writers):
     return TrustedDeploymentAclPolicy(
         expected_owner_sid=OWNER,
