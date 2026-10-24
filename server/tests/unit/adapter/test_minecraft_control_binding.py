@@ -1,4 +1,6 @@
 ﻿import asyncio
+import base64
+import json
 from dataclasses import replace
 from datetime import datetime, timezone
 
@@ -8,6 +10,7 @@ from src.adapter.minecraft.control_auth import ControlAuthContext, PendingHandsh
 from src.adapter.minecraft.control_binding import (
     AuthenticatedRoleConnection,
     BindingCommit,
+    BindingPhase,
     BindingPrepare,
     ControlBindingError,
     ControlBindingPolicy,
@@ -17,7 +20,10 @@ from src.adapter.minecraft.control_binding import (
     VerifiedBodyBound,
 )
 from src.adapter.minecraft.current_roles import AuthenticatedControlRoleOwner, RoleWithdrawal
-from src.adapter.minecraft.epoch_store import CommittedEpoch, EpochCandidate
+from src.adapter.minecraft.epoch_store import CommittedEpoch, EpochCandidate, PlatformCapability
+from src.adapter.minecraft.epoch_worker import EpochPreflightRequest, EpochWorkerConfig, MinecraftEpochStoreWorker
+from src.adapter.minecraft.v2_body_routes import V2BodyRouteOwner
+from tests.unit.adapter.test_minecraft_v2_body_routes import candidate, notice
 
 
 class Clock:
@@ -216,7 +222,7 @@ def body_bound(controller=CLIENT_CONNECTION):
     )
 
 
-def coordinator(*, role_owner, store=None, commands=None, stage=None, clock=None):
+def coordinator(*, role_owner, store=None, worker=None, commands=None, stage=None, clock=None):
     return MinecraftControlBindingCoordinator(
         policy=ControlBindingPolicy(
             actor_id="actor",
@@ -229,6 +235,7 @@ def coordinator(*, role_owner, store=None, commands=None, stage=None, clock=None
         ),
         role_owner=role_owner,
         epoch_store=store,
+        epoch_worker=worker,
         commands=commands or Commands(),
         stage=stage or Stage(),
         monotonic_now=clock or Clock(),
@@ -246,6 +253,204 @@ async def registered(*, store=None, commands=None, stage=None, clock=None):
         role_owner.promote(reservation, connection.handshake)
     binding = coordinator(role_owner=role_owner, store=store, commands=commands, stage=stage, clock=clock)
     return binding, server, client
+
+
+class WorkerPlatform:
+    def capability(self, directory):
+        return PlatformCapability(True, "test-only")
+
+    def acquire_lock(self, path):
+        return type("Lock", (), {"close": lambda self: None})()
+
+
+async def v2_fixture(tmp_path, commands=None):
+    server = auth("SERVER_AUTHORITY", "server-install", SERVER_CONNECTION)
+    client = auth("CLIENT_CONTROLLER", "client-install", CLIENT_CONNECTION)
+    roles = AuthenticatedControlRoleOwner((server.handshake.context, client.handshake.context), "hub")
+    leases = {}
+    for connection in (server, client):
+        reservation = roles.reserve(connection.handshake.context, connection.connection_id)
+        roles.bind_challenge(reservation, connection.handshake.challenge_id)
+        leases[connection.role] = roles.promote(reservation, connection.handshake)
+    worker = MinecraftEpochStoreWorker(
+        EpochWorkerConfig(
+            mode="PROVISION",
+            directory=(tmp_path / "epoch").resolve(),
+            platform=WorkerPlatform(),
+            provision_id=PROVISION,
+            body_id=BODY,
+        )
+    )
+    await worker.start()
+    binding = coordinator(role_owner=roles, worker=worker, commands=commands or Commands())
+    routes = V2BodyRouteOwner(
+        role_owner=roles,
+        monotonic_millis=lambda: 0,
+        utc_now=lambda: datetime(2026, 10, 24, tzinfo=timezone.utc),
+        route_id=lambda: "80000000-0000-4000-8000-000000000008",
+    )
+    notice_payload = json.dumps(
+        {
+            "security": "luosandbox.control-auth.v1",
+            "kind": "BODY_BIND_NOTICE",
+            "serverBootId": BOOT,
+            "gameConnectionId": GAME,
+            "bodyId": BODY,
+            "gameNonce": base64.urlsafe_b64encode(b"n" * 32).decode().rstrip("="),
+        },
+        separators=(",", ":"),
+    ).encode()
+    notice_frame = replace(notice(), connection_id=CLIENT_CONNECTION, payload=notice_payload)
+    routes.route_notice(leases["CLIENT_CONTROLLER"], notice_frame, lambda *args: None)
+    candidate_payload = json.dumps(
+        {
+            "security": "luosandbox.control-auth.v1",
+            "kind": "BODY_BOUND",
+            "serverBootId": BOOT,
+            "gameConnectionId": GAME,
+            "bodyId": BODY,
+        },
+        separators=(",", ":"),
+    ).encode()
+    accepted = routes.accept_candidate(
+        leases["SERVER_AUTHORITY"],
+        replace(
+            candidate("80000000-0000-4000-8000-000000000008", body=BODY),
+            connection_id=SERVER_CONNECTION,
+            recipient_connection_id=SERVER_CONNECTION,
+            payload=candidate_payload,
+        ),
+    )
+    return binding, routes, accepted, server, client, worker
+
+
+@pytest.mark.asyncio
+async def test_v2_headless_admission_dispatch_and_early_ready_never_commit(tmp_path):
+    commands = BlockingCommands()
+    binding, routes, accepted, server, _, worker = await v2_fixture(tmp_path, commands)
+    dispatch = await binding.prepare_v2(routes, accepted.receipt)
+    prepare = dispatch.command
+    assert binding.pending_count == 1 and worker.outstanding_count == 1
+    with pytest.raises(ControlBindingError, match="headless"):
+        await binding.ready(server, VerifiedBindingReady(binding=prepare.binding, evidence_id="legacy"))
+    task = asyncio.create_task(binding.dispatch_v2_prepare(dispatch))
+    await commands.send_entered.wait()
+    binding.receive_v2_ready(server, VerifiedBindingReady(binding=prepare.binding, evidence_id="early"))
+    ticket = binding._v2_tickets[prepare.binding.session_id]
+    assert ticket.ready is not None and ticket.state.value == "DISPATCHING"
+    assert binding._pending[prepare.binding.session_id].phase is BindingPhase.PREPARE
+    commands.send_release.set()
+    assert await task == prepare
+    with pytest.raises(ControlBindingError):
+        await binding.dispatch_v2_prepare(dispatch)
+    assert ticket.state.value == "DELIVERED_CURRENT"
+    assert binding.active is None and binding.ingress is None
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_v2_default_worker_unavailable_and_duplicate_ready_fence(tmp_path):
+    owner, _, _ = await registered()
+    assert not owner.v2_admission_available()
+    commands = BlockingCommands()
+    binding, routes, accepted, server, _, worker = await v2_fixture(tmp_path, commands)
+    dispatch = await binding.prepare_v2(routes, accepted.receipt)
+    prepare = dispatch.command
+    task = asyncio.create_task(binding.dispatch_v2_prepare(dispatch))
+    await commands.send_entered.wait()
+    ready = VerifiedBindingReady(binding=prepare.binding, evidence_id="one")
+    binding.receive_v2_ready(server, ready)
+    with pytest.raises(ControlBindingError, match="duplicate"):
+        binding.receive_v2_ready(server, ready)
+    assert binding.pending_count == 0 and binding.quarantined
+    commands.send_release.set()
+    await asyncio.gather(task, return_exceptions=True)
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_v2_dispatch_capability_copy_and_equal_binding_are_not_authority(tmp_path):
+    import copy
+
+    binding, routes, accepted, _, _, worker = await v2_fixture(tmp_path)
+    dispatch = await binding.prepare_v2(routes, accepted.receipt)
+    with pytest.raises(ControlBindingError):
+        await binding.dispatch_v2_prepare(copy.copy(dispatch))
+    with pytest.raises(AttributeError):
+        dispatch.command = BindingPrepare(binding=replace(dispatch.command.binding))
+    equal_binding = replace(dispatch.command.binding)
+    with pytest.raises(ControlBindingError):
+        await binding.dispatch_v2_prepare(equal_binding)
+    assert binding.pending_count == 1 and worker.outstanding_count == 1
+    binding._fence_local("QUARANTINE")
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_conflicting_ready_fences_current_ticket(tmp_path):
+    commands = BlockingCommands()
+    binding, routes, accepted, server, _, worker = await v2_fixture(tmp_path, commands)
+    dispatch = await binding.prepare_v2(routes, accepted.receipt)
+    task = asyncio.create_task(binding.dispatch_v2_prepare(dispatch))
+    await commands.send_entered.wait()
+    wrong = replace(dispatch.command.binding, body_id="f0000000-0000-4000-8000-00000000000f")
+    with pytest.raises(ControlBindingError, match="conflicting"):
+        binding.receive_v2_ready(server, VerifiedBindingReady(binding=wrong, evidence_id="wrong"))
+    assert binding.pending_count == 0 and binding.quarantined
+    commands.send_release.set()
+    await asyncio.gather(task, return_exceptions=True)
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_v2_send_return_after_role_loss_is_never_success(tmp_path):
+    commands = BlockingCommands()
+    binding, routes, accepted, _, _, worker = await v2_fixture(tmp_path, commands)
+    dispatch = await binding.prepare_v2(routes, accepted.receipt)
+    task = asyncio.create_task(binding.dispatch_v2_prepare(dispatch))
+    await commands.send_entered.wait()
+    lease = binding.role_owner.current("CLIENT_CONTROLLER")
+    withdrawal = binding.role_owner.withdraw(lease)
+    command = binding.fence_role_withdrawal(withdrawal)
+    commands.send_release.set()
+    with pytest.raises(ControlBindingError):
+        await task
+    await binding.notify_revoke(command)
+    assert binding.pending_count == 0 and binding.quarantined
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_prepare_v2_submission_failure_invalidates_claimed_receipt(tmp_path):
+    binding, routes, accepted, _, _, worker = await v2_fixture(tmp_path)
+    first = worker.submit_preflight(
+        EpochPreflightRequest(
+            provision_id=PROVISION,
+            body_id=BODY,
+            coordinator_generation=99,
+            route_id="90000000-0000-4000-8000-000000000009",
+            server_connection_id=SERVER_CONNECTION,
+            controller_connection_id=CLIENT_CONNECTION,
+        )
+    )
+    second = worker.submit_preflight(
+        EpochPreflightRequest(
+            provision_id=PROVISION,
+            body_id=BODY,
+            coordinator_generation=100,
+            route_id="a0000000-0000-4000-8000-00000000000a",
+            server_connection_id=SERVER_CONNECTION,
+            controller_connection_id=CLIENT_CONNECTION,
+        )
+    )
+    with pytest.raises(ControlBindingError):
+        await binding.prepare_v2(routes, accepted.receipt)
+    record = routes._routes[accepted.candidate.route_id]
+    assert not record.preflight_claimed and record.receipt is None
+    assert record.deadline == 5000 and binding.pending_count == 0
+    worker.mark_obsolete(first)
+    worker.mark_obsolete(second)
+    await worker.close()
 
 
 @pytest.mark.asyncio

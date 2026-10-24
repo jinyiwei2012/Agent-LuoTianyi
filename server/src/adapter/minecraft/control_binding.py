@@ -25,9 +25,22 @@ from src.adapter.minecraft.epoch_store import (
     EpochCandidate,
     VerifiedReadyContext,
 )
+from src.adapter.minecraft.epoch_worker import (
+    EpochJobHandle,
+    EpochPreflightRequest,
+    EpochPreflightSnapshot,
+    EpochWorkerError,
+    EpochWorkerState,
+    MinecraftEpochStoreWorker,
+)
 from src.adapter.minecraft.typed_ingress import (
     MinecraftObservationBinding,
     TypedMinecraftObservationIngress,
+)
+from src.adapter.minecraft.v2_body_routes import (
+    BodyRouteAdmissionReceipt,
+    BodyRoutePreflightContext,
+    V2BodyRouteOwner,
 )
 
 _SERVER = "SERVER_AUTHORITY"
@@ -46,6 +59,40 @@ class BindingPhase(str, Enum):
     COMMIT = "COMMIT"
     ACTIVE = "ACTIVE"
     QUARANTINED = "QUARANTINED"
+
+
+class V2DispatchState(str, Enum):
+    UNDISPATCHED = "UNDISPATCHED"
+    DISPATCHING = "DISPATCHING"
+    DELIVERED_CURRENT = "DELIVERED_CURRENT"
+    STALE_OR_UNKNOWN = "STALE_OR_UNKNOWN"
+
+
+class V2PrepareDispatch:
+    __slots__ = ("_identity", "_command", "_frozen")
+
+    def __init__(self, identity: object | None = None, command: BindingPrepare | None = None) -> None:
+        object.__setattr__(self, "_identity", identity)
+        object.__setattr__(self, "_command", command)
+        object.__setattr__(self, "_frozen", True)
+
+    @property
+    def command(self) -> BindingPrepare | None:
+        return self._command
+
+    def __setattr__(self, name, value):
+        if getattr(self, "_frozen", False):
+            raise AttributeError("V2PrepareDispatch is immutable")
+        object.__setattr__(self, name, value)
+
+    def __repr__(self) -> str:
+        return "V2PrepareDispatch(<opaque>)"
+
+    def __copy__(self):
+        return V2PrepareDispatch()
+
+    def __deepcopy__(self, memo):
+        return V2PrepareDispatch()
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -217,6 +264,25 @@ class _PendingBinding:
     deadline: float
     phase: BindingPhase = BindingPhase.PREPARE
     committed: CommittedEpoch | None = None
+    v2: bool = False
+    preflight: EpochPreflightSnapshot | None = None
+    preflight_handle: EpochJobHandle | None = None
+    route_receipt: BodyRouteAdmissionReceipt | None = None
+    route_context: BodyRoutePreflightContext | None = None
+
+
+@dataclass(slots=True)
+class _V2Ticket:
+    pending: _PendingBinding
+    generation: int
+    server_lease: AuthenticatedRoleLease
+    controller_lease: AuthenticatedRoleLease
+    session_id: str
+    route_id: str
+    state: V2DispatchState = V2DispatchState.UNDISPATCHED
+    ready: VerifiedBindingReady | None = None
+    dispatch: V2PrepareDispatch | None = None
+    command: BindingPrepare | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,6 +318,7 @@ class MinecraftControlBindingCoordinator:
         policy: ControlBindingPolicy,
         role_owner: AuthenticatedControlRoleOwner,
         epoch_store: EpochStorePort | None,
+        epoch_worker: MinecraftEpochStoreWorker | None = None,
         commands: ControlCommandPort,
         stage: ObservationStagePort,
         monotonic_now: Callable[[], float],
@@ -268,6 +335,7 @@ class MinecraftControlBindingCoordinator:
         self._policy = policy
         self._role_owner = role_owner
         self._store = epoch_store
+        self._epoch_worker = epoch_worker
         self._commands = commands
         self._stage = stage
         self._monotonic_now = monotonic_now
@@ -278,6 +346,7 @@ class MinecraftControlBindingCoordinator:
         self._last_monotonic: float | None = None
         self._quarantined = False
         self._generation = 0
+        self._v2_tickets: dict[str, _V2Ticket] = {}
 
     @property
     def active(self) -> ActiveBinding | None:
@@ -299,6 +368,10 @@ class MinecraftControlBindingCoordinator:
     def role_owner(self) -> AuthenticatedControlRoleOwner:
         return self._role_owner
 
+    @property
+    def epoch_worker(self) -> MinecraftEpochStoreWorker | None:
+        return self._epoch_worker
+
     def active_snapshot(self) -> ActiveBindingSnapshot | None:
         """Return one coherent current ACTIVE/server-origin snapshot."""
         active = self._active
@@ -317,6 +390,224 @@ class MinecraftControlBindingCoordinator:
                 handshake=active.server_lease.handshake,
             ),
         )
+
+    def v2_admission_available(self) -> bool:
+        self._role_owner.assert_owner()
+        return (
+            self._epoch_worker is not None
+            and self._epoch_worker.state is EpochWorkerState.AVAILABLE
+            and not self._quarantined
+        )
+
+    async def prepare_v2(
+        self,
+        routes: V2BodyRouteOwner,
+        receipt: BodyRouteAdmissionReceipt,
+    ) -> V2PrepareDispatch:
+        self._role_owner.assert_owner()
+        handle = snapshot = context = None
+        snapshot = None
+        try:
+            await self._begin_operation()
+            if self._epoch_worker is None or self._epoch_worker.state is not EpochWorkerState.AVAILABLE:
+                raise ControlBindingError("v2 control activation is disabled")
+            context = routes.inspect_for_preflight(receipt)
+            if (
+                context.candidate.body_id != self._policy.body_id
+                or context.server_lease.handshake.context.peer_install_id != self._policy.server_install_id
+                or context.controller_lease.handshake.context.peer_install_id != self._policy.client_install_id
+            ):
+                raise ControlBindingError("v2 route does not match policy")
+            generation = self._generation
+            active = self._active
+            pending_before = tuple(self._pending.values())
+            handle = self._epoch_worker.submit_preflight(
+                EpochPreflightRequest(
+                    provision_id=self._policy.provision_id,
+                    body_id=self._policy.body_id,
+                    coordinator_generation=generation,
+                    route_id=context.route_id,
+                    server_connection_id=context.server_lease.connection_id,
+                    controller_connection_id=context.controller_lease.connection_id,
+                )
+            )
+            await self._epoch_worker.wait(handle)
+            snapshot = self._epoch_worker.take_preflight(handle)
+            session_id = str(uuid4())
+            return self._admit_v2_prepare(
+                routes, receipt, context, handle, snapshot, generation, active, pending_before, session_id
+            )
+        except asyncio.CancelledError:
+            self._obsolete_preflight(handle, snapshot)
+            routes.invalidate_admission(receipt)
+            raise
+        except Exception:
+            self._obsolete_preflight(handle, snapshot)
+            routes.invalidate_admission(receipt)
+            raise ControlBindingError("v2 preflight admission failed") from None
+
+    def _admit_v2_prepare(
+        self,
+        routes,
+        receipt,
+        context,
+        handle,
+        snapshot,
+        generation,
+        active,
+        pending_before,
+        session_id,
+    ) -> V2PrepareDispatch:
+        redemption = routes._prevalidate_redemption(receipt, context)
+        actual_pending = tuple(self._pending.values())
+        valid = (
+            self._generation == generation
+            and self._active is active
+            and len(actual_pending) == len(pending_before)
+            and all(a is b for a, b in zip(actual_pending, pending_before))
+            and not self._quarantined
+            and len(self._pending) < _MAX_PENDING
+            and self._leases_current(context.server_lease, context.controller_lease)
+            and self._epoch_worker.validates_preflight(
+                snapshot,
+                provision_id=self._policy.provision_id,
+                body_id=self._policy.body_id,
+                coordinator_generation=generation,
+                route_id=context.route_id,
+                server_connection_id=context.server_lease.connection_id,
+                controller_connection_id=context.controller_lease.connection_id,
+            )
+        )
+        if not valid:
+            raise ControlBindingError("v2 preflight is stale")
+        candidate = routes._redeem_prevalidated(receipt, redemption)
+        binding = BindingTuple(
+            actor_id=self._policy.actor_id,
+            world_id=self._policy.world_id,
+            body_id=self._policy.body_id,
+            session_id=session_id,
+            session_epoch=snapshot.next_epoch,
+            server_boot_id=candidate.server_boot_id,
+            game_connection_id=candidate.game_connection_id,
+        )
+        pending = _PendingBinding(
+            binding=binding,
+            candidate=EpochCandidate(
+                snapshot.provision_id,
+                snapshot.body_id,
+                snapshot.expected_last_epoch,
+                snapshot.expected_generation,
+                snapshot.next_epoch,
+            ),
+            body_bound=VerifiedBodyBound(
+                server_boot_id=candidate.server_boot_id,
+                game_connection_id=candidate.game_connection_id,
+                body_id=candidate.body_id,
+                client_install_id=context.controller_lease.handshake.context.peer_install_id,
+                controller_connection_id=context.controller_lease.connection_id,
+                evidence_id=context.route_id,
+            ),
+            server_lease=context.server_lease,
+            controller_lease=context.controller_lease,
+            deadline=self._last_monotonic + _LIFETIME_SECONDS,
+            v2=True,
+            preflight=snapshot,
+            preflight_handle=handle,
+            route_receipt=receipt,
+            route_context=context,
+        )
+        ticket = _V2Ticket(
+            pending,
+            generation,
+            context.server_lease,
+            context.controller_lease,
+            session_id,
+            context.route_id,
+        )
+        command = BindingPrepare(binding=binding)
+        dispatch = V2PrepareDispatch(object(), command)
+        ticket.dispatch = dispatch
+        ticket.command = command
+        self._pending[session_id] = pending
+        self._v2_tickets[session_id] = ticket
+        return dispatch
+
+    async def dispatch_v2_prepare(self, dispatch: V2PrepareDispatch) -> BindingPrepare:
+        self._role_owner.assert_owner()
+        if type(dispatch) is not V2PrepareDispatch:
+            raise ControlBindingError("v2 dispatch ticket is not current")
+        ticket = next((value for value in self._v2_tickets.values() if value.dispatch is dispatch), None)
+        if ticket is None or ticket.state is not V2DispatchState.UNDISPATCHED or not self._v2_ticket_current(ticket):
+            raise ControlBindingError("v2 dispatch ticket is not current")
+        ticket.state = V2DispatchState.DISPATCHING
+        command = ticket.command
+        if command is None or command.binding is not ticket.pending.binding:
+            raise ControlBindingError("v2 dispatch ticket is not current")
+        try:
+            await self._commands.send(command)
+        except asyncio.CancelledError as error:
+            await self._fail_v2_ticket(ticket, error)
+        except Exception as error:
+            await self._fail_v2_ticket(ticket, ControlBindingError("v2 prepare delivery is uncertain"))
+            raise ControlBindingError("v2 prepare delivery is uncertain") from error
+        if not self._v2_ticket_current(ticket):
+            await self._fail_v2_ticket(ticket, ControlBindingError("v2 prepare delivery is stale"))
+        ticket.state = V2DispatchState.DELIVERED_CURRENT
+        return command
+
+    def receive_v2_ready(self, server: AuthenticatedRoleConnection, ready: VerifiedBindingReady) -> None:
+        self._require_current(server, _SERVER)
+        ticket = self._v2_tickets.get(ready.binding.session_id)
+        if ticket is None or not self._v2_ticket_current(ticket):
+            raise ControlBindingError("v2 READY does not match current ticket")
+        if ticket.pending.binding != ready.binding:
+            ticket.state = V2DispatchState.STALE_OR_UNKNOWN
+            ticket.ready = None
+            self._fence_local("QUARANTINE")
+            raise ControlBindingError("conflicting v2 READY")
+        if ticket.state is V2DispatchState.UNDISPATCHED:
+            self._fence_local("QUARANTINE")
+            raise ControlBindingError("v2 READY arrived before dispatch")
+        if ticket.state not in {V2DispatchState.DISPATCHING, V2DispatchState.DELIVERED_CURRENT}:
+            raise ControlBindingError("v2 READY ticket is stale")
+        if ticket.ready is not None:
+            self._fence_local("QUARANTINE")
+            raise ControlBindingError("duplicate v2 READY")
+        ticket.ready = ready
+
+    def _v2_ticket_current(self, ticket: _V2Ticket) -> bool:
+        return (
+            self._v2_tickets.get(ticket.session_id) is ticket
+            and self._pending.get(ticket.session_id) is ticket.pending
+            and self._generation == ticket.generation
+            and self._leases_current(ticket.server_lease, ticket.controller_lease)
+            and ticket.state is not V2DispatchState.STALE_OR_UNKNOWN
+        )
+
+    async def _fail_v2_ticket(self, ticket: _V2Ticket, error: BaseException) -> None:
+        ticket.state = V2DispatchState.STALE_OR_UNKNOWN
+        ticket.ready = None
+        if self._v2_ticket_current_owned(ticket):
+            command = self._fence_local("QUARANTINE")
+            await self._best_effort_revoke(command)
+        if isinstance(error, asyncio.CancelledError):
+            raise error
+        raise ControlBindingError("v2 prepare delivery is stale") from None
+
+    def _v2_ticket_current_owned(self, ticket: _V2Ticket) -> bool:
+        return (
+            self._v2_tickets.get(ticket.session_id) is ticket
+            and self._pending.get(ticket.session_id) is ticket.pending
+            and self._generation == ticket.generation
+        )
+
+    def _obsolete_preflight(self, handle, snapshot) -> None:
+        if self._epoch_worker is None or (handle is None and snapshot is None):
+            return
+        try:
+            self._epoch_worker.mark_obsolete(snapshot if snapshot is not None else handle)
+        except EpochWorkerError:
+            pass
 
     def fence_role_withdrawal(self, withdrawal: RoleWithdrawal, reason: str = "CONTROL_LOST") -> BindingRevoke | None:
         self._role_owner.assert_owner()
@@ -421,6 +712,8 @@ class MinecraftControlBindingCoordinator:
     ) -> BindingCommit:
         await self._begin_operation()
         pending = self._pending.get(ready.binding.session_id)
+        if pending is not None and pending.v2:
+            raise ControlBindingError("v2 READY requires headless ticket handling")
         if pending is not None and pending.binding == ready.binding and pending.phase is BindingPhase.COMMIT:
             self._require_current(server, _SERVER)
             if not self._guard_current(pending, BindingPhase.COMMIT):
@@ -464,6 +757,9 @@ class MinecraftControlBindingCoordinator:
         active: VerifiedBindingActive,
     ) -> TypedMinecraftObservationIngress:
         await self._begin_operation()
+        pending_value = self._pending.get(active.binding.session_id)
+        if pending_value is not None and pending_value.v2:
+            raise ControlBindingError("v2 ACTIVE is disabled")
         if self._active is not None and self._active.binding == active.binding:
             self._require_current(server, _SERVER)
             if self._ingress is None or self.active_snapshot() is None:
@@ -648,6 +944,10 @@ class MinecraftControlBindingCoordinator:
         binding = self._active.binding if self._active is not None else None
         if binding is None and self._pending:
             binding = next(iter(self._pending.values())).binding
+        handoffs = [(pending.preflight_handle, pending.preflight) for pending in self._pending.values() if pending.v2]
+        for ticket in self._v2_tickets.values():
+            ticket.state = V2DispatchState.STALE_OR_UNKNOWN
+            ticket.ready = None
         observation = None
         if self._active is not None:
             observation = MinecraftObservationBinding(
@@ -662,10 +962,22 @@ class MinecraftControlBindingCoordinator:
         self._active = None
         self._ingress = None
         self._pending.clear()
+        self._v2_tickets.clear()
         self._quarantined = True
         self._generation += 1
+        cleanup_error = None
+        for handle, snapshot in handoffs:
+            try:
+                self._obsolete_preflight(handle, snapshot)
+            except BaseException as error:
+                cleanup_error = cleanup_error or error
         if observation is not None:
-            self._stage.unbind_minecraft_observations(observation.observation_scope)
+            try:
+                self._stage.unbind_minecraft_observations(observation.observation_scope)
+            except BaseException as error:
+                cleanup_error = cleanup_error or error
+        if cleanup_error is not None:
+            raise cleanup_error
         return None if binding is None else BindingRevoke(binding=binding, reason=reason)
 
     async def _best_effort_revoke(self, command: BindingRevoke | None) -> None:

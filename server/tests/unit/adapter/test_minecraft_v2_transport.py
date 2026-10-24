@@ -4,15 +4,20 @@ import ctypes
 import json
 import os
 import struct
+import threading
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from src.adapter.minecraft.control_auth import ControlAuthError, PendingHandshakes, b32_encode, compute_proof
 from src.adapter.minecraft.control_binding import (
     AuthenticatedRoleConnection,
+    BindingCommit,
+    BindingPhase,
+    BindingPrepare,
     ControlBindingPolicy,
     MinecraftControlBindingCoordinator,
     VerifiedBodyBound,
@@ -26,7 +31,12 @@ from src.adapter.minecraft.deployment_files import (
     load_verified_deployment_filesystem,
 )
 from src.adapter.minecraft.deployment_manifest import DeploymentManifest, TrustedDeploymentIdentity
-from src.adapter.minecraft.epoch_store import EpochCandidate
+from src.adapter.minecraft.epoch_store import EpochCandidate, EpochStore, PlatformCapability
+from src.adapter.minecraft.epoch_worker import (
+    EpochPreflightRequest,
+    EpochWorkerConfig,
+    MinecraftEpochStoreWorker,
+)
 from src.adapter.minecraft.postauth_frame import PostAuthFrame, TrustedFrameContext, encode_frame
 from src.adapter.minecraft.postauth_keys import AuthenticatedTranscript, PostAuthSessionKeys
 from src.adapter.minecraft.postauth_session import PostAuthSessionState
@@ -74,17 +84,51 @@ class BindingStage:
 
 class BindingCommands:
     def __init__(self):
+        self.sent = []
         self.revoke_entered = asyncio.Event()
         self.revoke_release = asyncio.Event()
         self.block_revoke = False
 
     async def send(self, command):
+        self.sent.append(command)
         return None
 
     async def revoke(self, command):
         self.revoke_entered.set()
         if self.block_revoke:
             await self.revoke_release.wait()
+
+
+class BlockingPrepareCommands(BindingCommands):
+    def __init__(self, *, hold_cancel=False):
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = 0
+        self.hold_cancel = hold_cancel
+
+    async def send(self, command):
+        self.sent.append(command)
+        self.entered.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            if self.hold_cancel:
+                await self.release.wait()
+            raise
+
+
+class CapacityPrepareCommands(BindingCommands):
+    def __init__(self):
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def send(self, command):
+        self.sent.append(command)
+        self.entered.set()
+        await self.release.wait()
 
 
 class BindingStore:
@@ -97,7 +141,7 @@ class IntegratedStage(BindingStage):
         self.minecraft_observation_scope = None
 
 
-def _coordinator(owner, *, commands=None, stage=None, store=None):
+def _coordinator(owner, *, commands=None, stage=None, store=None, worker=None):
     return MinecraftControlBindingCoordinator(
         policy=ControlBindingPolicy(
             actor_id="actor",
@@ -110,11 +154,431 @@ def _coordinator(owner, *, commands=None, stage=None, store=None):
         ),
         role_owner=owner,
         epoch_store=store,
+        epoch_worker=worker,
         commands=commands or BindingCommands(),
         stage=stage or BindingStage(),
         monotonic_now=lambda: 10.0,
         utc_now=lambda: NOW,
     )
+
+
+class AdmissionPlatform:
+    def capability(self, directory):
+        return PlatformCapability(True, "test-only")
+
+    def acquire_lock(self, path):
+        return type("Lock", (), {"close": lambda self: None})()
+
+
+@pytest.mark.asyncio
+async def test_transport_candidate_stays_prepare_only_and_reopen_preserves_initial_epoch(peers, tmp_path):
+    clock = Clock()
+    route_body = "11111111-2222-4333-8444-555555555553"
+    epoch_directory = (tmp_path / "epoch").resolve()
+    roles = AuthenticatedControlRoleOwner(tuple(peer.context for peer in peers), "hub-test-1")
+    worker = MinecraftEpochStoreWorker(
+        EpochWorkerConfig(
+            mode="PROVISION",
+            directory=epoch_directory,
+            platform=AdmissionPlatform(),
+            provision_id=INTEGRATED_PROVISION,
+            body_id=route_body,
+        )
+    )
+    await worker.start()
+    commands = BindingCommands()
+    stage = IntegratedStage()
+    coordinator = MinecraftControlBindingCoordinator(
+        policy=ControlBindingPolicy(
+            actor_id="actor",
+            world_id="world",
+            body_id=route_body,
+            character_id="luotianyi",
+            provision_id=INTEGRATED_PROVISION,
+            server_install_id="server-test-1",
+            client_install_id="client-test-1",
+        ),
+        role_owner=roles,
+        epoch_store=None,
+        epoch_worker=worker,
+        commands=commands,
+        stage=stage,
+        monotonic_now=lambda: 10.0,
+        utc_now=lambda: NOW,
+    )
+    transport = MinecraftV2AuthenticatedTransport(
+        peers=peers,
+        hub_install_id="hub-test-1",
+        monotonic_millis=clock,
+        utc_now=lambda: NOW,
+        nonce=lambda: HUB_NONCE,
+        challenge_id=lambda: CHALLENGE_ID,
+        role_owner=roles,
+        binding_coordinator=coordinator,
+        epoch_worker=worker,
+    )
+    server, controller = Socket(peers[0], candidate=True), Socket(peers[1], business=True)
+    tasks = [asyncio.create_task(transport.handle(server)), asyncio.create_task(transport.handle(controller))]
+    try:
+        deadline = asyncio.get_running_loop().time() + 2
+        while not commands.sent and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0)
+        assert len(commands.sent) == 1 and type(commands.sent[0]) is BindingPrepare
+        assert coordinator.pending_count == 1
+        pending = next(iter(coordinator._pending.values()))
+        assert pending.phase is BindingPhase.PREPARE and pending.committed is None
+        assert coordinator.active is None and coordinator.ingress is None
+        assert stage.minecraft_observation_scope is None
+        assert len(transport._admissions) <= 1 and worker.outstanding_count == 1
+        assert not any(type(command) is BindingCommit for command in commands.sent)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await worker.close()
+
+    reopened = MinecraftEpochStoreWorker(
+        EpochWorkerConfig(mode="OPEN", directory=epoch_directory, platform=AdmissionPlatform())
+    )
+    await reopened.start()
+    try:
+        handle = reopened.submit_preflight(
+            EpochPreflightRequest(
+                provision_id=INTEGRATED_PROVISION,
+                body_id=route_body,
+                coordinator_generation=0,
+                route_id="30000000-0000-4000-8000-000000000003",
+                server_connection_id="40000000-0000-4000-8000-000000000004",
+                controller_connection_id="50000000-0000-4000-8000-000000000005",
+            )
+        )
+        await reopened.wait(handle)
+        snapshot = reopened.take_preflight(handle)
+        assert snapshot.expected_last_epoch == 0
+        assert snapshot.expected_generation == 0
+        assert snapshot.next_epoch == 1
+        reopened.mark_obsolete(snapshot)
+        assert reopened.outstanding_count == 0
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("withdraw_index", (0, 1))
+async def test_real_admission_blocked_preflight_is_cancelled_by_either_role_withdrawal(
+    peers, tmp_path, monkeypatch, withdraw_index
+):
+    clock = Clock()
+    route_body = "11111111-2222-4333-8444-555555555553"
+    roles = AuthenticatedControlRoleOwner(tuple(peer.context for peer in peers), "hub-test-1")
+    entered = threading.Event()
+    release = threading.Event()
+    original_read = EpochStore.read_candidate
+
+    def gated_read(store):
+        entered.set()
+        release.wait(timeout=5)
+        return original_read(store)
+
+    monkeypatch.setattr(EpochStore, "read_candidate", gated_read)
+    worker = MinecraftEpochStoreWorker(
+        EpochWorkerConfig(
+            mode="PROVISION",
+            directory=(tmp_path / "epoch").resolve(),
+            platform=AdmissionPlatform(),
+            provision_id=INTEGRATED_PROVISION,
+            body_id=route_body,
+        )
+    )
+    await worker.start()
+    commands = BindingCommands()
+    coordinator = MinecraftControlBindingCoordinator(
+        policy=ControlBindingPolicy(
+            actor_id="actor",
+            world_id="world",
+            body_id=route_body,
+            character_id="luotianyi",
+            provision_id=INTEGRATED_PROVISION,
+            server_install_id="server-test-1",
+            client_install_id="client-test-1",
+        ),
+        role_owner=roles,
+        epoch_store=None,
+        epoch_worker=worker,
+        commands=commands,
+        stage=IntegratedStage(),
+        monotonic_now=lambda: 10.0,
+        utc_now=lambda: NOW,
+    )
+    transport = MinecraftV2AuthenticatedTransport(
+        peers=peers,
+        hub_install_id="hub-test-1",
+        monotonic_millis=clock,
+        utc_now=lambda: NOW,
+        nonce=lambda: HUB_NONCE,
+        challenge_id=lambda: CHALLENGE_ID,
+        role_owner=roles,
+        binding_coordinator=coordinator,
+        epoch_worker=worker,
+    )
+    sockets = [Socket(peers[0], candidate=True), Socket(peers[1], business=True)]
+    handles = [asyncio.create_task(transport.handle(socket)) for socket in sockets]
+    try:
+        deadline = asyncio.get_running_loop().time() + 2
+        while not entered.is_set() and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0)
+        assert entered.is_set()
+        deadline = asyncio.get_running_loop().time() + 2
+        while len(transport._admissions) != 1 and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0)
+        assert len(transport._admissions) == 1 and worker.outstanding_count == 1
+        admission = transport._admissions[0].task
+        handles[withdraw_index].cancel()
+        await asyncio.wait_for(asyncio.gather(handles[withdraw_index], return_exceptions=True), timeout=2)
+        deadline = asyncio.get_running_loop().time() + 2
+        while not admission.done() and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0)
+        assert admission.done() and admission.cancelled()
+        assert coordinator.pending_count == 0 and commands.sent == []
+        assert worker.outstanding_count == 1
+        assert roles.current("SERVER_AUTHORITY" if withdraw_index == 0 else "CLIENT_CONTROLLER") is None
+        release.set()
+        deadline = asyncio.get_running_loop().time() + 2
+        while worker.outstanding_count and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0)
+        assert worker.outstanding_count == 0 and transport._admissions == []
+    finally:
+        release.set()
+        for handle in handles:
+            if not handle.done():
+                handle.cancel()
+        await asyncio.gather(*handles, return_exceptions=True)
+        await worker.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("withdraw_index", (0, 1))
+async def test_real_admission_blocked_prepare_send_is_stale_for_either_role(peers, tmp_path, withdraw_index):
+    clock = Clock()
+    route_body = "11111111-2222-4333-8444-555555555553"
+    roles = AuthenticatedControlRoleOwner(tuple(peer.context for peer in peers), "hub-test-1")
+    worker = MinecraftEpochStoreWorker(
+        EpochWorkerConfig(
+            mode="PROVISION",
+            directory=(tmp_path / "epoch").resolve(),
+            platform=AdmissionPlatform(),
+            provision_id=INTEGRATED_PROVISION,
+            body_id=route_body,
+        )
+    )
+    await worker.start()
+    commands = BlockingPrepareCommands()
+    coordinator = MinecraftControlBindingCoordinator(
+        policy=ControlBindingPolicy(
+            actor_id="actor",
+            world_id="world",
+            body_id=route_body,
+            character_id="luotianyi",
+            provision_id=INTEGRATED_PROVISION,
+            server_install_id="server-test-1",
+            client_install_id="client-test-1",
+        ),
+        role_owner=roles,
+        epoch_store=None,
+        epoch_worker=worker,
+        commands=commands,
+        stage=IntegratedStage(),
+        monotonic_now=lambda: 10.0,
+        utc_now=lambda: NOW,
+    )
+    transport = MinecraftV2AuthenticatedTransport(
+        peers=peers,
+        hub_install_id="hub-test-1",
+        monotonic_millis=clock,
+        utc_now=lambda: NOW,
+        nonce=lambda: HUB_NONCE,
+        challenge_id=lambda: CHALLENGE_ID,
+        role_owner=roles,
+        binding_coordinator=coordinator,
+        epoch_worker=worker,
+    )
+    sockets = [Socket(peers[0], candidate=True), Socket(peers[1], business=True)]
+    handles = [asyncio.create_task(transport.handle(socket)) for socket in sockets]
+    try:
+        await asyncio.wait_for(commands.entered.wait(), timeout=2)
+        assert len(commands.sent) == 1 and len(transport._admissions) == 1
+        admission = transport._admissions[0].task
+        handles[withdraw_index].cancel()
+        await asyncio.wait_for(asyncio.gather(handles[withdraw_index], return_exceptions=True), timeout=2)
+        assert coordinator.pending_count == 0 and coordinator._v2_tickets == {}
+        assert coordinator.quarantined and admission.done()
+        assert len(commands.sent) == 1 and commands.cancelled == 1
+        assert coordinator.active is None and coordinator.ingress is None
+        commands.release.set()
+        await asyncio.sleep(0)
+        assert transport._admissions == []
+    finally:
+        commands.release.set()
+        commands.revoke_release.set()
+        for handle in handles:
+            if not handle.done():
+                handle.cancel()
+        await asyncio.gather(*handles, return_exceptions=True)
+        await worker.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_unstarted", (False, True))
+async def test_actual_candidate_with_missing_or_unavailable_worker_stays_observational(
+    peers, tmp_path, explicit_unstarted
+):
+    clock = Clock()
+    roles = AuthenticatedControlRoleOwner(tuple(peer.context for peer in peers), "hub-test-1")
+    worker = (
+        MinecraftEpochStoreWorker(EpochWorkerConfig(mode="OPEN", directory=(tmp_path / "missing").resolve()))
+        if explicit_unstarted
+        else None
+    )
+    if worker is not None:
+        with pytest.raises(Exception):
+            await worker.start()
+    commands = BindingCommands()
+    coordinator = _coordinator(roles, commands=commands, store=None, worker=worker)
+    transport = MinecraftV2AuthenticatedTransport(
+        peers=peers,
+        hub_install_id="hub-test-1",
+        monotonic_millis=clock,
+        utc_now=lambda: NOW,
+        nonce=lambda: HUB_NONCE,
+        challenge_id=lambda: CHALLENGE_ID,
+        role_owner=roles,
+        binding_coordinator=coordinator,
+        epoch_worker=worker,
+    )
+    sockets = [Socket(peers[0], candidate=True), Socket(peers[1], business=True)]
+    handles = [asyncio.create_task(transport.handle(socket)) for socket in sockets]
+    try:
+        deadline = asyncio.get_running_loop().time() + 2
+        while not transport._body_routes.candidates() and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0)
+        assert len(transport._body_routes.candidates()) == 1
+        assert transport._admissions == [] and commands.sent == []
+        assert coordinator.pending_count == 0 and coordinator._v2_tickets == {}
+        assert worker is None or worker._state.value == "UNAVAILABLE"
+    finally:
+        for handle in handles:
+            handle.cancel()
+        await asyncio.gather(*handles, return_exceptions=True)
+        if worker is not None:
+            await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_actual_third_candidate_at_admission_capacity_is_rejected_without_replacing_entries(
+    peers, tmp_path, monkeypatch
+):
+    admission_creations = []
+    original_create_task = asyncio.create_task
+
+    def observe_create_task(coro, *, name=None, context=None):
+        if name == "minecraft-v2-headless-admission":
+            admission_creations.append(coro)
+        if context is None:
+            return original_create_task(coro, name=name)
+        return original_create_task(coro, name=name, context=context)
+
+    monkeypatch.setattr(asyncio, "create_task", observe_create_task)
+    clock = Clock()
+    route_body = "11111111-2222-4333-8444-555555555553"
+    roles = AuthenticatedControlRoleOwner(tuple(peer.context for peer in peers), "hub-test-1")
+    worker = MinecraftEpochStoreWorker(
+        EpochWorkerConfig(
+            mode="PROVISION",
+            directory=(tmp_path / "epoch").resolve(),
+            platform=AdmissionPlatform(),
+            provision_id=INTEGRATED_PROVISION,
+            body_id=route_body,
+        )
+    )
+    await worker.start()
+    commands = CapacityPrepareCommands()
+    coordinator = MinecraftControlBindingCoordinator(
+        policy=ControlBindingPolicy(
+            actor_id="actor",
+            world_id="world",
+            body_id=route_body,
+            character_id="luotianyi",
+            provision_id=INTEGRATED_PROVISION,
+            server_install_id="server-test-1",
+            client_install_id="client-test-1",
+        ),
+        role_owner=roles,
+        epoch_store=None,
+        epoch_worker=worker,
+        commands=commands,
+        stage=IntegratedStage(),
+        monotonic_now=lambda: 10.0,
+        utc_now=lambda: NOW,
+    )
+    transport = MinecraftV2AuthenticatedTransport(
+        peers=peers,
+        hub_install_id="hub-test-1",
+        monotonic_millis=clock,
+        utc_now=lambda: NOW,
+        nonce=lambda: HUB_NONCE,
+        challenge_id=lambda: CHALLENGE_ID,
+        role_owner=roles,
+        binding_coordinator=coordinator,
+        epoch_worker=worker,
+    )
+    server, controller = Socket(peers[0], candidate=True), Socket(peers[1], business=True)
+    handles = [asyncio.create_task(transport.handle(server)), asyncio.create_task(transport.handle(controller))]
+    invalidated = []
+    original_invalidate = transport._body_routes.invalidate_admission
+
+    def observe_invalidation(receipt):
+        invalidated.append((receipt, tuple(transport._admissions), worker.outstanding_count))
+        original_invalidate(receipt)
+
+    monkeypatch.setattr(transport._body_routes, "invalidate_admission", observe_invalidation)
+    try:
+        await asyncio.wait_for(commands.entered.wait(), timeout=2)
+        assert len(commands.sent) == 1 and len(transport._admissions) == 1
+        commands.entered.clear()
+        await controller.queue_notice()
+        await asyncio.wait_for(commands.entered.wait(), timeout=2)
+        first_entries = tuple(transport._admissions)
+        assert len(first_entries) == 2 and worker.outstanding_count == 2
+        assert all(not entry.task.done() for entry in first_entries)
+
+        for _ in range(5):
+            clock.value += 1_000
+            await server.queue_heartbeat()
+            await controller.queue_heartbeat()
+            for _ in range(10):
+                await asyncio.sleep(0)
+            assert all(not handle.done() for handle in handles)
+        await controller.queue_notice()
+
+        deadline = asyncio.get_running_loop().time() + 2
+        while not invalidated and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0)
+        assert len(invalidated) == 1
+        third_receipt, entries_at_rejection, outstanding_at_rejection = invalidated[0]
+        assert entries_at_rejection == first_entries
+        assert tuple(transport._admissions) == first_entries
+        assert len(entries_at_rejection) == 2 and outstanding_at_rejection == 2
+        assert len(admission_creations) == 2
+        assert all(entry.receipt is not third_receipt for entry in first_entries)
+        assert transport._body_routes._record_for_receipt(third_receipt) is None
+        assert len(commands.sent) == 2
+    finally:
+        commands.release.set()
+        for handle in handles:
+            if not handle.done():
+                handle.cancel()
+        await asyncio.gather(*handles, return_exceptions=True)
+        await worker.close()
 
 
 def _manifest(role, peer_id):
@@ -302,6 +766,7 @@ class Socket:
         fail_send_at=None,
         business=False,
         candidate=False,
+        business_count=1,
     ):
         self.peer = peer
         self.messages = asyncio.Queue()
@@ -310,6 +775,8 @@ class Socket:
         self.fail_send_at = fail_send_at
         self.business = business
         self.candidate = candidate
+        self.business_count = business_count
+        self.next_peer_sequence = 1
         self.sent = []
         self.closed = None
         self.headers = {}
@@ -398,59 +865,87 @@ class Socket:
                     )
                     await self.messages.put(encode_frame(ack, context, self.keys, "PEER_TO_HUB").decode("ascii"))
                 if self.business and value["messageKind"] == "SESSION_OPEN":
-                    frame = PostAuthFrame(
-                        connection_id=self.connection_id,
-                        challenge_id=self.authenticated.challenge_id,
-                        sequence=1,
-                        message_kind="BODY_BIND_NOTICE",
-                        route_id="",
-                        source_install_id="",
-                        source_connection_id="",
-                        recipient_connection_id="",
-                        challenge_expires_at="",
-                        payload=json.dumps(
-                            {
-                                "security": "luosandbox.control-auth.v1",
-                                "kind": "BODY_BIND_NOTICE",
-                                "serverBootId": "11111111-2222-4333-8444-555555555551",
-                                "gameConnectionId": "11111111-2222-4333-8444-555555555552",
-                                "bodyId": "11111111-2222-4333-8444-555555555553",
-                                "gameNonce": b32_encode(b"n" * 32),
-                            },
-                            separators=(",", ":"),
-                        ).encode(),
-                    )
-                    await self.messages.put(encode_frame(frame, context, self.keys, "PEER_TO_HUB").decode("ascii"))
+                    for _ in range(self.business_count):
+                        await self.queue_notice()
                 if value["messageKind"] == "BODY_BIND_ROUTE" and self.candidate:
-                    routed_payload = base64.urlsafe_b64decode(value["payload"] + "=" * (-len(value["payload"]) % 4))
-                    notice_value = json.loads(routed_payload)
-                    candidate_payload = json.dumps(
-                        {
-                            "security": "luosandbox.control-auth.v1",
-                            "kind": "BODY_BOUND",
-                            "serverBootId": notice_value["serverBootId"],
-                            "gameConnectionId": notice_value["gameConnectionId"],
-                            "bodyId": notice_value["bodyId"],
-                        },
-                        separators=(",", ":"),
-                    ).encode()
-                    candidate_frame = PostAuthFrame(
-                        connection_id=self.connection_id,
-                        challenge_id=self.authenticated.challenge_id,
-                        sequence=1,
-                        message_kind="BODY_BOUND_CANDIDATE",
-                        route_id=value["routeId"],
-                        source_install_id="",
-                        source_connection_id="",
-                        recipient_connection_id=self.connection_id,
-                        challenge_expires_at="2026-01-02T03:04:10.000Z",
-                        payload=candidate_payload,
-                    )
-                    await self.messages.put(
-                        encode_frame(candidate_frame, context, self.keys, "PEER_TO_HUB").decode("ascii")
-                    )
+                    await self.queue_candidate(value, context)
         finally:
             self.send_active -= 1
+
+    async def queue_notice(self):
+        context = TrustedFrameContext(authenticated=self.authenticated, connection_id=self.connection_id)
+        sequence = self.next_peer_sequence
+        self.next_peer_sequence += 1
+        frame = PostAuthFrame(
+            connection_id=self.connection_id,
+            challenge_id=self.authenticated.challenge_id,
+            sequence=sequence,
+            message_kind="BODY_BIND_NOTICE",
+            route_id="",
+            source_install_id="",
+            source_connection_id="",
+            recipient_connection_id="",
+            challenge_expires_at="",
+            payload=json.dumps(
+                {
+                    "security": "luosandbox.control-auth.v1",
+                    "kind": "BODY_BIND_NOTICE",
+                    "serverBootId": "11111111-2222-4333-8444-555555555551",
+                    "gameConnectionId": "11111111-2222-4333-8444-555555555552",
+                    "bodyId": "11111111-2222-4333-8444-555555555553",
+                    "gameNonce": b32_encode(b"n" * 32),
+                },
+                separators=(",", ":"),
+            ).encode(),
+        )
+        await self.messages.put(encode_frame(frame, context, self.keys, "PEER_TO_HUB").decode("ascii"))
+
+    async def queue_candidate(self, value, context):
+        sequence = self.next_peer_sequence
+        self.next_peer_sequence += 1
+        routed_payload = base64.urlsafe_b64decode(value["payload"] + "=" * (-len(value["payload"]) % 4))
+        notice_value = json.loads(routed_payload)
+        candidate_payload = json.dumps(
+            {
+                "security": "luosandbox.control-auth.v1",
+                "kind": "BODY_BOUND",
+                "serverBootId": notice_value["serverBootId"],
+                "gameConnectionId": notice_value["gameConnectionId"],
+                "bodyId": notice_value["bodyId"],
+            },
+            separators=(",", ":"),
+        ).encode()
+        candidate_frame = PostAuthFrame(
+            connection_id=self.connection_id,
+            challenge_id=self.authenticated.challenge_id,
+            sequence=sequence,
+            message_kind="BODY_BOUND_CANDIDATE",
+            route_id=value["routeId"],
+            source_install_id="",
+            source_connection_id="",
+            recipient_connection_id=self.connection_id,
+            challenge_expires_at="2026-01-02T03:04:10.000Z",
+            payload=candidate_payload,
+        )
+        await self.messages.put(encode_frame(candidate_frame, context, self.keys, "PEER_TO_HUB").decode("ascii"))
+
+    async def queue_heartbeat(self):
+        context = TrustedFrameContext(authenticated=self.authenticated, connection_id=self.connection_id)
+        sequence = self.next_peer_sequence
+        self.next_peer_sequence += 1
+        frame = PostAuthFrame(
+            connection_id=self.connection_id,
+            challenge_id=self.authenticated.challenge_id,
+            sequence=sequence,
+            message_kind="HEARTBEAT",
+            route_id="",
+            source_install_id="",
+            source_connection_id="",
+            recipient_connection_id="",
+            challenge_expires_at="",
+            payload=b"{}",
+        )
+        await self.messages.put(encode_frame(frame, context, self.keys, "PEER_TO_HUB").decode("ascii"))
 
     async def close(self, code=1000, reason=None):
         self.close_entered.set()
@@ -672,6 +1167,102 @@ async def test_route_invalidation_failure_still_fences_coordinator_before_socket
     results = await asyncio.gather(*tasks, return_exceptions=True)
     assert any(isinstance(result, asyncio.CancelledError) for result in results)
     assert transport.active_roles == () and transport.pending_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("withdraw_index", (0, 1))
+async def test_matching_admission_is_cancelled_and_drained_when_route_invalidation_fails(
+    peers, monkeypatch, withdraw_index
+):
+    clock = Clock()
+    role_owner = AuthenticatedControlRoleOwner(tuple(peer.context for peer in peers), "hub-test-1")
+    commands, stage = BindingCommands(), IntegratedStage()
+    commands.block_revoke = True
+    coordinator = _coordinator(role_owner, commands=commands, stage=stage, store=BindingStore())
+    transport = MinecraftV2AuthenticatedTransport(
+        peers=peers,
+        hub_install_id="hub-test-1",
+        monotonic_millis=clock,
+        utc_now=lambda: NOW,
+        nonce=lambda: HUB_NONCE,
+        challenge_id=lambda: CHALLENGE_ID,
+        role_owner=role_owner,
+        binding_coordinator=coordinator,
+    )
+    sockets = [Socket(peer) for peer in peers]
+    sockets[withdraw_index].block_close = True
+    handles = [asyncio.create_task(transport.handle(socket)) for socket in sockets]
+    admission = None
+    try:
+        deadline = asyncio.get_running_loop().time() + 2
+        while len(transport.active_roles) != 2 and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0)
+        server_lease = role_owner.current("SERVER_AUTHORITY")
+        controller_lease = role_owner.current("CLIENT_CONTROLLER")
+        server = AuthenticatedRoleConnection(
+            connection_id=server_lease.connection_id,
+            handshake=server_lease.handshake,
+        )
+        await coordinator.prepare(
+            server,
+            VerifiedBodyBound(
+                server_boot_id="boot",
+                game_connection_id="game",
+                body_id=INTEGRATED_BODY,
+                client_install_id="client-test-1",
+                controller_connection_id=controller_lease.connection_id,
+                evidence_id="evidence",
+            ),
+        )
+        admission_entered = asyncio.Event()
+        admission_finished = asyncio.Event()
+
+        async def blocked_admission():
+            admission_entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                admission_finished.set()
+
+        admission = asyncio.create_task(blocked_admission())
+        await admission_entered.wait()
+        transport._admissions.append(
+            SimpleNamespace(
+                task=admission,
+                server_lease=server_lease,
+                controller_lease=controller_lease,
+                receipt=object(),
+            )
+        )
+        attempts = []
+
+        def fail_invalidation(lease):
+            attempts.append(lease)
+            raise RuntimeError("route cleanup failed")
+
+        monkeypatch.setattr(transport._body_routes, "invalidate_lease", fail_invalidation)
+        handles[withdraw_index].cancel()
+        await asyncio.wait_for(commands.revoke_entered.wait(), timeout=2)
+        await asyncio.wait_for(admission_finished.wait(), timeout=2)
+        assert coordinator.pending_count == 0 and coordinator.quarantined
+        assert admission.cancelled() and admission.done()
+        assert not sockets[withdraw_index].close_entered.is_set()
+        assert attempts == [server_lease if withdraw_index == 0 else controller_lease]
+        commands.revoke_release.set()
+        await asyncio.wait_for(sockets[withdraw_index].close_entered.wait(), timeout=2)
+        sockets[withdraw_index].close_release.set()
+        result = await asyncio.gather(handles[withdraw_index], return_exceptions=True)
+        assert isinstance(result[0], asyncio.CancelledError)
+    finally:
+        commands.revoke_release.set()
+        sockets[withdraw_index].close_release.set()
+        if admission is not None and not admission.done():
+            admission.cancel()
+            await asyncio.gather(admission, return_exceptions=True)
+        for handle in handles:
+            if not handle.done():
+                handle.cancel()
+        await asyncio.gather(*handles, return_exceptions=True)
 
 
 @pytest.mark.asyncio

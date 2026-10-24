@@ -43,6 +43,48 @@ class NonAuthoritativeBodyBoundCandidate:
     challenge_expires_at: str
 
 
+class BodyRouteAdmissionReceipt:
+    __slots__ = ("_identity",)
+
+    def __init__(self, identity: object | None = None) -> None:
+        self._identity = identity
+
+    def __repr__(self) -> str:
+        return "BodyRouteAdmissionReceipt(<opaque>)"
+
+    def __copy__(self):
+        return BodyRouteAdmissionReceipt()
+
+    def __deepcopy__(self, memo):
+        return BodyRouteAdmissionReceipt()
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class AcceptedBodyCandidate:
+    candidate: NonAuthoritativeBodyBoundCandidate
+    receipt: BodyRouteAdmissionReceipt
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class BodyRoutePreflightContext:
+    candidate: NonAuthoritativeBodyBoundCandidate
+    server_lease: AuthenticatedRoleLease
+    controller_lease: AuthenticatedRoleLease
+    route_id: str
+    _record_identity: object
+    _candidate_identity: object
+    _generation: int
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _PrevalidatedRedemption:
+    context: BodyRoutePreflightContext
+    _record_identity: object
+    _candidate_identity: object
+    _generation: int
+    _identity: object
+
+
 @dataclass(slots=True, repr=False)
 class _Route:
     route_id: str
@@ -58,6 +100,11 @@ class _Route:
     state: V2BodyRouteState = V2BodyRouteState.ROUTED
     challenge_expires_at: str = ""
     candidate: NonAuthoritativeBodyBoundCandidate | None = None
+    receipt: BodyRouteAdmissionReceipt | None = None
+    identity: object = None
+    generation: int = 0
+    preflight_claimed: bool = False
+    redemption: _PrevalidatedRedemption | None = None
 
 
 class V2BodyRouteOwner:
@@ -156,9 +203,7 @@ class V2BodyRouteOwner:
         ):
             self._invalidate(record)
 
-    def accept_candidate(
-        self, server: AuthenticatedRoleLease, frame: PostAuthFrame
-    ) -> NonAuthoritativeBodyBoundCandidate:
+    def accept_candidate(self, server: AuthenticatedRoleLease, frame: PostAuthFrame) -> AcceptedBodyCandidate:
         self._roles.assert_owner()
         _candidate_frame(frame, server)
         value = _payload(frame.payload, notice=False)
@@ -199,8 +244,128 @@ class V2BodyRouteOwner:
         )
         record.challenge_expires_at = frame.challenge_expires_at
         record.candidate = candidate
+        record.identity = object()
+        record.generation += 1
+        receipt = BodyRouteAdmissionReceipt(object())
+        record.receipt = receipt
         self._transition(record, V2BodyRouteState.CONSUMED)
-        return candidate
+        return AcceptedBodyCandidate(candidate, receipt)
+
+    def inspect_for_preflight(self, receipt: BodyRouteAdmissionReceipt) -> BodyRoutePreflightContext:
+        self._roles.assert_owner()
+        if type(receipt) is not BodyRouteAdmissionReceipt:
+            raise V2BodyRouteError("route admission is not current")
+        now = self._now()
+        utc_now = self._utc()
+        self._prune(now)
+        record = self._record_for_receipt(receipt)
+        if (
+            record is None
+            or record.state is not V2BodyRouteState.CONSUMED
+            or record.candidate is None
+            or record.preflight_claimed
+            or not self._roles.is_current(record.server_lease)
+            or not self._roles.is_current(record.controller_lease)
+            or now >= record.deadline
+            or utc_now >= _utc(record.challenge_expires_at)
+        ):
+            raise V2BodyRouteError("route admission is not current")
+        record.preflight_claimed = True
+        return BodyRoutePreflightContext(
+            record.candidate,
+            record.server_lease,
+            record.controller_lease,
+            record.route_id,
+            record.identity,
+            record.candidate,
+            record.generation,
+        )
+
+    def _prevalidate_redemption(
+        self,
+        receipt: BodyRouteAdmissionReceipt,
+        expected: BodyRoutePreflightContext,
+    ) -> _PrevalidatedRedemption:
+        """Sample trusted clocks before the callback-free final admission turn."""
+        self._roles.assert_owner()
+        if type(receipt) is not BodyRouteAdmissionReceipt or type(expected) is not BodyRoutePreflightContext:
+            raise V2BodyRouteError("route admission is not current")
+        now = self._now()
+        utc_now = self._utc()
+        self._prune(now)
+        record = self._record_for_receipt(receipt)
+        if (
+            record is None
+            or record.state is not V2BodyRouteState.CONSUMED
+            or record.candidate is not expected.candidate
+            or record.identity is not expected._record_identity
+            or record.candidate is not expected._candidate_identity
+            or record.generation != expected._generation
+            or record.server_lease is not expected.server_lease
+            or record.controller_lease is not expected.controller_lease
+            or not record.preflight_claimed
+            or not self._roles.is_current(record.server_lease)
+            or not self._roles.is_current(record.controller_lease)
+            or now >= record.deadline
+            or utc_now >= _utc(record.challenge_expires_at)
+        ):
+            raise V2BodyRouteError("route admission is not current")
+        token = _PrevalidatedRedemption(
+            expected,
+            record.identity,
+            record.candidate,
+            record.generation,
+            object(),
+        )
+        record.redemption = token
+        return token
+
+    def _redeem_prevalidated(
+        self,
+        receipt: BodyRouteAdmissionReceipt,
+        token: _PrevalidatedRedemption,
+    ) -> NonAuthoritativeBodyBoundCandidate:
+        """Consume a token minted and used synchronously in the same owner turn."""
+        self._roles.assert_owner()
+        if type(receipt) is not BodyRouteAdmissionReceipt or type(token) is not _PrevalidatedRedemption:
+            raise V2BodyRouteError("route admission is not current")
+        record = self._record_for_receipt(receipt)
+        context = token.context
+        if (
+            record is None
+            or record.redemption is not token
+            or record.state is not V2BodyRouteState.CONSUMED
+            or record.identity is not token._record_identity
+            or record.candidate is not token._candidate_identity
+            or record.generation != token._generation
+            or record.candidate is not context.candidate
+            or record.server_lease is not context.server_lease
+            or record.controller_lease is not context.controller_lease
+            or not record.preflight_claimed
+            or not self._roles.is_current(record.server_lease)
+            or not self._roles.is_current(record.controller_lease)
+        ):
+            raise V2BodyRouteError("route admission is not current")
+        record.receipt = None
+        record.preflight_claimed = False
+        record.redemption = None
+        record.generation += 1
+        return record.candidate
+
+    def invalidate_admission(self, receipt: BodyRouteAdmissionReceipt) -> None:
+        self._roles.assert_owner()
+        if type(receipt) is not BodyRouteAdmissionReceipt:
+            return
+        record = self._record_for_receipt(receipt)
+        if record is not None:
+            record.receipt = None
+            record.preflight_claimed = False
+            record.redemption = None
+            record.generation += 1
+            self._invalidate(record)
+
+    def _record_for_receipt(self, receipt: BodyRouteAdmissionReceipt) -> _Route | None:
+        return next((record for record in self._routes.values() if record.receipt is receipt), None)
 
     def invalidate_lease(self, lease: AuthenticatedRoleLease) -> None:
         self._roles.assert_owner()

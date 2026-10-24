@@ -533,6 +533,13 @@ def _native_kernel():
         ctypes.c_uint,
     )
     kernel.GetVolumeInformationByHandleW.restype = ctypes.c_int
+    kernel.GetFinalPathNameByHandleW.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_wchar_p,
+        ctypes.c_uint,
+        ctypes.c_uint,
+    )
+    kernel.GetFinalPathNameByHandleW.restype = ctypes.c_uint
     return kernel
 
 
@@ -558,8 +565,12 @@ def _rename_by_handle(kernel, handle, destination):
         _FILE_RENAME_INFO.FileName.offset,
     )
     assert actual_offsets == expected_offsets
-    encoded = str(destination).encode("utf-16-le")
-    buffer_size = _FILE_RENAME_INFO.FileName.offset + len(encoded)
+    assert ctypes.sizeof(wintypes.WCHAR) == 2
+    destination_text = str(destination)
+    assert "\0" not in destination_text
+    encoded = destination_text.encode("utf-16-le")
+    terminator = b"\0" * ctypes.sizeof(wintypes.WCHAR)
+    buffer_size = _FILE_RENAME_INFO.FileName.offset + len(encoded) + len(terminator)
 
     class _AlignedRenameBuffer(ctypes.Union):
         _fields_ = (("alignment", ctypes.c_void_p), ("raw", ctypes.c_ubyte * buffer_size))
@@ -570,8 +581,11 @@ def _rename_by_handle(kernel, handle, destination):
     value.ReplaceIfExists = False
     value.RootDirectory = None
     value.FileNameLength = len(encoded)
-    assert _FILE_RENAME_INFO.FileName.offset + len(encoded) <= ctypes.sizeof(buffer)
-    ctypes.memmove(ctypes.addressof(buffer) + _FILE_RENAME_INFO.FileName.offset, encoded, len(encoded))
+    filename_address = ctypes.addressof(buffer) + _FILE_RENAME_INFO.FileName.offset
+    assert filename_address % ctypes.alignment(wintypes.WCHAR) == 0
+    assert _FILE_RENAME_INFO.FileName.offset + len(encoded) + len(terminator) <= ctypes.sizeof(buffer)
+    ctypes.memmove(filename_address, encoded, len(encoded))
+    ctypes.memmove(filename_address + len(encoded), terminator, len(terminator))
     ctypes.set_last_error(0)
     success = bool(kernel.SetFileInformationByHandle(handle, 3, ctypes.byref(buffer), buffer_size))
     error = 0 if success else ctypes.get_last_error()
@@ -582,6 +596,40 @@ def _filesystem_name(kernel, handle):
     name = ctypes.create_unicode_buffer(64)
     assert kernel.GetVolumeInformationByHandleW(handle, None, 0, None, None, None, name, len(name))
     return name.value
+
+
+def _final_path_basename(kernel, handle):
+    name = ctypes.create_unicode_buffer(1024)
+    length = kernel.GetFinalPathNameByHandleW(handle, name, len(name), 0)
+    assert 0 < length < len(name)
+    return Path(name.value).name
+
+
+@pytest.mark.parametrize("destination", (Path("C:/a"), Path("C:/two-chars"), Path("C:/目录-雪"), Path("C:/xĀ")))
+def test_rename_buffer_has_exact_length_delimited_name_and_zero_tail(destination):
+    calls = []
+
+    class Kernel:
+        def SetFileInformationByHandle(self, handle, information_class, buffer, buffer_size):
+            calls.append((handle, information_class, ctypes.string_at(buffer, buffer_size), buffer_size))
+            return 1
+
+    kernel = Kernel()
+    success, error, offsets = _rename_by_handle(kernel, 123, destination)
+    assert success and error == 0
+    assert offsets == ((8, 16, 20) if ctypes.sizeof(ctypes.c_void_p) == 8 else (4, 8, 12))
+    assert len(calls) == 1
+    handle, information_class, raw, buffer_size = calls[0]
+    encoded = str(destination).encode("utf-16-le")
+    filename_offset = _FILE_RENAME_INFO.FileName.offset
+    assert handle == 123 and information_class == 3
+    assert buffer_size == filename_offset + len(encoded) + 2
+    assert int.from_bytes(
+        raw[_FILE_RENAME_INFO.FileNameLength.offset : _FILE_RENAME_INFO.FileNameLength.offset + 4],
+        "little",
+    ) == len(encoded)
+    assert raw[filename_offset : filename_offset + len(encoded)] == encoded
+    assert raw[filename_offset + len(encoded) :] == b"\0\0"
 
 
 def _open_directory_for_rename(kernel, path):
@@ -758,6 +806,7 @@ def test_native_root_handle_rename_is_blocked_while_held_then_succeeds_and_resto
     try:
         success, error, offsets = _rename_by_handle(kernel, attacker, renamed)
         assert success and error == 0
+        assert _final_path_basename(kernel, attacker) == renamed.name
         assert not root.exists() and renamed.is_dir()
         renamed_handle, renamed_error = _open_directory_for_rename(kernel, renamed)
         assert renamed_error == 0 and renamed_handle not in (None, ctypes.c_void_p(-1).value)
@@ -771,8 +820,13 @@ def test_native_root_handle_rename_is_blocked_while_held_then_succeeds_and_resto
             assert kernel.CloseHandle(renamed_handle)
         restored, restore_error, restore_offsets = _rename_by_handle(kernel, attacker, root)
         assert restored and restore_error == 0 and restore_offsets == offsets
+        assert _final_path_basename(kernel, attacker) == root.name
         assert root.is_dir() and not renamed.exists()
-        assert _file_info(kernel, attacker).file_index == original_identity.file_index
+        restored_identity = _file_info(kernel, attacker)
+        assert (restored_identity.volume_serial, restored_identity.file_index) == (
+            original_identity.volume_serial,
+            original_identity.file_index,
+        )
     finally:
         if renamed.exists() and not root.exists():
             restored, _restore_error, _ = _rename_by_handle(kernel, attacker, root)

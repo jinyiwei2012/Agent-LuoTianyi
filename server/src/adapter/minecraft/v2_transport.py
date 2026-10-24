@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 from uuid import uuid4
@@ -35,10 +36,19 @@ _I63_MAX = (1 << 63) - 1
 # Keep adjacent millisecond samples distinguishable after conversion to the
 # shared auth API's float seconds, with headroom for its fixed five-second TTL.
 _MAX_SAFE_AUTH_MILLIS = ((1 << 42) - 5) * 1000 - 1
+_MAX_ADMISSIONS = 2
 
 
 class V2TransportError(RuntimeError):
     """Sanitized v2 transport assembly failure."""
+
+
+@dataclass(slots=True)
+class _AdmissionTask:
+    task: asyncio.Task
+    server_lease: object
+    controller_lease: object
+    receipt: object
 
 
 class MinecraftV2AuthenticatedTransport:
@@ -55,6 +65,7 @@ class MinecraftV2AuthenticatedTransport:
         challenge_id: Callable[[], str] | None = None,
         role_owner: AuthenticatedControlRoleOwner | None = None,
         binding_coordinator: MinecraftControlBindingCoordinator | None = None,
+        epoch_worker=None,
     ) -> None:
         if type(peers) is not tuple or not peers or type(hub_install_id) is not str or not hub_install_id:
             raise ValueError("invalid v2 transport provisioning")
@@ -94,12 +105,16 @@ class MinecraftV2AuthenticatedTransport:
         self._pending = PendingHandshakes(maximum=4)
         self._roles = selected_owner
         self._binding = binding_coordinator
+        if binding_coordinator is not None and epoch_worker is not binding_coordinator.epoch_worker:
+            raise ValueError("binding coordinator epoch worker mismatch")
+        self._epoch_worker = epoch_worker
         self._body_routes = V2BodyRouteOwner(
             role_owner=selected_owner,
             monotonic_millis=self._monotonic_millis,
             utc_now=self._trusted_utc,
         )
         self._sessions: dict[str, tuple[object, PostAuthHubSession]] = {}
+        self._admissions: list[_AdmissionTask] = []
         self._unauthenticated: set[str] = set()
         self._attempts = {install: _Bucket(1.0, 2.0) for install in installs}
         self._global_attempts = _Bucket(2.0, 4.0)
@@ -275,7 +290,23 @@ class MinecraftV2AuthenticatedTransport:
                     )
                     return
                 if frame.message_kind == "BODY_BOUND_CANDIDATE" and lease.role == "SERVER_AUTHORITY":
-                    self._body_routes.accept_candidate(lease, frame)
+                    accepted = self._body_routes.accept_candidate(lease, frame)
+                    if self._binding is not None and self._binding.v2_admission_available():
+                        if len(self._admissions) >= _MAX_ADMISSIONS:
+                            self._body_routes.invalidate_admission(accepted.receipt)
+                            raise V2TransportError("v2 admission capacity")
+                        task = asyncio.create_task(
+                            self._admit_and_dispatch(accepted.receipt),
+                            name="minecraft-v2-headless-admission",
+                        )
+                        entry = _AdmissionTask(
+                            task,
+                            lease,
+                            self._roles.current("CLIENT_CONTROLLER"),
+                            accepted.receipt,
+                        )
+                        self._admissions.append(entry)
+                        task.add_done_callback(lambda done, actual=entry: self._remove_admission(actual, done))
                     return
                 raise V2TransportError("v2 application authority is disabled")
 
@@ -361,6 +392,25 @@ class MinecraftV2AuthenticatedTransport:
         if cleanup_failed:
             raise V2TransportError("v2 transport cleanup failed") from None
 
+    async def _admit_and_dispatch(self, receipt) -> None:
+        try:
+            dispatch = await self._binding.prepare_v2(self._body_routes, receipt)
+            await self._binding.dispatch_v2_prepare(dispatch)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return
+
+    def _remove_admission(self, entry: _AdmissionTask, done: asyncio.Task) -> None:
+        for index, actual in enumerate(self._admissions):
+            if actual is entry and actual.task is done:
+                self._admissions.pop(index)
+                break
+        try:
+            done.exception()
+        except (asyncio.CancelledError, Exception):
+            pass
+
     async def _drive_session(
         self,
         websocket: WebSocketPort,
@@ -395,6 +445,11 @@ class MinecraftV2AuthenticatedTransport:
         def after_remove(withdrawal) -> None:  # noqa: C901
             first_error = None
             fatal = None
+            matching = [
+                entry
+                for entry in tuple(self._admissions)
+                if entry.server_lease is lease or entry.controller_lease is lease
+            ]
             try:
                 association = self._sessions.get(lease.role)
                 if association is not None and association[0] is lease:
@@ -420,6 +475,14 @@ class MinecraftV2AuthenticatedTransport:
                     fatal = fatal or error
                 elif first_error is None:
                     first_error = error
+            for entry in matching:
+                entry.task.cancel()
+                task = asyncio.create_task(
+                    _drain_tasks((entry.task,)),
+                    name="minecraft-v2-admission-cleanup",
+                )
+                cleanup_tasks.add(task)
+                task.add_done_callback(cleanup_tasks.discard)
             if fatal is not None:
                 raise fatal
             if first_error is not None:

@@ -164,7 +164,8 @@ async def test_route_payload_metadata_candidate_and_original_ttl():
     raw = notice().payload
     routes.route_notice(leases["CLIENT_CONTROLLER"], notice(raw), lambda *args: routed.append(args))
     assert routed == [(ROUTES[0], "client", CLIENT_CONNECTION, raw)]
-    value = routes.accept_candidate(leases["SERVER_AUTHORITY"], candidate(ROUTES[0]))
+    accepted = routes.accept_candidate(leases["SERVER_AUTHORITY"], candidate(ROUTES[0]))
+    value = accepted.candidate
     assert value.route_id == ROUTES[0] and value.body_id == BODY
     assert routes.candidates() == (value,)
     clock.value = 4999
@@ -417,3 +418,28 @@ async def test_stale_server_candidate_cannot_invalidate_replacement_record_with_
     with pytest.raises(V2BodyRouteError, match="origin"):
         routes.accept_candidate(stale_server, candidate(ROUTES[0]))
     assert routes._routes[ROUTES[0]].state.value == "ROUTED" and routes._generation == generation
+
+
+@pytest.mark.asyncio
+async def test_admission_receipt_is_exact_one_use_and_dto_never_authorizes():
+    import copy
+
+    owner, leases = roles()
+    routes = V2BodyRouteOwner(
+        role_owner=owner,
+        monotonic_millis=lambda: 0,
+        utc_now=lambda: NOW,
+        route_id=lambda: ROUTES[0],
+    )
+    routes.route_notice(leases["CLIENT_CONTROLLER"], notice(), lambda *args: None)
+    accepted = routes.accept_candidate(leases["SERVER_AUTHORITY"], candidate(ROUTES[0]))
+    with pytest.raises(V2BodyRouteError):
+        routes.inspect_for_preflight(copy.copy(accepted.receipt))
+    context = routes.inspect_for_preflight(accepted.receipt)
+    with pytest.raises(V2BodyRouteError):
+        routes.inspect_for_preflight(accepted.receipt)
+    token = routes._prevalidate_redemption(accepted.receipt, context)
+    assert routes._redeem_prevalidated(accepted.receipt, token) is accepted.candidate
+    with pytest.raises(V2BodyRouteError):
+        routes._redeem_prevalidated(accepted.receipt, token)
+    assert routes.candidates() == (accepted.candidate,)
