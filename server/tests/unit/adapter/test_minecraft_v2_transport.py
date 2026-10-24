@@ -10,6 +10,13 @@ from pathlib import Path
 import pytest
 
 from src.adapter.minecraft.control_auth import ControlAuthError, PendingHandshakes, b32_encode, compute_proof
+from src.adapter.minecraft.control_binding import (
+    AuthenticatedRoleConnection,
+    ControlBindingPolicy,
+    MinecraftControlBindingCoordinator,
+    VerifiedBodyBound,
+)
+from src.adapter.minecraft.current_roles import AuthenticatedControlRoleOwner
 from src.adapter.minecraft.deployment_acl import TrustedDeploymentAclPolicy, inspect_handle_security_descriptor
 from src.adapter.minecraft.deployment_files import (
     DeploymentFileProvision,
@@ -18,6 +25,7 @@ from src.adapter.minecraft.deployment_files import (
     load_verified_deployment_filesystem,
 )
 from src.adapter.minecraft.deployment_manifest import DeploymentManifest, TrustedDeploymentIdentity
+from src.adapter.minecraft.epoch_store import EpochCandidate
 from src.adapter.minecraft.postauth_frame import PostAuthFrame, TrustedFrameContext, encode_frame
 from src.adapter.minecraft.postauth_keys import AuthenticatedTranscript, PostAuthSessionKeys
 from src.adapter.minecraft.v2_startup import provision_v2_peer
@@ -31,6 +39,8 @@ BINDING = b"public-binding-manifest"
 PSK = bytes(range(32))
 NOW = datetime(2026, 1, 2, 3, 4, 5, 678000, tzinfo=timezone.utc)
 CHALLENGE_ID = "11111111-2222-4333-8444-555555555555"
+INTEGRATED_PROVISION = "10000000-0000-4000-8000-000000000001"
+INTEGRATED_BODY = "20000000-0000-4000-8000-000000000002"
 PEER_NONCE = b"p" * 32
 HUB_NONCE = b"h" * 32
 
@@ -41,6 +51,64 @@ class Clock:
 
     def __call__(self):
         return self.value
+
+
+class BindingStage:
+    character_id = "luotianyi"
+    world_id = "world"
+    minecraft_observation_scope = None
+
+    def bind_minecraft_observations(self, scope):
+        self.minecraft_observation_scope = scope
+
+    def unbind_minecraft_observations(self, scope):
+        self.minecraft_observation_scope = None
+        return True
+
+
+class BindingCommands:
+    def __init__(self):
+        self.revoke_entered = asyncio.Event()
+        self.revoke_release = asyncio.Event()
+        self.block_revoke = False
+
+    async def send(self, command):
+        return None
+
+    async def revoke(self, command):
+        self.revoke_entered.set()
+        if self.block_revoke:
+            await self.revoke_release.wait()
+
+
+class BindingStore:
+    def read_candidate(self):
+        return EpochCandidate(INTEGRATED_PROVISION, INTEGRATED_BODY, 0, 0, 1)
+
+
+class IntegratedStage(BindingStage):
+    def __init__(self):
+        self.minecraft_observation_scope = None
+
+
+def _coordinator(owner, *, commands=None, stage=None, store=None):
+    return MinecraftControlBindingCoordinator(
+        policy=ControlBindingPolicy(
+            actor_id="actor",
+            world_id="world",
+            body_id=INTEGRATED_BODY,
+            character_id="luotianyi",
+            provision_id=INTEGRATED_PROVISION,
+            server_install_id="server-test-1",
+            client_install_id="client-test-1",
+        ),
+        role_owner=owner,
+        epoch_store=store,
+        commands=commands or BindingCommands(),
+        stage=stage or BindingStage(),
+        monotonic_now=lambda: 10.0,
+        utc_now=lambda: NOW,
+    )
 
 
 def _manifest(role, peer_id):
@@ -236,6 +304,9 @@ class Socket:
         self.authenticated = None
         self.connection_id = None
         self.close_failure = False
+        self.close_entered = asyncio.Event()
+        self.close_release = asyncio.Event()
+        self.block_close = False
 
     async def accept(self, *, subprotocol=None):
         self.accepted = subprotocol
@@ -337,6 +408,9 @@ class Socket:
             self.send_active -= 1
 
     async def close(self, code=1000, reason=None):
+        self.close_entered.set()
+        if self.block_close:
+            await self.close_release.wait()
         self.closed = (code, reason)
         if self.keys is not None:
             self.keys.close()
@@ -376,6 +450,48 @@ def test_constructor_rejects_raw_closed_duplicate_role_and_wrong_hub(peers):
         )
 
 
+def test_constructor_accepts_exact_shared_owner_and_rejects_context_mismatch(peers):
+    clock = Clock()
+    owner = AuthenticatedControlRoleOwner(tuple(peer.context for peer in peers), "hub-test-1")
+    transport = MinecraftV2AuthenticatedTransport(
+        peers=peers,
+        hub_install_id="hub-test-1",
+        monotonic_millis=clock,
+        utc_now=lambda: NOW,
+        role_owner=owner,
+    )
+    assert transport._roles is owner and owner._loop is None
+    other = AuthenticatedControlRoleOwner((peers[0].context,), "hub-test-1")
+    with pytest.raises(ValueError, match="provisioning mismatch"):
+        MinecraftV2AuthenticatedTransport(
+            peers=peers,
+            hub_install_id="hub-test-1",
+            monotonic_millis=clock,
+            utc_now=lambda: NOW,
+            role_owner=other,
+        )
+    coordinator = _coordinator(owner)
+    integrated = MinecraftV2AuthenticatedTransport(
+        peers=peers,
+        hub_install_id="hub-test-1",
+        monotonic_millis=clock,
+        utc_now=lambda: NOW,
+        role_owner=owner,
+        binding_coordinator=coordinator,
+    )
+    assert integrated._roles is coordinator.role_owner
+    different = AuthenticatedControlRoleOwner(tuple(peer.context for peer in peers), "hub-test-1")
+    with pytest.raises(ValueError, match="role owner mismatch"):
+        MinecraftV2AuthenticatedTransport(
+            peers=peers,
+            hub_install_id="hub-test-1",
+            monotonic_millis=clock,
+            utc_now=lambda: NOW,
+            role_owner=different,
+            binding_coordinator=coordinator,
+        )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("index", (0, 1))
 async def test_actual_both_roles_authenticate_open_ack_and_cleanup(index, peers):
@@ -395,6 +511,62 @@ async def test_actual_both_roles_authenticate_open_ack_and_cleanup(index, peers)
     assert owner.active_roles == () and owner.pending_count == 0
     assert socket.closed == (1001, "FEATURE_DISABLED")
     assert all(peer.is_provisioned for peer in peers)
+
+
+@pytest.mark.asyncio
+async def test_integrated_withdrawal_fences_before_revoke_then_socket_close(peers):
+    clock = Clock()
+    role_owner = AuthenticatedControlRoleOwner(tuple(peer.context for peer in peers), "hub-test-1")
+    commands, stage = BindingCommands(), IntegratedStage()
+    commands.block_revoke = True
+    coordinator = _coordinator(role_owner, commands=commands, stage=stage, store=BindingStore())
+    transport = MinecraftV2AuthenticatedTransport(
+        peers=peers,
+        hub_install_id="hub-test-1",
+        monotonic_millis=clock,
+        utc_now=lambda: NOW,
+        nonce=lambda: HUB_NONCE,
+        challenge_id=lambda: CHALLENGE_ID,
+        role_owner=role_owner,
+        binding_coordinator=coordinator,
+    )
+    sockets = [Socket(peer) for peer in peers]
+    sockets[0].block_close = True
+    tasks = [asyncio.create_task(transport.handle(socket)) for socket in sockets]
+    deadline = asyncio.get_running_loop().time() + 2
+    while len(transport.active_roles) != 2 and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0)
+    server_lease = role_owner.current("SERVER_AUTHORITY")
+    server = AuthenticatedRoleConnection(
+        connection_id=server_lease.connection_id,
+        handshake=server_lease.handshake,
+    )
+    controller_lease = role_owner.current("CLIENT_CONTROLLER")
+    await coordinator.prepare(
+        server,
+        VerifiedBodyBound(
+            server_boot_id="boot",
+            game_connection_id="game",
+            body_id=INTEGRATED_BODY,
+            client_install_id="client-test-1",
+            controller_connection_id=controller_lease.connection_id,
+            evidence_id="evidence",
+        ),
+    )
+    tasks[0].cancel()
+    await commands.revoke_entered.wait()
+    assert role_owner.current("SERVER_AUTHORITY") is None
+    assert coordinator.pending_count == 0 and coordinator.active_snapshot() is None
+    assert coordinator.ingress is None and stage.minecraft_observation_scope is None
+    assert coordinator.quarantined and not sockets[0].close_entered.is_set()
+    commands.revoke_release.set()
+    await sockets[0].close_entered.wait()
+    tasks[0].cancel()
+    assert role_owner.current("SERVER_AUTHORITY") is None and coordinator.pending_count == 0
+    sockets[0].close_release.set()
+    tasks[1].cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    assert transport.active_roles == () and transport.pending_count == 0
 
 
 @pytest.mark.asyncio

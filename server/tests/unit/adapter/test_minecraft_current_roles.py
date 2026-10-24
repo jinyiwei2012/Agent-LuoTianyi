@@ -12,7 +12,12 @@ from src.adapter.minecraft.control_auth import (
     PendingHandshakes,
     compute_proof,
 )
-from src.adapter.minecraft.current_roles import AuthenticatedControlRoleOwner, CurrentRoleError
+from src.adapter.minecraft.current_roles import (
+    AuthenticatedControlRoleOwner,
+    AuthenticatedRoleLease,
+    CurrentRoleError,
+    RoleWithdrawal,
+)
 
 NOW = datetime(2026, 10, 23, tzinfo=timezone.utc)
 CONNECTION = "10000000-0000-4000-8000-000000000001"
@@ -75,12 +80,95 @@ async def test_exact_two_roles_duplicate_rejection_and_single_use_promotion():
         owner.reserve(server, "10000000-0000-4000-8000-000000000002")
     owner.bind_challenge(reservation, CHALLENGE)
     lease = owner.promote(reservation, handshake(server))
+    assert owner.current("SERVER_AUTHORITY") is lease and owner.is_current(lease)
     assert owner.active_roles() == ("SERVER_AUTHORITY",)
     with pytest.raises(CurrentRoleError):
         owner.promote(reservation, handshake(server))
     withdrawal = owner.withdraw(lease)
     assert withdrawal.role == "SERVER_AUTHORITY" and withdrawal.connection_id == CONNECTION
     assert owner.withdraw(lease) is None and owner.active_roles() == ()
+
+
+@pytest.mark.asyncio
+async def test_currentness_is_exact_identity_and_withdraw_callback_observes_removed_slot():
+    server = context()
+    owner = AuthenticatedControlRoleOwner((server,), "hub")
+    reservation = owner.reserve(server, CONNECTION)
+    owner.bind_challenge(reservation, CHALLENGE)
+    lease = owner.promote(reservation, handshake(server))
+    copied = copy.copy(lease)
+    assert not owner.is_current(copied)
+    observed = []
+
+    def after_remove(withdrawal):
+        observed.append((withdrawal, owner.current("SERVER_AUTHORITY")))
+
+    withdrawal = owner.withdraw(lease, after_remove=after_remove)
+    assert observed == [(withdrawal, None)]
+    assert not owner.is_current(lease)
+
+
+@pytest.mark.asyncio
+async def test_withdraw_callback_exception_never_restores_authority():
+    server = context()
+    owner = AuthenticatedControlRoleOwner((server,), "hub")
+    reservation = owner.reserve(server, CONNECTION)
+    owner.bind_challenge(reservation, CHALLENGE)
+    lease = owner.promote(reservation, handshake(server))
+
+    def fail(_withdrawal):
+        assert owner.current("SERVER_AUTHORITY") is None
+        raise RuntimeError("callback failed")
+
+    with pytest.raises(RuntimeError, match="callback failed"):
+        owner.withdraw(lease, after_remove=fail)
+    assert owner.current("SERVER_AUTHORITY") is None and not owner.is_current(lease)
+
+
+@pytest.mark.asyncio
+async def test_reservation_withdrawal_and_copied_receipt_lack_authenticated_provenance():
+    server = context()
+    owner = AuthenticatedControlRoleOwner((server,), "hub")
+    reservation = owner.reserve(server, CONNECTION)
+    receipt = owner.withdraw(reservation)
+    assert receipt is None and owner._withdrawals == {}
+    lease_like = AuthenticatedRoleLease(
+        "SERVER_AUTHORITY",
+        CONNECTION,
+        1,
+        handshake(server),
+        object(),
+    )
+    forged = RoleWithdrawal(lease_like.role, lease_like.connection_id, lease_like.generation)
+    assert not owner.consume_withdrawal(forged, lease_like)
+
+
+@pytest.mark.asyncio
+async def test_owner_held_withdrawal_registry_is_bounded_and_one_use():
+    server, client = context(), context("CLIENT_CONTROLLER", "client")
+    owner = AuthenticatedControlRoleOwner((server, client), "hub")
+    for index, value in enumerate((server, client)):
+        connection = f"10000000-0000-4000-8000-{index + 1:012x}"
+        challenge = f"20000000-0000-4000-8000-{index + 1:012x}"
+        reservation = owner.reserve(value, connection)
+        owner.bind_challenge(reservation, challenge)
+        lease = owner.promote(reservation, handshake(value, connection=connection, challenge=challenge))
+        forged = RoleWithdrawal(lease.role, lease.connection_id, lease.generation)
+        assert owner._withdrawals == {} and not owner.consume_withdrawal(forged, lease)
+        receipt = owner.withdraw(lease)
+        assert len(owner._withdrawals) <= 2
+        copied = copy.copy(receipt)
+        assert not owner.consume_withdrawal(copied, lease)
+        assert owner.consume_withdrawal(receipt, lease)
+        assert not owner.consume_withdrawal(receipt, lease)
+
+
+def test_context_compatibility_does_not_bind_owner_loop():
+    server = context()
+    owner = AuthenticatedControlRoleOwner((server,), "hub")
+    assert owner.matches_contexts((server,), "hub")
+    assert not owner.matches_contexts((replace(server),), "hub")
+    assert owner._loop is None and owner._thread is None
 
 
 @pytest.mark.asyncio
@@ -203,13 +291,20 @@ async def _withdraw(owner, token):
 
 @pytest.mark.asyncio
 async def test_generation_exhaustion_closes_without_wrap(monkeypatch):
-    server = context()
-    owner = AuthenticatedControlRoleOwner((server,), "hub")
+    server, client = context(), context("CLIENT_CONTROLLER", "client")
+    owner = AuthenticatedControlRoleOwner((server, client), "hub")
+    reservation = owner.reserve(server, CONNECTION)
+    owner.bind_challenge(reservation, CHALLENGE)
+    lease = owner.promote(reservation, handshake(server))
     monkeypatch.setattr(owner, "_generation", (1 << 63) - 1)
     with pytest.raises(CurrentRoleError, match="exhausted"):
-        owner.reserve(server, CONNECTION)
+        owner.reserve(client, "10000000-0000-4000-8000-000000000002")
     with pytest.raises(CurrentRoleError):
-        owner.reserve(server, CONNECTION)
+        owner.reserve(client, "10000000-0000-4000-8000-000000000002")
+    assert owner.current("SERVER_AUTHORITY") is lease
+    observed = []
+    owner.withdraw(lease, after_remove=observed.append)
+    assert len(observed) == 1 and owner.current("SERVER_AUTHORITY") is None
 
 
 def test_constructor_rejects_payload_style_clone_context_and_wrong_hub():

@@ -6,6 +6,7 @@ import asyncio
 import re
 import threading
 from dataclasses import dataclass
+from typing import Callable
 
 from .control_auth import AuthenticatedHandshake, ControlAuthContext
 
@@ -20,11 +21,18 @@ class CurrentRoleError(RuntimeError):
     """Fail-closed role ownership error without authentication material."""
 
 
-@dataclass(frozen=True, slots=True, repr=False)
 class RoleWithdrawal:
-    role: str
-    connection_id: str
-    generation: int
+    """Opaque owner-issued proof that one exact authenticated lease was removed."""
+
+    __slots__ = ("role", "connection_id", "generation")
+
+    def __init__(self, role: str, connection_id: str, generation: int) -> None:
+        self.role = role
+        self.connection_id = connection_id
+        self.generation = generation
+
+    def __repr__(self) -> str:
+        return "RoleWithdrawal(<opaque>)"
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -37,7 +45,7 @@ class _RoleReservation:
 
 
 @dataclass(frozen=True, slots=True, repr=False)
-class _AuthenticatedRoleLease:
+class AuthenticatedRoleLease:
     role: str
     connection_id: str
     generation: int
@@ -62,12 +70,13 @@ class AuthenticatedControlRoleOwner:
                 raise ValueError("invalid provisioned role owner")
             expected[context.peer_role] = context
         self._expected = expected
-        self._slots: dict[str, _RoleReservation | _AuthenticatedRoleLease] = {}
+        self._slots: dict[str, _RoleReservation | AuthenticatedRoleLease] = {}
         self._challenges: dict[object, str] = {}
         self._generation = 0
         self._closed = False
         self._thread: int | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._withdrawals: dict[str, tuple[RoleWithdrawal, AuthenticatedRoleLease]] = {}
 
     def reserve(self, context: ControlAuthContext, connection_id: str) -> _RoleReservation:
         self._owner()
@@ -75,6 +84,7 @@ class AuthenticatedControlRoleOwner:
             raise CurrentRoleError("role context is not provisioned")
         if context.peer_role in self._slots:
             raise CurrentRoleError("authenticated role already reserved")
+        self._withdrawals.pop(context.peer_role, None)
         generation = self._next_generation()
         reservation = _RoleReservation(context.peer_role, connection_id, generation, context, object())
         self._slots[context.peer_role] = reservation
@@ -90,7 +100,7 @@ class AuthenticatedControlRoleOwner:
             raise CurrentRoleError("role reservation is not current")
         self._challenges[reservation.identity] = challenge_id
 
-    def promote(self, reservation: _RoleReservation, handshake: AuthenticatedHandshake) -> _AuthenticatedRoleLease:
+    def promote(self, reservation: _RoleReservation, handshake: AuthenticatedHandshake) -> AuthenticatedRoleLease:
         self._owner()
         expected_challenge = self._challenges.pop(reservation.identity, None)
         if (
@@ -102,7 +112,7 @@ class AuthenticatedControlRoleOwner:
             or not handshake.has_full_provenance
         ):
             raise CurrentRoleError("authenticated role promotion rejected")
-        lease = _AuthenticatedRoleLease(
+        lease = AuthenticatedRoleLease(
             reservation.role,
             reservation.connection_id,
             reservation.generation,
@@ -112,31 +122,98 @@ class AuthenticatedControlRoleOwner:
         self._slots[reservation.role] = lease
         return lease
 
-    def withdraw(self, token: _RoleReservation | _AuthenticatedRoleLease) -> RoleWithdrawal | None:
+    def current(self, role: str) -> AuthenticatedRoleLease | None:
         self._owner()
+        if role not in _ROLES:
+            raise CurrentRoleError("invalid authenticated role")
+        token = self._slots.get(role)
+        return token if isinstance(token, AuthenticatedRoleLease) else None
+
+    def is_current(self, lease: AuthenticatedRoleLease) -> bool:
+        self._owner()
+        return isinstance(lease, AuthenticatedRoleLease) and self._current(lease) is lease
+
+    def assert_owner(self) -> None:
+        self._owner()
+
+    def consume_withdrawal(self, withdrawal: RoleWithdrawal, lease: AuthenticatedRoleLease) -> bool:
+        self._owner()
+        if not isinstance(withdrawal, RoleWithdrawal) or not isinstance(lease, AuthenticatedRoleLease):
+            return False
+        issued = self._withdrawals.get(lease.role)
+        if (
+            issued is None
+            or issued[0] is not withdrawal
+            or issued[1] is not lease
+            or withdrawal.role != lease.role
+            or withdrawal.connection_id != lease.connection_id
+            or withdrawal.generation != lease.generation
+        ):
+            return False
+        self._withdrawals.pop(lease.role, None)
+        return True
+
+    def matches_contexts(self, contexts: tuple[ControlAuthContext, ...], hub_install_id: str) -> bool:
+        if type(contexts) is not tuple or type(hub_install_id) is not str:
+            return False
+        supplied = {context.peer_role: context for context in contexts if isinstance(context, ControlAuthContext)}
+        return (
+            len(supplied) == len(contexts) == len(self._expected)
+            and all(self._expected.get(role) is context for role, context in supplied.items())
+            and all(context.hub_install_id == hub_install_id for context in supplied.values())
+        )
+
+    def matches_role_installs(self, expected: dict[str, str]) -> bool:
+        return (
+            type(expected) is dict
+            and set(expected) == set(self._expected)
+            and all(
+                type(install_id) is str and self._expected[role].peer_install_id == install_id
+                for role, install_id in expected.items()
+            )
+        )
+
+    def withdraw(
+        self,
+        token: _RoleReservation | AuthenticatedRoleLease,
+        after_remove: Callable[[RoleWithdrawal], None] | None = None,
+    ) -> RoleWithdrawal | None:
+        self._owner()
+        if after_remove is not None and not callable(after_remove):
+            raise TypeError("withdraw callback must be callable")
         current = self._current(token)
         if current is not token:
             return None
         self._slots.pop(token.role, None)
         if isinstance(token, _RoleReservation):
             self._challenges.pop(token.identity, None)
-        return RoleWithdrawal(token.role, token.connection_id, token.generation)
+        withdrawal = None
+        if isinstance(token, AuthenticatedRoleLease):
+            withdrawal = RoleWithdrawal(token.role, token.connection_id, token.generation)
+            self._withdrawals[token.role] = (withdrawal, token)
+        if after_remove is not None:
+            if withdrawal is not None:
+                after_remove(withdrawal)
+        return withdrawal
 
     def active_roles(self) -> tuple[str, ...]:
         self._owner()
-        return tuple(sorted(role for role, token in self._slots.items() if isinstance(token, _AuthenticatedRoleLease)))
+        return tuple(sorted(role for role, token in self._slots.items() if isinstance(token, AuthenticatedRoleLease)))
 
     def close(self) -> tuple[RoleWithdrawal, ...]:
         self._owner()
         if self._closed:
             return ()
         self._closed = True
-        withdrawals = tuple(
-            RoleWithdrawal(token.role, token.connection_id, token.generation) for token in self._slots.values()
-        )
+        withdrawals = []
+        for token in self._slots.values():
+            if isinstance(token, AuthenticatedRoleLease):
+                withdrawal = RoleWithdrawal(token.role, token.connection_id, token.generation)
+                self._withdrawals[token.role] = (withdrawal, token)
+                withdrawals.append(withdrawal)
         self._slots.clear()
         self._challenges.clear()
-        return withdrawals
+        return tuple(withdrawals)
 
     def _current(self, token: object):
         role = getattr(token, "role", None)
@@ -145,8 +222,6 @@ class AuthenticatedControlRoleOwner:
     def _next_generation(self) -> int:
         if self._generation >= _I63_MAX:
             self._closed = True
-            self._slots.clear()
-            self._challenges.clear()
             raise CurrentRoleError("role generation exhausted")
         self._generation += 1
         return self._generation

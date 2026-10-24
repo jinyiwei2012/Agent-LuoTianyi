@@ -16,6 +16,7 @@ from typing import Callable
 from uuid import uuid4
 
 from .control_auth import ControlAuthError, PendingHandshakes, b32_decode, b32_encode
+from .control_binding import MinecraftControlBindingCoordinator
 from .current_roles import AuthenticatedControlRoleOwner, CurrentRoleError
 from .postauth_keys import AuthenticatedTranscript, PostAuthKeyError
 from .postauth_session import PostAuthHubSession, PostAuthSessionError, PostAuthSessionState
@@ -51,6 +52,8 @@ class MinecraftV2AuthenticatedTransport:
         utc_now: Callable[[], datetime],
         nonce: Callable[[], bytes] | None = None,
         challenge_id: Callable[[], str] | None = None,
+        role_owner: AuthenticatedControlRoleOwner | None = None,
+        binding_coordinator: MinecraftControlBindingCoordinator | None = None,
     ) -> None:
         if type(peers) is not tuple or not peers or type(hub_install_id) is not str or not hub_install_id:
             raise ValueError("invalid v2 transport provisioning")
@@ -79,8 +82,17 @@ class MinecraftV2AuthenticatedTransport:
         self._utc_clock = utc_now
         self._nonce = nonce
         self._challenge_id = challenge_id
+        contexts = tuple(peer.context for peer in peers)
+        if binding_coordinator is not None and (role_owner is None or binding_coordinator.role_owner is not role_owner):
+            raise ValueError("binding coordinator role owner mismatch")
+        if role_owner is not None and not isinstance(role_owner, AuthenticatedControlRoleOwner):
+            raise ValueError("invalid v2 role owner")
+        selected_owner = role_owner or AuthenticatedControlRoleOwner(contexts, hub_install_id)
+        if not selected_owner.matches_contexts(contexts, hub_install_id):
+            raise ValueError("v2 role owner provisioning mismatch")
         self._pending = PendingHandshakes(maximum=4)
-        self._roles = AuthenticatedControlRoleOwner(tuple(peer.context for peer in peers), hub_install_id)
+        self._roles = selected_owner
+        self._binding = binding_coordinator
         self._unauthenticated: set[str] = set()
         self._attempts = {install: _Bucket(1.0, 2.0) for install in installs}
         self._global_attempts = _Bucket(2.0, 4.0)
@@ -101,6 +113,7 @@ class MinecraftV2AuthenticatedTransport:
         session: PostAuthHubSession | None = None
         keys = None
         send_tasks: set[asyncio.Task] = set()
+        cleanup_tasks: set[asyncio.Task] = set()
         close_requested = asyncio.Event()
         callback_error: list[BaseException] = []
         loop = asyncio.get_running_loop()
@@ -188,7 +201,7 @@ class MinecraftV2AuthenticatedTransport:
             def fence() -> None:
                 nonlocal lease
                 if lease is not None:
-                    self._roles.withdraw(lease)
+                    self._withdraw_role(lease, cleanup_tasks)
                     lease = None
 
             def request_close() -> None:
@@ -270,12 +283,21 @@ class MinecraftV2AuthenticatedTransport:
             elif keys is not None:
                 keys.close()
             if lease is not None:
-                self._roles.withdraw(lease)
+                try:
+                    self._withdraw_role(lease, cleanup_tasks)
+                except BaseException as error:
+                    if fatal is None:
+                        fatal = error
             if reservation is not None:
-                self._roles.withdraw(reservation)
+                try:
+                    self._roles.withdraw(reservation)
+                except BaseException as error:
+                    if fatal is None:
+                        fatal = error
             self._pending.discard(connection_id)
             self._unauthenticated.discard(connection_id)
             cleanup_cancel = await _cancel_and_drain(tuple(send_tasks))
+            cleanup_cancel = cleanup_cancel or await _drain_tasks(tuple(cleanup_tasks))
             await _safe_close(websocket, close_code, close_reason)
             cancellation = cancellation or cleanup_cancel
         if cancellation is not None:
@@ -311,6 +333,22 @@ class MinecraftV2AuthenticatedTransport:
                 cancellation = await _cancel_and_drain((receive,))
                 if cancellation is not None:
                     raise cancellation
+
+    def _withdraw_role(self, lease, cleanup_tasks: set[asyncio.Task]) -> None:
+        def after_remove(withdrawal) -> None:
+            if self._binding is None:
+                return
+            command = self._binding.fence_role_withdrawal(withdrawal)
+            if command is None:
+                return
+            task = asyncio.create_task(
+                self._binding.notify_revoke(command),
+                name="minecraft-v2-binding-revoke",
+            )
+            cleanup_tasks.add(task)
+            task.add_done_callback(cleanup_tasks.discard)
+
+        self._roles.withdraw(lease, after_remove=after_remove)
 
     async def _receive_plain(self, websocket: WebSocketPort, timeout: float) -> dict:
         if timeout <= 0:
@@ -493,6 +531,25 @@ async def _cancel_and_drain(tasks: tuple[asyncio.Task, ...]) -> asyncio.Cancelle
         await asyncio.gather(*tasks, return_exceptions=True)
 
     cleanup = asyncio.create_task(drain(), name="minecraft-v2-task-cleanup")
+    cancellation = None
+    while not cleanup.done():
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError as error:
+            cancellation = cancellation or error
+    cleanup.result()
+    return cancellation
+
+
+async def _drain_tasks(tasks: tuple[asyncio.Task, ...]) -> asyncio.CancelledError | None:
+    tasks = tuple(dict.fromkeys(tasks))
+    if not tasks:
+        return None
+
+    async def drain() -> None:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    cleanup = asyncio.create_task(drain(), name="minecraft-v2-notification-cleanup")
     cancellation = None
     while not cleanup.done():
         try:

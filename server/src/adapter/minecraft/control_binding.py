@@ -15,6 +15,11 @@ from typing import Callable, Protocol
 from uuid import uuid4
 
 from src.adapter.minecraft.control_auth import AuthenticatedHandshake
+from src.adapter.minecraft.current_roles import (
+    AuthenticatedControlRoleOwner,
+    AuthenticatedRoleLease,
+    RoleWithdrawal,
+)
 from src.adapter.minecraft.epoch_store import (
     CommittedEpoch,
     EpochCandidate,
@@ -207,8 +212,8 @@ class _PendingBinding:
     binding: BindingTuple
     candidate: EpochCandidate
     body_bound: VerifiedBodyBound
-    server_connection_id: str
-    controller_connection_id: str
+    server_lease: AuthenticatedRoleLease
+    controller_lease: AuthenticatedRoleLease
     deadline: float
     phase: BindingPhase = BindingPhase.PREPARE
     committed: CommittedEpoch | None = None
@@ -217,8 +222,16 @@ class _PendingBinding:
 @dataclass(frozen=True, slots=True)
 class ActiveBinding:
     binding: BindingTuple
-    server_connection_id: str
-    controller_connection_id: str
+    server_lease: AuthenticatedRoleLease
+    controller_lease: AuthenticatedRoleLease
+
+    @property
+    def server_connection_id(self) -> str:
+        return self.server_lease.connection_id
+
+    @property
+    def controller_connection_id(self) -> str:
+        return self.controller_lease.connection_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,23 +250,28 @@ class MinecraftControlBindingCoordinator:
         self,
         *,
         policy: ControlBindingPolicy,
+        role_owner: AuthenticatedControlRoleOwner,
         epoch_store: EpochStorePort | None,
         commands: ControlCommandPort,
         stage: ObservationStagePort,
         monotonic_now: Callable[[], float],
         utc_now: Callable,
     ) -> None:
+        if not isinstance(role_owner, AuthenticatedControlRoleOwner):
+            raise TypeError("binding requires authenticated role owner")
+        if not role_owner.matches_role_installs({_SERVER: policy.server_install_id, _CLIENT: policy.client_install_id}):
+            raise ValueError("binding policy does not match role owner")
         if stage.character_id != policy.character_id or stage.world_id != policy.world_id:
             raise ValueError("binding policy does not match stage")
         if not callable(monotonic_now) or not callable(utc_now):
             raise TypeError("binding clocks must be callable")
         self._policy = policy
+        self._role_owner = role_owner
         self._store = epoch_store
         self._commands = commands
         self._stage = stage
         self._monotonic_now = monotonic_now
         self._utc_now = utc_now
-        self._roles: dict[str, AuthenticatedRoleConnection] = {}
         self._pending: dict[str, _PendingBinding] = {}
         self._active: ActiveBinding | None = None
         self._ingress: TypedMinecraftObservationIngress | None = None
@@ -277,40 +295,53 @@ class MinecraftControlBindingCoordinator:
     def quarantined(self) -> bool:
         return self._quarantined
 
+    @property
+    def role_owner(self) -> AuthenticatedControlRoleOwner:
+        return self._role_owner
+
     def active_snapshot(self) -> ActiveBindingSnapshot | None:
         """Return one coherent current ACTIVE/server-origin snapshot."""
         active = self._active
-        server = self._roles.get(_SERVER)
-        if active is None or server is None or server.connection_id != active.server_connection_id or self._quarantined:
+        if (
+            active is None
+            or self._quarantined
+            or not self._role_owner.is_current(active.server_lease)
+            or not self._role_owner.is_current(active.controller_lease)
+        ):
             return None
-        return ActiveBindingSnapshot(self._generation, active, server)
+        return ActiveBindingSnapshot(
+            self._generation,
+            active,
+            AuthenticatedRoleConnection(
+                connection_id=active.server_lease.connection_id,
+                handshake=active.server_lease.handshake,
+            ),
+        )
 
-    async def register_authenticated(self, connection: AuthenticatedRoleConnection) -> None:
-        expected = {_SERVER: self._policy.server_install_id, _CLIENT: self._policy.client_install_id}
-        if connection.role not in expected or connection.install_id != expected[connection.role]:
-            raise ControlBindingError("authenticated role is not allowlisted")
-        previous = self._roles.get(connection.role)
-        if previous is not None and previous.connection_id != connection.connection_id:
-            await self._fence("REBIND")
-        self._roles[connection.role] = connection
+    def fence_role_withdrawal(self, withdrawal: RoleWithdrawal, reason: str = "CONTROL_LOST") -> BindingRevoke | None:
+        self._role_owner.assert_owner()
+        if not isinstance(withdrawal, RoleWithdrawal) or reason != "CONTROL_LOST":
+            raise ControlBindingError("invalid role withdrawal")
+        target = self._withdrawal_target(withdrawal)
+        if target is None or not self._role_owner.consume_withdrawal(withdrawal, target):
+            return None
+        return self._fence_local(reason)
 
-    async def disconnect(self, connection_id: str) -> None:
-        removed = False
-        for role, connection in tuple(self._roles.items()):
-            if connection.connection_id == connection_id:
-                self._roles.pop(role, None)
-                removed = True
-        if removed:
-            await self._fence("CONTROL_LOST")
+    async def notify_revoke(self, command: BindingRevoke | None) -> None:
+        await self._best_effort_revoke(command)
 
-    async def prepare(
+    async def prepare(  # noqa: C901
         self,
         server: AuthenticatedRoleConnection,
         body_bound: VerifiedBodyBound,
     ) -> BindingPrepare:
         now = await self._begin_operation()
-        self._require_current(server, _SERVER)
-        controller = self._roles.get(_CLIENT)
+        server_lease = self._require_current(server, _SERVER)
+        controller_lease = self._role_owner.current(_CLIENT)
+        controller = self._connection_from_lease(controller_lease)
+        operation_generation = self._generation
+        operation_active = self._active
+        operation_pending = tuple(self._pending.values())
         if (
             controller is None
             or body_bound.body_id != self._policy.body_id
@@ -322,8 +353,9 @@ class MinecraftControlBindingCoordinator:
             if (
                 pending.phase is BindingPhase.PREPARE
                 and pending.body_bound == body_bound
-                and pending.server_connection_id == server.connection_id
-                and pending.controller_connection_id == controller.connection_id
+                and pending.server_lease is server_lease
+                and pending.controller_lease is controller_lease
+                and self._guard_current(pending, BindingPhase.PREPARE)
             ):
                 return BindingPrepare(binding=pending.binding)
         if self._quarantined or self._store is None:
@@ -333,8 +365,22 @@ class MinecraftControlBindingCoordinator:
         try:
             candidate = self._store.read_candidate()
         except Exception as error:
-            self._quarantined = True
+            self._fence_prepare_operation(
+                operation_generation,
+                operation_active,
+                operation_pending,
+                server_lease,
+                controller_lease,
+            )
             raise ControlBindingError("epoch candidate is unavailable") from error
+        if not self._prepare_operation_current(
+            operation_generation,
+            operation_active,
+            operation_pending,
+            server_lease,
+            controller_lease,
+        ):
+            raise ControlBindingError("binding origin changed during candidate read")
         if candidate.body_id != self._policy.body_id or candidate.provision_id != self._policy.provision_id:
             self._quarantined = True
             raise ControlBindingError("epoch candidate identity mismatch")
@@ -351,8 +397,8 @@ class MinecraftControlBindingCoordinator:
             binding=binding,
             candidate=candidate,
             body_bound=body_bound,
-            server_connection_id=server.connection_id,
-            controller_connection_id=controller.connection_id,
+            server_lease=server_lease,
+            controller_lease=controller_lease,
             deadline=now + _LIFETIME_SECONDS,
         )
         self._pending[binding.session_id] = pending
@@ -360,11 +406,12 @@ class MinecraftControlBindingCoordinator:
         try:
             await self._commands.send(command)
         except asyncio.CancelledError as cancellation:
-            await self._cancelled_fence("QUARANTINE", cancellation)
+            await self._cancelled_pending_fence(pending, "QUARANTINE", cancellation)
         except Exception as error:
-            self._pending.pop(binding.session_id, None)
-            await self._fence("QUARANTINE")
+            await self._fence_pending(pending, "QUARANTINE")
             raise ControlBindingError("prepare delivery is uncertain") from error
+        if not self._guard_current(pending, BindingPhase.PREPARE):
+            raise ControlBindingError("prepare delivery completed after authority changed")
         return command
 
     async def ready(
@@ -376,6 +423,8 @@ class MinecraftControlBindingCoordinator:
         pending = self._pending.get(ready.binding.session_id)
         if pending is not None and pending.binding == ready.binding and pending.phase is BindingPhase.COMMIT:
             self._require_current(server, _SERVER)
+            if not self._guard_current(pending, BindingPhase.COMMIT):
+                raise ControlBindingError("commit is no longer current")
             return BindingCommit(binding=pending.binding)
         pending = self._matching_pending(server, ready.binding, BindingPhase.PREPARE)
         try:
@@ -391,19 +440,22 @@ class MinecraftControlBindingCoordinator:
                 ),
             )
         except Exception as error:
-            self._pending.pop(pending.binding.session_id, None)
-            await self._fence("QUARANTINE")
+            await self._fence_pending(pending, "QUARANTINE")
             raise ControlBindingError("epoch commit failed") from error
+        if not self._guard_current(pending, BindingPhase.PREPARE):
+            raise ControlBindingError("epoch commit completed after authority changed")
         pending.phase = BindingPhase.COMMIT
         pending.committed = committed
         command = BindingCommit(binding=pending.binding)
         try:
             await self._commands.send(command)
         except asyncio.CancelledError as cancellation:
-            await self._cancelled_fence("QUARANTINE", cancellation)
+            await self._cancelled_pending_fence(pending, "QUARANTINE", cancellation)
         except Exception as error:
-            await self._fence("QUARANTINE")
+            await self._fence_pending(pending, "QUARANTINE")
             raise ControlBindingError("commit delivery is uncertain") from error
+        if not self._guard_current(pending, BindingPhase.COMMIT):
+            raise ControlBindingError("commit delivery completed after authority changed")
         return command
 
     async def activate(
@@ -414,16 +466,16 @@ class MinecraftControlBindingCoordinator:
         await self._begin_operation()
         if self._active is not None and self._active.binding == active.binding:
             self._require_current(server, _SERVER)
-            if self._ingress is None:
+            if self._ingress is None or self.active_snapshot() is None:
                 raise ControlBindingError("active ingress is unavailable")
             return self._ingress
         pending = self._matching_pending(server, active.binding, BindingPhase.COMMIT)
-        controller = self._roles.get(_CLIENT)
+        controller = self._connection_from_lease(pending.controller_lease)
         if (
             pending.committed is None
             or pending.committed.last_epoch != pending.binding.session_epoch
             or controller is None
-            or controller.connection_id != pending.controller_connection_id
+            or controller.connection_id != pending.controller_lease.connection_id
         ):
             await self._fence("QUARANTINE")
             raise ControlBindingError("active evidence does not match durable candidate")
@@ -437,11 +489,14 @@ class MinecraftControlBindingCoordinator:
             character_id=self._policy.character_id,
         )
         self._stage.bind_minecraft_observations(observation.observation_scope)
+        if not self._guard_current(pending, BindingPhase.COMMIT):
+            self._stage.unbind_minecraft_observations(observation.observation_scope)
+            raise ControlBindingError("active binding changed during stage bind")
         ingress = TypedMinecraftObservationIngress(binding=observation, target=self._stage, now=self._utc_now)
         self._active = ActiveBinding(
             pending.binding,
-            pending.server_connection_id,
-            pending.controller_connection_id,
+            pending.server_lease,
+            pending.controller_lease,
         )
         pending.phase = BindingPhase.ACTIVE
         self._pending.pop(pending.binding.session_id, None)
@@ -486,14 +541,84 @@ class MinecraftControlBindingCoordinator:
             pending is None
             or pending.binding != binding
             or pending.phase is not phase
-            or pending.server_connection_id != server.connection_id
+            or pending.server_lease.connection_id != server.connection_id
+            or not self._guard_current(pending, phase)
         ):
             raise ControlBindingError("binding evidence does not match pending state")
         return pending
 
-    def _require_current(self, connection: AuthenticatedRoleConnection, role: str) -> None:
-        if connection.role != role or self._roles.get(role) != connection:
+    def _require_current(self, connection: AuthenticatedRoleConnection, role: str) -> AuthenticatedRoleLease:
+        lease = self._role_owner.current(role)
+        expected_install = self._policy.server_install_id if role == _SERVER else self._policy.client_install_id
+        if (
+            connection.role != role
+            or connection.install_id != expected_install
+            or lease is None
+            or lease.connection_id != connection.connection_id
+            or lease.handshake is not connection.handshake
+            or not self._role_owner.is_current(lease)
+        ):
             raise ControlBindingError("authenticated origin is not current")
+        return lease
+
+    @staticmethod
+    def _connection_from_lease(lease: AuthenticatedRoleLease | None) -> AuthenticatedRoleConnection | None:
+        if lease is None:
+            return None
+        return AuthenticatedRoleConnection(connection_id=lease.connection_id, handshake=lease.handshake)
+
+    def _leases_current(self, server: AuthenticatedRoleLease, controller: AuthenticatedRoleLease) -> bool:
+        return self._role_owner.is_current(server) and self._role_owner.is_current(controller)
+
+    def _withdrawal_target(self, withdrawal: RoleWithdrawal) -> AuthenticatedRoleLease | None:
+        candidates = []
+        if self._active is not None:
+            candidates.extend((self._active.server_lease, self._active.controller_lease))
+        for pending in self._pending.values():
+            candidates.extend((pending.server_lease, pending.controller_lease))
+        for lease in candidates:
+            if (
+                withdrawal.role == lease.role
+                and withdrawal.connection_id == lease.connection_id
+                and withdrawal.generation == lease.generation
+            ):
+                return lease
+        return None
+
+    def _fence_prepare_operation(
+        self,
+        generation: int,
+        active: ActiveBinding | None,
+        pending: tuple[_PendingBinding, ...],
+        server: AuthenticatedRoleLease,
+        controller: AuthenticatedRoleLease,
+    ) -> None:
+        if self._prepare_operation_current(generation, active, pending, server, controller):
+            self._fence_local("QUARANTINE")
+
+    def _prepare_operation_current(
+        self,
+        generation: int,
+        active: ActiveBinding | None,
+        pending: tuple[_PendingBinding, ...],
+        server: AuthenticatedRoleLease,
+        controller: AuthenticatedRoleLease,
+    ) -> bool:
+        actual_pending = tuple(self._pending.values())
+        return (
+            self._generation == generation
+            and self._active is active
+            and len(actual_pending) == len(pending)
+            and all(actual is captured for actual, captured in zip(actual_pending, pending))
+            and self._leases_current(server, controller)
+        )
+
+    def _guard_current(self, pending: _PendingBinding, phase: BindingPhase) -> bool:
+        return (
+            self._pending.get(pending.binding.session_id) is pending
+            and pending.phase is phase
+            and self._leases_current(pending.server_lease, pending.controller_lease)
+        )
 
     async def _fence(self, reason: str) -> None:
         command = self._fence_local(reason)
@@ -504,11 +629,26 @@ class MinecraftControlBindingCoordinator:
         await self._best_effort_revoke(command)
         raise cancellation
 
+    async def _fence_pending(self, pending: _PendingBinding, reason: str) -> None:
+        if self._pending.get(pending.binding.session_id) is not pending:
+            return
+        await self._fence(reason)
+
+    async def _cancelled_pending_fence(
+        self,
+        pending: _PendingBinding,
+        reason: str,
+        cancellation: asyncio.CancelledError,
+    ) -> None:
+        await self._fence_pending(pending, reason)
+        raise cancellation
+
     def _fence_local(self, reason: str) -> BindingRevoke | None:
         """Synchronously remove all local authority before any cleanup await."""
         binding = self._active.binding if self._active is not None else None
         if binding is None and self._pending:
             binding = next(iter(self._pending.values())).binding
+        observation = None
         if self._active is not None:
             observation = MinecraftObservationBinding(
                 actor_id=self._active.binding.actor_id,
@@ -519,12 +659,13 @@ class MinecraftControlBindingCoordinator:
                 server_boot_id=self._active.binding.server_boot_id,
                 character_id=self._policy.character_id,
             )
-            self._stage.unbind_minecraft_observations(observation.observation_scope)
         self._active = None
         self._ingress = None
         self._pending.clear()
         self._quarantined = True
         self._generation += 1
+        if observation is not None:
+            self._stage.unbind_minecraft_observations(observation.observation_scope)
         return None if binding is None else BindingRevoke(binding=binding, reason=reason)
 
     async def _best_effort_revoke(self, command: BindingRevoke | None) -> None:

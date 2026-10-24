@@ -1,9 +1,10 @@
 ﻿import asyncio
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
 
-from src.adapter.minecraft.control_auth import AuthenticatedHandshake, ControlAuthContext
+from src.adapter.minecraft.control_auth import ControlAuthContext, PendingHandshakes, compute_proof
 from src.adapter.minecraft.control_binding import (
     AuthenticatedRoleConnection,
     BindingCommit,
@@ -15,6 +16,7 @@ from src.adapter.minecraft.control_binding import (
     VerifiedBindingReady,
     VerifiedBodyBound,
 )
+from src.adapter.minecraft.current_roles import AuthenticatedControlRoleOwner, RoleWithdrawal
 from src.adapter.minecraft.epoch_store import CommittedEpoch, EpochCandidate
 
 
@@ -81,6 +83,29 @@ class Store:
         return CommittedEpoch(PROVISION, BODY, self.last_epoch, self.generation)
 
 
+class ReentrantStore(Store):
+    def __init__(self):
+        super().__init__()
+        self.on_read = None
+        self.on_commit = None
+        self.fail_read = False
+        self.read_result = None
+
+    def read_candidate(self):
+        candidate = self.read_result or super().read_candidate()
+        if self.on_read is not None:
+            self.on_read()
+        if self.fail_read:
+            raise RuntimeError("read failed")
+        return candidate
+
+    def commit_ready(self, candidate, ready):
+        committed = super().commit_ready(candidate, ready)
+        if self.on_commit is not None:
+            self.on_commit()
+        return committed
+
+
 class Stage:
     character_id = "luotianyi"
     world_id = "world"
@@ -99,14 +124,44 @@ class Stage:
         return scope == self.minecraft_observation_scope
 
 
+class RaisingUnbindStage(Stage):
+    def __init__(self, *, clear_first):
+        self.minecraft_observation_scope = None
+        self.clear_first = clear_first
+        self.observed = None
+        self.coordinator = None
+
+    def unbind_minecraft_observations(self, scope):
+        self.observed = (
+            self.coordinator.active,
+            self.coordinator.ingress,
+            self.coordinator.pending_count,
+            self.coordinator.quarantined,
+            self.coordinator.active_snapshot(),
+            self.coordinator._generation,
+        )
+        if self.clear_first:
+            self.minecraft_observation_scope = None
+        raise RuntimeError("unbind failed")
+
+
 PROVISION = "10000000-0000-0000-0000-000000000001"
 BODY = "20000000-0000-0000-0000-000000000002"
 GAME = "30000000-0000-0000-0000-000000000003"
 BOOT = "40000000-0000-0000-0000-000000000004"
+SERVER_CONNECTION = "60000000-0000-4000-8000-000000000006"
+CLIENT_CONNECTION = "70000000-0000-4000-8000-000000000007"
 
 
-def auth(role, install, connection):
-    context = ControlAuthContext(
+def auth(
+    role,
+    install,
+    connection,
+    *,
+    challenge="50000000-0000-4000-8000-000000000005",
+    selected_context=None,
+):
+    context = selected_context or ControlAuthContext(
         peer_role=role,
         peer_install_id=install,
         hub_install_id="hub",
@@ -116,15 +171,41 @@ def auth(role, install, connection):
         config_hash=b"c" * 32,
         binding_hash=b"b" * 32,
     )
-    handshake = AuthenticatedHandshake(
-        context=context,
-        challenge_id="50000000-0000-0000-0000-000000000005",
-        ready_proof="proof",
+    now = datetime(2026, 10, 23, tzinfo=timezone.utc)
+    pending = PendingHandshakes()
+    item = pending.begin(
+        connection,
+        context,
+        b"p" * 32,
+        now,
+        hub_nonce=b"h" * 32,
+        challenge_id=challenge,
+        now=0,
+        utc_now=now,
+    )
+    proof = compute_proof(
+        b"k" * 32,
+        "PEER_PROOF",
+        context,
+        item.peer_nonce,
+        item.hub_nonce,
+        item.challenge_id,
+        item.issued_at,
+        item.expires_at,
+    )
+    handshake = pending.consume(
+        connection,
+        challenge,
+        proof,
+        b"k" * 32,
+        expected_context=context,
+        now=1,
+        utc_now=now,
     )
     return AuthenticatedRoleConnection(connection_id=connection, handshake=handshake)
 
 
-def body_bound(controller="client-conn"):
+def body_bound(controller=CLIENT_CONNECTION):
     return VerifiedBodyBound(
         server_boot_id=BOOT,
         game_connection_id=GAME,
@@ -135,7 +216,7 @@ def body_bound(controller="client-conn"):
     )
 
 
-def coordinator(*, store=None, commands=None, stage=None, clock=None):
+def coordinator(*, role_owner, store=None, commands=None, stage=None, clock=None):
     return MinecraftControlBindingCoordinator(
         policy=ControlBindingPolicy(
             actor_id="actor",
@@ -146,6 +227,7 @@ def coordinator(*, store=None, commands=None, stage=None, clock=None):
             server_install_id="server-install",
             client_install_id="client-install",
         ),
+        role_owner=role_owner,
         epoch_store=store,
         commands=commands or Commands(),
         stage=stage or Stage(),
@@ -155,12 +237,15 @@ def coordinator(*, store=None, commands=None, stage=None, clock=None):
 
 
 async def registered(*, store=None, commands=None, stage=None, clock=None):
-    owner = coordinator(store=store, commands=commands, stage=stage, clock=clock)
-    server = auth("SERVER_AUTHORITY", "server-install", "server-conn")
-    client = auth("CLIENT_CONTROLLER", "client-install", "client-conn")
-    await owner.register_authenticated(server)
-    await owner.register_authenticated(client)
-    return owner, server, client
+    server = auth("SERVER_AUTHORITY", "server-install", SERVER_CONNECTION)
+    client = auth("CLIENT_CONTROLLER", "client-install", CLIENT_CONNECTION)
+    role_owner = AuthenticatedControlRoleOwner((server.handshake.context, client.handshake.context), "hub")
+    for connection in (server, client):
+        reservation = role_owner.reserve(connection.handshake.context, connection.connection_id)
+        role_owner.bind_challenge(reservation, connection.handshake.challenge_id)
+        role_owner.promote(reservation, connection.handshake)
+    binding = coordinator(role_owner=role_owner, store=store, commands=commands, stage=stage, clock=clock)
+    return binding, server, client
 
 
 @pytest.mark.asyncio
@@ -207,9 +292,7 @@ async def test_wrong_roles_installs_connections_and_body_tuple_fail_closed_befor
     with pytest.raises(ControlBindingError):
         await owner.prepare(impostor, body_bound())
     with pytest.raises(ControlBindingError):
-        await owner.prepare(server, body_bound(controller="wrong-connection"))
-    with pytest.raises(ControlBindingError):
-        await owner.register_authenticated(auth("SERVER_AUTHORITY", "wrong-install", "wrong"))
+        await owner.prepare(server, body_bound(controller="80000000-0000-4000-8000-000000000008"))
     assert store.commit_calls == 0
 
 
@@ -268,18 +351,219 @@ async def test_commit_send_failure_consumes_epoch_and_fences_without_duplicate_w
 
 
 @pytest.mark.asyncio
-async def test_controller_replacement_and_disconnect_revoke_active_and_old_cannot_revive():
+async def test_controller_withdrawal_revokes_active_and_old_cannot_revive():
     store, commands, stage = Store(), Commands(), Stage()
     owner, server, client = await registered(store=store, commands=commands, stage=stage)
     prepare = await owner.prepare(server, body_bound())
     await owner.ready(server, VerifiedBindingReady(binding=prepare.binding, evidence_id="ready"))
     await owner.activate(server, VerifiedBindingActive(binding=prepare.binding, evidence_id="active"))
-    await owner.register_authenticated(auth("CLIENT_CONTROLLER", "client-install", "client-new"))
+    role_owner = owner.role_owner
+    lease = role_owner.current("CLIENT_CONTROLLER")
+    withdrawal = role_owner.withdraw(lease)
+    command = owner.fence_role_withdrawal(withdrawal)
+    assert owner.active is None and owner.ingress is None and owner.pending_count == 0
+    assert stage.minecraft_observation_scope is None and owner.quarantined
+    assert not commands.revoked
+    await owner.notify_revoke(command)
     assert owner.active is None and stage.minecraft_observation_scope is None and commands.revoked
     with pytest.raises(ControlBindingError):
         await owner.activate(server, VerifiedBindingActive(binding=prepare.binding, evidence_id="late"))
-    await owner.disconnect(client.connection_id)
+    assert role_owner.withdraw(lease) is None
     assert owner.quarantined
+
+
+@pytest.mark.asyncio
+async def test_stale_unrelated_withdrawal_cannot_fence_replacement_generation():
+    store, commands, stage = Store(), Commands(), Stage()
+    owner, server, _ = await registered(store=store, commands=commands, stage=stage)
+    prepare = await owner.prepare(server, body_bound())
+    await owner.ready(server, VerifiedBindingReady(binding=prepare.binding, evidence_id="ready"))
+    await owner.activate(server, VerifiedBindingActive(binding=prepare.binding, evidence_id="active"))
+    stale = RoleWithdrawal("CLIENT_CONTROLLER", "80000000-0000-4000-8000-000000000008", 1)
+    assert owner.fence_role_withdrawal(stale) is None
+    assert owner.active is not None and stage.minecraft_observation_scope is not None
+
+
+@pytest.mark.asyncio
+async def test_forged_same_payload_and_copied_withdrawal_cannot_fence():
+    import copy
+
+    store, commands, stage = Store(), Commands(), Stage()
+    owner, server, _ = await registered(store=store, commands=commands, stage=stage)
+    prepare = await owner.prepare(server, body_bound())
+    await owner.ready(server, VerifiedBindingReady(binding=prepare.binding, evidence_id="ready"))
+    await owner.activate(server, VerifiedBindingActive(binding=prepare.binding, evidence_id="active"))
+    lease = owner.role_owner.current("CLIENT_CONTROLLER")
+    forged = RoleWithdrawal(lease.role, lease.connection_id, lease.generation)
+    assert owner.fence_role_withdrawal(forged) is None
+    withdrawal = owner.role_owner.withdraw(lease)
+    copied = copy.copy(withdrawal)
+    assert owner.fence_role_withdrawal(copied) is None
+    command = owner.fence_role_withdrawal(withdrawal)
+    assert command is not None and owner.active is None
+    assert owner.fence_role_withdrawal(withdrawal) is None
+
+
+@pytest.mark.asyncio
+async def test_prepare_send_withdrawal_cannot_return_stale_success():
+    store, commands, stage = Store(), BlockingCommands(), Stage()
+    owner, server, _ = await registered(store=store, commands=commands, stage=stage)
+    task = asyncio.create_task(owner.prepare(server, body_bound()))
+    await commands.send_entered.wait()
+    lease = owner.role_owner.current("CLIENT_CONTROLLER")
+    withdrawal = owner.role_owner.withdraw(lease)
+    command = owner.fence_role_withdrawal(withdrawal)
+    commands.send_release.set()
+    with pytest.raises(ControlBindingError, match="authority changed"):
+        await task
+    assert owner.pending_count == 0 and owner.active is None and owner.quarantined
+    await owner.notify_revoke(command)
+
+
+@pytest.mark.asyncio
+async def test_reentrant_candidate_read_withdrawal_never_publishes_pending():
+    store = ReentrantStore()
+    owner, server, _ = await registered(store=store)
+    command = None
+
+    def withdraw():
+        nonlocal command
+        lease = owner.role_owner.current("CLIENT_CONTROLLER")
+        command = owner.fence_role_withdrawal(owner.role_owner.withdraw(lease))
+
+    store.on_read = withdraw
+    with pytest.raises(ControlBindingError, match="candidate read"):
+        await owner.prepare(server, body_bound())
+    assert owner.pending_count == 0 and owner.active is None and not owner.quarantined
+    await owner.notify_revoke(command)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read_error", (False, True))
+async def test_stale_candidate_read_cannot_clear_same_connection_new_generation(read_error):
+    store = ReentrantStore()
+    owner, server, client = await registered(store=store)
+    existing = await owner.prepare(server, body_bound())
+    old_pending = owner._pending[existing.binding.session_id]
+    old_client = owner.role_owner.current("CLIENT_CONTROLLER")
+    replacement_challenge = "90000000-0000-4000-8000-000000000009"
+
+    def replace_generation():
+        owner.role_owner.withdraw(old_client)
+        reservation = owner.role_owner.reserve(client.handshake.context, client.connection_id)
+        owner.role_owner.bind_challenge(reservation, replacement_challenge)
+        replacement = auth(
+            "CLIENT_CONTROLLER",
+            "client-install",
+            client.connection_id,
+            challenge=replacement_challenge,
+            selected_context=client.handshake.context,
+        )
+        new_client = owner.role_owner.promote(reservation, replacement.handshake)
+        replacement_pending = replace(old_pending, controller_lease=new_client)
+        owner._pending = {replacement_pending.binding.session_id: replacement_pending}
+        owner._generation += 1
+
+    store.on_read = replace_generation
+    store.fail_read = read_error
+    changed = body_bound()
+    object.__setattr__(changed, "evidence_id", "different-evidence")
+    with pytest.raises(ControlBindingError):
+        await owner.prepare(server, changed)
+    assert owner._pending[existing.binding.session_id] is not old_pending
+    assert owner.pending_count == 1 and not owner.quarantined
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read_error", (False, True))
+@pytest.mark.parametrize("mutation", ("generation", "pending"))
+async def test_candidate_read_state_change_with_same_current_leases_preserves_replacement(read_error, mutation):
+    store, commands = ReentrantStore(), Commands()
+    owner, server, _ = await registered(store=store, commands=commands)
+    existing = await owner.prepare(server, body_bound())
+    captured_pending = owner._pending[existing.binding.session_id]
+    server_lease = owner.role_owner.current("SERVER_AUTHORITY")
+    controller_lease = owner.role_owner.current("CLIENT_CONTROLLER")
+    replacement = None
+
+    def change_state():
+        nonlocal replacement
+        assert owner.role_owner.current("SERVER_AUTHORITY") is server_lease
+        assert owner.role_owner.current("CLIENT_CONTROLLER") is controller_lease
+        if mutation == "generation":
+            owner._generation += 1
+        else:
+            replacement = replace(captured_pending)
+            owner._pending = {replacement.binding.session_id: replacement}
+
+    store.on_read = change_state
+    store.fail_read = read_error
+    if not read_error:
+        store.read_result = EpochCandidate(
+            "90000000-0000-4000-8000-000000000009",
+            BODY,
+            0,
+            0,
+            1,
+        )
+    changed = body_bound()
+    object.__setattr__(changed, "evidence_id", "different-evidence")
+    with pytest.raises(ControlBindingError):
+        await owner.prepare(server, changed)
+    assert owner.role_owner.current("SERVER_AUTHORITY") is server_lease
+    assert owner.role_owner.current("CLIENT_CONTROLLER") is controller_lease
+    if mutation == "generation":
+        assert owner._pending[existing.binding.session_id] is captured_pending
+        assert owner._generation == 1
+    else:
+        assert owner._pending[existing.binding.session_id] is replacement
+        assert owner._generation == 0
+    assert owner.pending_count == 1 and not owner.quarantined
+    assert len(commands.sent) == 1 and store.last_epoch == 0
+
+
+@pytest.mark.asyncio
+async def test_reentrant_commit_withdrawal_consumes_epoch_but_never_sends_commit():
+    store, commands = ReentrantStore(), Commands()
+    owner, server, _ = await registered(store=store, commands=commands)
+    prepare = await owner.prepare(server, body_bound())
+    command = None
+
+    def withdraw():
+        nonlocal command
+        lease = owner.role_owner.current("CLIENT_CONTROLLER")
+        command = owner.fence_role_withdrawal(owner.role_owner.withdraw(lease))
+
+    store.on_commit = withdraw
+    with pytest.raises(ControlBindingError, match="epoch commit completed"):
+        await owner.ready(server, VerifiedBindingReady(binding=prepare.binding, evidence_id="ready"))
+    assert store.last_epoch == 1 and len(commands.sent) == 1
+    assert owner.pending_count == 0 and owner.active is None and owner.quarantined
+    await owner.notify_revoke(command)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("clear_first", (False, True))
+async def test_active_unbind_failure_observes_local_authority_already_cleared(clear_first):
+    store, commands = Store(), Commands()
+    stage = RaisingUnbindStage(clear_first=clear_first)
+    owner, server, _ = await registered(store=store, commands=commands, stage=stage)
+    stage.coordinator = owner
+    prepare = await owner.prepare(server, body_bound())
+    await owner.ready(server, VerifiedBindingReady(binding=prepare.binding, evidence_id="ready"))
+    await owner.activate(server, VerifiedBindingActive(binding=prepare.binding, evidence_id="active"))
+    generation = owner._generation
+    lease = owner.role_owner.current("CLIENT_CONTROLLER")
+    withdrawal = owner.role_owner.withdraw(lease)
+    with pytest.raises(RuntimeError, match="unbind failed"):
+        owner.fence_role_withdrawal(withdrawal)
+    assert stage.observed == (None, None, 0, True, None, generation + 1)
+    assert owner.active is None and owner.ingress is None and owner.pending_count == 0
+    assert owner.quarantined and owner.active_snapshot() is None
+    if clear_first:
+        assert stage.minecraft_observation_scope is None
+    else:
+        assert stage.minecraft_observation_scope is not None
 
 
 @pytest.mark.asyncio

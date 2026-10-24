@@ -38,6 +38,19 @@ def _install_controlled_packages() -> None:
         module.__package__ = name
         sys.modules[name] = module
 
+    domain = types.ModuleType("src.domain")
+    domain.__path__ = []
+    domain.__package__ = "src.domain"
+    sys.modules["src.domain"] = domain
+    domain_agent = types.ModuleType("src.domain.agent")
+    domain_agent.__package__ = "src.domain.agent"
+    sys.modules["src.domain.agent"] = domain_agent
+    domain.agent = domain_agent
+    stage = types.ModuleType("src.stage")
+    stage.__package__ = "src.stage"
+    stage.WorldFactSink = object
+    sys.modules["src.stage"] = stage
+
 
 _install_controlled_packages()
 control_auth = importlib.import_module("src.adapter.minecraft.control_auth")
@@ -51,6 +64,10 @@ postauth_frame = importlib.import_module("src.adapter.minecraft.postauth_frame")
 postauth_keys = importlib.import_module("src.adapter.minecraft.postauth_keys")
 postauth_session = importlib.import_module("src.adapter.minecraft.postauth_session")
 transport_module = importlib.import_module("src.adapter.minecraft.transport")
+wire = importlib.import_module("src.adapter.minecraft.wire")
+typed_ingress = importlib.import_module("src.adapter.minecraft.typed_ingress")
+epoch_store = importlib.import_module("src.adapter.minecraft.epoch_store")
+control_binding = importlib.import_module("src.adapter.minecraft.control_binding")
 v2_startup = importlib.import_module("src.adapter.minecraft.v2_startup")
 v2_transport = importlib.import_module("src.adapter.minecraft.v2_transport")
 
@@ -83,6 +100,10 @@ _MODULES = {
     "python:src/adapter/minecraft/postauth_frame.py": postauth_frame,
     "python:src/adapter/minecraft/postauth_session.py": postauth_session,
     "python:src/adapter/minecraft/transport.py": transport_module,
+    "python:src/adapter/minecraft/wire.py": wire,
+    "python:src/adapter/minecraft/typed_ingress.py": typed_ingress,
+    "python:src/adapter/minecraft/epoch_store.py": epoch_store,
+    "python:src/adapter/minecraft/control_binding.py": control_binding,
     "python:src/adapter/minecraft/v2_transport.py": v2_transport,
 }
 

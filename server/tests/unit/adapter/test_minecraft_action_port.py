@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import src.adapter.minecraft.action_port as action_port_module
 from src.adapter.minecraft.action_ledger import MinecraftActionLedger, TrustedServerOrigin
 from src.adapter.minecraft.action_port import ActiveActionContext, OfflineMinecraftActionPort, TrustedActionObservation
 from src.adapter.minecraft.control_auth import AuthenticatedHandshake, ControlAuthContext
@@ -62,6 +63,38 @@ class MonoClock:
 
     def __call__(self):
         return self.value
+
+
+class FrozenDeadlineLoop:
+    """Delegate loop operations while keeping only the port's deadline clock fixed."""
+
+    def __init__(self, loop, value=100.0):
+        self._loop = loop
+        self.value = value
+
+    def time(self):
+        return self.value
+
+    def __getattr__(self, name):
+        return getattr(self._loop, name)
+
+
+class FrozenDeadlineAsyncio:
+    """Narrow action-port asyncio facade; pytest and real scheduling stay untouched."""
+
+    def __init__(self, loop):
+        self._loop = FrozenDeadlineLoop(loop)
+
+    def get_running_loop(self):
+        return self._loop
+
+    async def wait(self, futures, *, timeout=None, return_when=asyncio.ALL_COMPLETED):
+        # The frozen deadline cannot elapse, so a real-loop timeout would be a
+        # contradictory second clock. The outer test wait_for remains the hang bound.
+        return await asyncio.wait(futures, return_when=return_when)
+
+    def __getattr__(self, name):
+        return getattr(asyncio, name)
 
 
 def origin(connection="server-conn"):
@@ -450,14 +483,26 @@ async def test_send_and_admission_share_one_monotonic_budget():
 
 
 @pytest.mark.asyncio
-async def test_correlations_follow_ledger_retention_and_expired_stop_declines_without_send():
+async def test_correlations_follow_ledger_retention_and_expired_stop_declines_without_send(monkeypatch):
     clock = MonoClock()
     port, ledger, sender, holder = make_port(timeout=0.01, monotonic=clock)
+    monkeypatch.setattr(
+        action_port_module,
+        "asyncio",
+        FrozenDeadlineAsyncio(asyncio.get_running_loop()),
+    )
+    authoritative_responses = 0
     for cycle in range(3):
         for index in range(32):
             local_id = f"cycle-{cycle}-{index}"
 
             async def reject(envelope, response_index=index):
+                nonlocal authoritative_responses
+                if cycle == 0 and response_index == 0:
+                    # Exceed the production 10 ms wall-clock budget deliberately.
+                    # Only this retention test pins the port's deadline view, while
+                    # the real event loop still schedules send and response tasks.
+                    await asyncio.sleep(0.02)
                 port.receive_authoritative(
                     authoritative(
                         "admission",
@@ -467,9 +512,13 @@ async def test_correlations_follow_ledger_retention_and_expired_stop_declines_wi
                     ),
                     origin=holder["value"].server_origin,
                 )
+                authoritative_responses += 1
 
             sender.on_send = reject
-            result = await port.submit(request(MinecraftIntent.QUERY, local_id))
+            result = await asyncio.wait_for(
+                port.submit(request(MinecraftIntent.QUERY, local_id)),
+                timeout=5,
+            )
             assert result.admission is MinecraftPortAdmission.DECLINED
         assert port.correlation_count == ledger.action_count == 32
         old_local_id = f"cycle-{cycle}-0"
@@ -484,6 +533,7 @@ async def test_correlations_follow_ledger_retention_and_expired_stop_declines_wi
         )
         assert (await port.cancel(stop)).admission is MinecraftPortAdmission.DECLINED
         assert len(sender.sent) == sent_before
+    assert authoritative_responses == 96
 
 
 @pytest.mark.asyncio
