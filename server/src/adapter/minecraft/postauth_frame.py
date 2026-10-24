@@ -95,7 +95,7 @@ def parse_frame(raw: bytes, context: TrustedFrameContext, keys: PostAuthSessionK
         values = json.loads(text, object_pairs_hook=_object, parse_constant=_constant)
     except (UnicodeDecodeError, json.JSONDecodeError, PostAuthFrameError) as error:
         raise PostAuthFrameError("invalid frame JSON") from error
-    if type(values) is not dict or tuple(values) != _KEYS:
+    if type(values) is not dict or set(values) != set(_KEYS):
         raise PostAuthFrameError("invalid frame keys")
     if (
         values["security"] != "luosandbox.control-auth.v1"

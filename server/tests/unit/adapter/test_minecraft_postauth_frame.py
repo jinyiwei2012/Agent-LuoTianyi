@@ -18,6 +18,22 @@ CONNECTION = "00000000-0000-4000-8000-000000000002"
 OTHER = "00000000-0000-4000-8000-000000000003"
 ROUTE = "00000000-0000-4000-8000-000000000004"
 BODY = "00000000-0000-4000-8000-000000000005"
+OUTER_KEYS = (
+    "security",
+    "kind",
+    "profile",
+    "connectionId",
+    "challengeId",
+    "sequence",
+    "messageKind",
+    "routeId",
+    "sourceInstallId",
+    "sourceConnectionId",
+    "recipientConnectionId",
+    "challengeExpiresAt",
+    "payload",
+    "mac",
+)
 
 
 def codec(role: str = "CLIENT_CONTROLLER", connection: str | None = CONNECTION):
@@ -105,6 +121,94 @@ def test_all_five_kinds_round_trip_exact_semantics(kind: str, role: str, directi
     item = frame(kind)
     raw = encode_frame(item, trusted, keys, direction)
     assert parse_frame(raw, trusted, keys, direction) == item
+
+
+@pytest.mark.parametrize("outer_form", ("reversed", "mac_first_sequence_last", "whitespace"))
+@pytest.mark.parametrize(
+    "kind,role,direction",
+    (
+        ("SESSION_OPEN", "CLIENT_CONTROLLER", "HUB_TO_PEER"),
+        ("HEARTBEAT", "CLIENT_CONTROLLER", "PEER_TO_HUB"),
+        ("BODY_BIND_NOTICE", "CLIENT_CONTROLLER", "PEER_TO_HUB"),
+        ("BODY_BIND_ROUTE", "SERVER_AUTHORITY", "HUB_TO_PEER"),
+        ("BODY_BOUND_CANDIDATE", "SERVER_AUTHORITY", "PEER_TO_HUB"),
+    ),
+)
+def test_outer_order_and_whitespace_preserve_authenticated_frame(kind: str, role: str, direction: str, outer_form: str):
+    from src.adapter.minecraft import postauth_frame
+
+    trusted, keys = codec(role, connection=None if kind == "SESSION_OPEN" else CONNECTION)
+    item = frame(kind)
+    raw = encode_frame(item, trusted, keys, direction)
+    original = json.loads(raw)
+    assert tuple(original) == OUTER_KEYS
+    if outer_form == "mac_first_sequence_last":
+        ordered_keys = ("mac", *(name for name in original if name not in ("mac", "sequence")), "sequence")
+    else:
+        ordered_keys = tuple(reversed(original))
+    reordered = {name: original[name] for name in ordered_keys}
+    if outer_form == "whitespace":
+        changed = (" \t\r\n" + json.dumps(reordered, indent="\t", separators=(",", " : ")) + "\r\n ").encode()
+    else:
+        changed = json.dumps(reordered, separators=(",", ":")).encode()
+    assert changed != raw
+    assert json.loads(changed) == original
+    assert json.loads(changed)["mac"] == original["mac"]
+    assert json.loads(changed)["payload"] == original["payload"]
+    decoded = parse_frame(changed, trusted, keys, direction)
+    assert decoded == parse_frame(raw, trusted, keys, direction) == item
+    assert decoded.payload == item.payload
+    assert postauth_frame._mac_input(decoded, trusted, direction) == postauth_frame._mac_input(item, trusted, direction)
+    assert encode_frame(decoded, trusted, keys, direction) == raw
+
+
+@pytest.mark.parametrize("name", OUTER_KEYS)
+@pytest.mark.parametrize("mutation", ("omitted", "replaced_with_unknown"))
+def test_outer_required_key_membership_rejects(name: str, mutation: str):
+    trusted, keys = codec()
+    original = json.loads(encode_frame(frame("HEARTBEAT"), trusted, keys, "PEER_TO_HUB"))
+    changed = dict(original)
+    value = changed.pop(name)
+    if mutation == "replaced_with_unknown":
+        changed["unknown"] = value
+        assert len(changed) == len(original) == 14
+    raw = json.dumps(changed, separators=(",", ":")).encode()
+    with pytest.raises(PostAuthFrameError, match="invalid frame keys"):
+        parse_frame(raw, trusted, keys, "PEER_TO_HUB")
+
+
+def test_outer_unknown_extra_key_rejects():
+    trusted, keys = codec()
+    raw = encode_frame(frame("HEARTBEAT"), trusted, keys, "PEER_TO_HUB")
+    changed = raw[:-1] + b',"unknown":""}'
+    with pytest.raises(PostAuthFrameError, match="invalid frame keys"):
+        parse_frame(changed, trusted, keys, "PEER_TO_HUB")
+
+
+@pytest.mark.parametrize("name", OUTER_KEYS)
+@pytest.mark.parametrize("conflicting", (False, True), ids=("identical", "conflicting"))
+def test_raw_outer_duplicate_known_key_rejects_before_membership(name: str, conflicting: bool):
+    trusted, keys = codec()
+    raw = encode_frame(frame("HEARTBEAT"), trusted, keys, "PEER_TO_HUB")
+    original = json.loads(raw)
+    value = (1 if name == "sequence" else "tampered") if conflicting else original[name]
+    duplicate = json.dumps(name).encode() + b":" + json.dumps(value).encode()
+    changed = b"{" + duplicate + b"," + raw[1:]
+    with pytest.raises(PostAuthFrameError, match="invalid frame JSON") as caught:
+        parse_frame(changed, trusted, keys, "PEER_TO_HUB")
+    assert isinstance(caught.value.__cause__, PostAuthFrameError)
+    assert str(caught.value.__cause__) == "duplicate key"
+
+
+def test_reordered_changed_value_with_original_mac_rejects():
+    trusted, keys = codec()
+    original = json.loads(encode_frame(frame("HEARTBEAT"), trusted, keys, "PEER_TO_HUB"))
+    changed = dict(reversed(tuple(original.items())))
+    changed["sequence"] = 1
+    assert changed["mac"] == original["mac"]
+    assert changed["payload"] == original["payload"]
+    with pytest.raises(PostAuthFrameError, match="invalid frame MAC"):
+        parse_frame(json.dumps(changed, separators=(",", ":")).encode(), trusted, keys, "PEER_TO_HUB")
 
 
 def test_session_open_allows_first_adoption_only_and_exact_payload():
