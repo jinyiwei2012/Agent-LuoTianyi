@@ -1,6 +1,9 @@
 import asyncio
 import copy
+import gc
+import json
 import threading
+import weakref
 from pathlib import Path
 
 import pytest
@@ -22,6 +25,409 @@ BODY = "20000000-0000-4000-8000-000000000002"
 ROUTE = "30000000-0000-4000-8000-000000000003"
 SERVER = "40000000-0000-4000-8000-000000000004"
 CLIENT = "50000000-0000-4000-8000-000000000005"
+
+
+def custody_config(path, custody):
+    from src.adapter.minecraft.epoch_store import TrustedEpochPolicy
+
+    sid = b"\x01\x01\x00\x00\x00\x00\x00\x05\x12\x00\x00\x00"
+    policy = TrustedEpochPolicy(str(path), 1, 2, sid, (sid,), (sid,), (sid,), PROVISION, BODY)
+    return EpochWorkerConfig(mode="OPEN_WITH_CUSTODY", directory=str(path), custody_policy=policy, custody=custody)
+
+
+class CustodyLease:
+    def __init__(self):
+        self.calls = []
+        self.failure = None
+
+    def validate(self):
+        self.calls.append(("validate", threading.get_ident()))
+
+    def read_marker(self):
+        self.calls.append(("marker", threading.get_ident()))
+        return json.dumps(dict(version=1, provisionId=PROVISION, bodyId=BODY)).encode()
+
+    def close(self):
+        self.calls.append(("close", threading.get_ident()))
+        if self.failure is not None:
+            raise self.failure
+
+
+@pytest.mark.asyncio
+async def test_snapshot_partial_acquisition_never_claims_no_retention(tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class Port:
+        def acquire(self, policy, receipt):
+            receipt._register(CustodyLease())
+            entered.set()
+            if not release.wait(2):
+                raise RuntimeError("bounded test release")
+            raise RuntimeError("deliberate acquisition failure")
+
+    worker = MinecraftEpochStoreWorker(custody_config(tmp_path, Port()))
+
+    async def start_caught():
+        with pytest.raises(EpochWorkerError):
+            await worker.start()
+
+    task = asyncio.create_task(start_caught())
+    try:
+        # The loop must service start() before the synchronous event wait.
+        ready = asyncio.get_running_loop().create_future()
+        asyncio.get_running_loop().call_soon(ready.set_result, None)
+        await ready
+        assert entered.wait(2)
+        snapshot = worker.snapshot()
+        assert not snapshot.terminal_published
+        assert snapshot.retention == "NOT_YET_REPORTED"
+    finally:
+        release.set()
+        await asyncio.wait_for(task, 3)
+        await worker.close()
+    assert worker.snapshot().retention == "NONE"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_available_store_never_claims_no_retention(tmp_path):
+    from src.adapter.minecraft.epoch_store import EpochStore
+
+    root = tmp_path / "epoch"
+    legacy = EpochStore.provision(root, PROVISION, BODY, platform=Platform())
+    legacy.close()
+
+    class Port:
+        def acquire(self, policy, receipt):
+            lease = CustodyLease()
+            receipt._register(lease)
+            return lease
+
+    worker = MinecraftEpochStoreWorker(custody_config(root, Port()))
+    try:
+        await worker.start()
+        assert worker.state is EpochWorkerState.AVAILABLE
+        assert not worker.snapshot().terminal_published
+        assert worker.snapshot().retention == "NOT_YET_REPORTED"
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_start_cancel_and_acquisition_fatal_drains_then_direct_rethrows(tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+    fatal = KeyboardInterrupt("acquisition")
+    lease = CustodyLease()
+    lease.failure = RuntimeError("cleanup")
+
+    class Port:
+        def acquire(self, policy, receipt):
+            receipt._register(lease)
+            entered.set()
+            if not release.wait(2):
+                raise RuntimeError("test timeout")
+            raise fatal
+
+    worker = MinecraftEpochStoreWorker(custody_config(tmp_path, Port()))
+    observed = []
+
+    async def direct_caller():
+        try:
+            await worker.start()
+        except KeyboardInterrupt as caught:
+            assert caught is fatal
+            observed.append(worker.snapshot())
+        else:
+            pytest.fail("fatal must win cancellation")
+
+    task = asyncio.create_task(direct_caller())
+    try:
+        ready = asyncio.get_running_loop().create_future()
+        asyncio.get_running_loop().call_soon(ready.set_result, None)
+        await ready
+        assert entered.wait(2)
+        task.cancel()
+    finally:
+        release.set()
+        await asyncio.wait_for(task, 3)
+    assert observed[0].terminal_published and observed[0].thread_completion_observed
+    assert observed[0].cleanup == "UNKNOWN" and observed[0].retention == "OPEN_RECEIPT"
+    assert isinstance(worker._start_task.exception(), EpochWorkerError)
+    assert isinstance(worker._close_task.exception(), EpochWorkerError)
+    try:
+        await worker.close()
+    except KeyboardInterrupt as caught:
+        assert caught is fatal
+    else:
+        pytest.fail("retained fatal missing")
+
+
+@pytest.mark.asyncio
+async def test_first_operation_fatal_wins_cleanup_fatal_at_direct_close(tmp_path, monkeypatch):
+    from src.adapter.minecraft.epoch_store import EpochStore
+
+    root = tmp_path / "epoch"
+    legacy = EpochStore.provision(root, PROVISION, BODY, platform=Platform())
+    legacy.close()
+    first = KeyboardInterrupt("operation")
+    later = SystemExit("cleanup")
+
+    class Port:
+        def acquire(self, policy, receipt):
+            lease = CustodyLease()
+            lease.failure = later
+            receipt._register(lease)
+            return lease
+
+    worker = MinecraftEpochStoreWorker(custody_config(root, Port()))
+    await worker.start()
+
+    def fail_read(store):
+        raise first
+
+    monkeypatch.setattr(EpochStore, "read_candidate", fail_read)
+    handle = worker.submit_preflight(preflight())
+    with pytest.raises(EpochWorkerError):
+        await worker.wait(handle)
+    try:
+        await worker.close()
+    except KeyboardInterrupt as caught:
+        assert caught is first
+    else:
+        pytest.fail("first fatal missing")
+    assert worker.snapshot().terminal_published and worker.snapshot().thread_completion_observed
+    assert worker.snapshot().retention == "STORE"
+
+
+@pytest.mark.asyncio
+async def test_evidence_fatal_retains_store_and_publishes_unknown(tmp_path, monkeypatch):
+    from src.adapter.minecraft.epoch_store import EpochStore
+
+    root = tmp_path / "epoch"
+    legacy = EpochStore.provision(root, PROVISION, BODY, platform=Platform())
+    legacy.close()
+
+    class Port:
+        def acquire(self, policy, receipt):
+            lease = CustodyLease()
+            receipt._register(lease)
+            return lease
+
+    worker = MinecraftEpochStoreWorker(custody_config(root, Port()))
+    await worker.start()
+    reference = weakref.ref(worker._retained_store)
+    fatal = SystemExit("evidence")
+
+    def fail_evidence(store):
+        raise fatal
+
+    monkeypatch.setattr(EpochStore, "cleanup_evidence", fail_evidence)
+    try:
+        await worker.close()
+    except SystemExit as caught:
+        assert caught is fatal
+    else:
+        pytest.fail("evidence fatal missing")
+    assert worker.snapshot().terminal_published and worker.snapshot().thread_completion_observed
+    assert worker.snapshot().cleanup == "UNKNOWN" and worker.snapshot().retention == "STORE"
+    # Remove traceback references so ownership evidence is not accidentally supplied by fatal frames.
+    fatal.__traceback__ = None
+    gc.collect()
+    assert reference() is worker._retained_store
+
+
+def test_custody_config_exact_and_inert(tmp_path):
+    class Port:
+        def acquire(self, *args):
+            raise AssertionError("constructor must be inert")
+
+    config = custody_config(tmp_path, Port())
+    assert config.directory == str(tmp_path)
+    from dataclasses import replace
+
+    for changes in (
+        dict(directory=tmp_path),
+        dict(platform=Platform()),
+        dict(provision_id=PROVISION),
+        dict(mode="OPEN"),
+        dict(custody=None),
+        dict(directory=str(tmp_path) + "\\other"),
+    ):
+        with pytest.raises(ValueError):
+            replace(config, **changes)
+
+
+@pytest.mark.asyncio
+async def test_actual_custody_worker_success_same_thread_and_public_evidence(tmp_path):
+    from src.adapter.minecraft.epoch_store import EpochStore
+
+    legacy = EpochStore.provision(tmp_path / "epoch", PROVISION, BODY, platform=Platform())
+    legacy.close()
+    lease = CustodyLease()
+    acquired = []
+
+    class Port:
+        def acquire(self, policy, receipt):
+            acquired.append(threading.get_ident())
+            receipt._registration_window()
+            receipt._register(lease)
+            return lease
+
+    worker = MinecraftEpochStoreWorker(custody_config(tmp_path / "epoch", Port()))
+    await worker.start()
+    handle = worker.submit_preflight(preflight())
+    await worker.wait(handle)
+    worker.mark_obsolete(worker.take_preflight(handle))
+    await worker.close()
+    assert worker.state is EpochWorkerState.CLOSED
+    assert worker.snapshot().cleanup == "CONFIRMED"
+    assert worker.snapshot().retention == "NONE"
+    assert set(acquired + [ident for _, ident in lease.calls]) == {worker._thread.ident}
+    assert worker._thread.ident != threading.get_ident() and not worker._thread.daemon
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unknown", [False, True])
+async def test_custody_startup_receipt_retention_after_thread_death(tmp_path, unknown):
+    refs = []
+
+    class Port:
+        def acquire(self, policy, receipt):
+            lease = CustodyLease()
+            refs.append(weakref.ref(lease))
+            receipt._register(lease)
+            if unknown:
+                lease.failure = RuntimeError("unknown")
+            raise RuntimeError("acquire failed")
+
+    worker = MinecraftEpochStoreWorker(custody_config(tmp_path, Port()))
+    with pytest.raises(EpochWorkerError):
+        await worker.start()
+    gc.collect()
+    assert worker.snapshot().thread_completion_observed
+    assert worker.snapshot().cleanup == ("UNKNOWN" if unknown else "CONFIRMED")
+    assert worker.snapshot().retention == ("OPEN_RECEIPT" if unknown else "NONE")
+    assert (refs[0]() is not None) == unknown
+    with pytest.raises(EpochWorkerError):
+        await worker.start()
+    if unknown:
+        with pytest.raises(EpochWorkerError):
+            await worker.close()
+        assert len(refs[0]().calls) == 1
+    else:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reject", ["startup", "job", "terminal"])
+async def test_custody_notification_rejection_independent_terminal(tmp_path, monkeypatch, reject):
+    from src.adapter.minecraft.epoch_store import EpochStore
+
+    root = tmp_path / "epoch"
+    legacy = EpochStore.provision(root, PROVISION, BODY, platform=Platform())
+    legacy.close()
+    lease = CustodyLease()
+
+    class Port:
+        def acquire(self, policy, receipt):
+            receipt._register(lease)
+            return lease
+
+    worker = MinecraftEpochStoreWorker(custody_config(root, Port()))
+    original = worker._post
+
+    def post(callback, *args):
+        names = {"startup": "_owner_started", "job": "_owner_complete", "terminal": "_owner_terminal"}
+        return False if callback.__name__ == names[reject] else original(callback, *args)
+
+    monkeypatch.setattr(worker, "_post", post)
+    if reject == "startup":
+        with pytest.raises(EpochWorkerError):
+            await worker.start()
+    else:
+        await worker.start()
+        if reject == "job":
+            handle = worker.submit_preflight(preflight())
+            with pytest.raises(EpochWorkerError):
+                await worker.wait(handle)
+    await worker.close()
+    snapshot = worker.snapshot()
+    assert snapshot.terminal_published and snapshot.thread_completion_observed
+    assert snapshot.cleanup == "CONFIRMED"
+    assert snapshot.notification == ("REJECTED" if reject == "terminal" else "ACCEPTED")
+
+
+@pytest.mark.asyncio
+async def test_custody_fatal_released_direct_await_same_object_no_internal_fatal(tmp_path):
+    fatal = KeyboardInterrupt("test fatal")
+
+    class Port:
+        def acquire(self, policy, receipt):
+            raise fatal
+
+    worker = MinecraftEpochStoreWorker(custody_config(tmp_path, Port()))
+    # Catch INSIDE direct-await coroutine; never put KeyboardInterrupt into an asyncio Task.
+    try:
+        await worker.start()
+    except KeyboardInterrupt as caught:
+        assert caught is fatal
+    else:
+        pytest.fail("fatal missing")
+    assert worker.snapshot().cleanup == "CONFIRMED"
+    assert not worker._thread.is_alive()
+    assert isinstance(worker._start_task.exception(), EpochWorkerError)
+    try:
+        await worker.close()
+    except KeyboardInterrupt as caught:
+        assert caught is fatal
+    else:
+        pytest.fail("fatal missing on repeated lifecycle")
+
+
+@pytest.mark.asyncio
+async def test_custody_native_unsupported_worker_zero_native_calls(tmp_path, monkeypatch):
+    from src.adapter.minecraft.epoch_platform import WindowsEpochPlatform
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("no native fallback")
+
+    monkeypatch.setattr("src.adapter.minecraft.epoch_platform._kernel32", forbidden)
+    monkeypatch.setattr("src.adapter.minecraft.epoch_store._connect_rw", forbidden)
+    worker = MinecraftEpochStoreWorker(custody_config(tmp_path, WindowsEpochPlatform()))
+    with pytest.raises(EpochWorkerError):
+        await worker.start()
+    assert worker.snapshot().cleanup == "CONFIRMED"
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_custody_later_lease_unknown_retained_after_thread_death(tmp_path):
+    from src.adapter.minecraft.epoch_store import EpochStore
+
+    root = tmp_path / "epoch"
+    legacy = EpochStore.provision(root, PROVISION, BODY, platform=Platform())
+    legacy.close()
+    refs = []
+
+    class Port:
+        def acquire(self, policy, receipt):
+            lease = CustodyLease()
+            lease.failure = RuntimeError("close unknown")
+            refs.append(weakref.ref(lease))
+            receipt._register(lease)
+            return lease
+
+    worker = MinecraftEpochStoreWorker(custody_config(root, Port()))
+    await worker.start()
+    with pytest.raises(EpochWorkerError):
+        await worker.close()
+    gc.collect()
+    assert worker.snapshot().retention == "STORE" and worker.snapshot().cleanup == "UNKNOWN"
+    assert refs[0]() is not None
+    with pytest.raises(EpochWorkerError):
+        await worker.close()
+    assert sum(name == "close" for name, _ in refs[0]().calls) == 1
 
 
 class Lock:
@@ -574,7 +980,8 @@ async def test_worker_fatal_settles_running_and_queued_waiters_and_cleans_metada
     assert second_calls == [] and len(close_calls) == 1
     assert worker._claimed == set() and worker._obsolete == set()
     assert worker._thread is not None and not worker._thread.is_alive()
-    with pytest.raises(EpochWorkerError, match="cleanup outcome is unknown"):
+    # Public lifecycle delivery deliberately rethrows the retained fatal, not through internal tasks.
+    with pytest.raises(WorkerFatal):
         await worker.close()
 
 

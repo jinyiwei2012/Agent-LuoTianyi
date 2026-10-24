@@ -14,9 +14,12 @@ from uuid import UUID
 from .epoch_store import (
     CommittedEpoch,
     EpochCandidate,
+    EpochCustodyPlatform,
+    EpochOpenAttemptReceipt,
     EpochPlatform,
     EpochStore,
     EpochStoreError,
+    TrustedEpochPolicy,
     VerifiedReadyContext,
 )
 
@@ -40,13 +43,29 @@ class EpochWorkerState(str, Enum):
 
 @dataclass(frozen=True, slots=True, kw_only=True, repr=False)
 class EpochWorkerConfig:
-    mode: Literal["OPEN", "PROVISION"]
-    directory: Path
+    mode: Literal["OPEN", "PROVISION", "OPEN_WITH_CUSTODY"]
+    directory: Path | str
     platform: EpochPlatform | None = None
     provision_id: str | None = None
     body_id: str | None = None
+    custody_policy: TrustedEpochPolicy | None = None
+    custody: EpochCustodyPlatform | None = None
 
     def __post_init__(self) -> None:
+        if self.mode == "OPEN_WITH_CUSTODY":
+            if (
+                type(self.custody_policy) is not TrustedEpochPolicy
+                or not isinstance(self.custody, EpochCustodyPlatform)
+                or self.platform is not None
+                or self.provision_id is not None
+                or self.body_id is not None
+                or type(self.directory) is not str
+                or self.directory != self.custody_policy.raw_root_path
+            ):
+                raise ValueError("invalid custody worker configuration")
+            return
+        if self.custody_policy is not None or self.custody is not None:
+            raise ValueError("legacy mode rejects custody fields")
         path = Path(self.directory)
         if not path.is_absolute() or self.mode not in ("OPEN", "PROVISION"):
             raise ValueError("invalid epoch worker configuration")
@@ -176,6 +195,18 @@ class _Completion:
 class _Terminal:
     startup: bool
     cleanup_unknown: bool
+    retention: str = "NONE"
+    transaction_unknown: bool | str = "NOT_REPORTED"
+
+
+@dataclass(frozen=True, slots=True)
+class EpochWorkerSnapshot:
+    terminal_published: bool
+    thread_completion_observed: bool
+    cleanup: str
+    retention: str
+    transaction_unknown: bool | str
+    notification: str
 
 
 class MinecraftEpochStoreWorker:
@@ -204,6 +235,30 @@ class MinecraftEpochStoreWorker:
         self._start_task = None
         self._close_task = None
         self._terminal_receipt: _Terminal | None = None
+        self._terminal_lock = threading.Lock()
+        self._terminal_notification = "UNKNOWN"
+        self._retained_receipt = None
+        self._retained_store = None
+        self._fatal = None
+        self._public_lifecycle = False
+
+    def snapshot(self) -> EpochWorkerSnapshot:
+        with self._terminal_lock:
+            terminal = self._terminal_receipt
+            notification = self._terminal_notification
+        dead = self._thread is not None and not self._thread.is_alive()
+        return EpochWorkerSnapshot(
+            terminal is not None,
+            dead,
+            "NOT_YET_REPORTED" if terminal is None else "UNKNOWN" if terminal.cleanup_unknown else "CONFIRMED",
+            terminal.retention if terminal else "NOT_YET_REPORTED",
+            terminal.transaction_unknown if terminal else "NOT_REPORTED",
+            notification,
+        )
+
+    def _deliver_fatal(self):
+        if self._fatal is not None:
+            raise self._fatal
 
     @property
     def state(self) -> EpochWorkerState:
@@ -216,8 +271,18 @@ class MinecraftEpochStoreWorker:
         return len(self._jobs)
 
     async def start(self) -> None:
+        if self._public_lifecycle:
+            raise EpochWorkerError("concurrent lifecycle entry is unsupported")
+        self._public_lifecycle = True
+        try:
+            await self._start_public()
+        finally:
+            self._public_lifecycle = False
+
+    async def _start_public(self) -> None:
         self._bind_owner()
         if self._state is not EpochWorkerState.NEW:
+            self._deliver_fatal()
             raise EpochWorkerError("epoch worker already started")
         self._state = EpochWorkerState.STARTING
         self._start_future = self._loop.create_future()
@@ -226,9 +291,13 @@ class MinecraftEpochStoreWorker:
         self._start_task = asyncio.create_task(self._wait_start(), name="minecraft-epoch-worker-start")
         try:
             await asyncio.shield(self._start_task)
+        except EpochWorkerError:
+            self._deliver_fatal()
+            raise
         except asyncio.CancelledError as cancellation:
             await self._drain_owned_task(self._start_task)
             await self._drain_owned_task(self._ensure_close_task())
+            self._deliver_fatal()
             raise cancellation
 
     def submit_preflight(self, request: EpochPreflightRequest) -> EpochJobHandle:
@@ -316,6 +385,9 @@ class MinecraftEpochStoreWorker:
     async def wait(self, handle: EpochJobHandle) -> None:
         self._owner()
         job = self._job(handle)
+        while not job.future.done():
+            await asyncio.sleep(0.001)
+            self._observe_terminal()
         await asyncio.shield(job.future)
         if job.failed:
             raise EpochWorkerError("epoch worker job failed")
@@ -353,6 +425,15 @@ class MinecraftEpochStoreWorker:
                 self._obsolete.discard(identity)
 
     async def close(self) -> None:
+        if self._public_lifecycle:
+            raise EpochWorkerError("concurrent lifecycle entry is unsupported")
+        self._public_lifecycle = True
+        try:
+            await self._close_public()
+        finally:
+            self._public_lifecycle = False
+
+    async def _close_public(self) -> None:
         self._owner()
         task = self._ensure_close_task()
         cancellation = None
@@ -361,12 +442,17 @@ class MinecraftEpochStoreWorker:
                 await asyncio.shield(task)
             except asyncio.CancelledError as error:
                 cancellation = cancellation or error
+            except EpochWorkerError:
+                break
+        self._deliver_fatal()
         task.result()
         if cancellation is not None:
             raise cancellation
 
     async def _wait_start(self) -> None:
-        await self._start_future
+        while not self._start_future.done():
+            self._observe_terminal()
+            await asyncio.sleep(0.001)
         await self._wait_thread_dead_if_terminal()
         if self._state is not EpochWorkerState.AVAILABLE:
             raise EpochWorkerError("epoch worker is unavailable")
@@ -400,12 +486,17 @@ class MinecraftEpochStoreWorker:
                 with self._claim_lock:
                     self._obsolete.add(identity)
             self._commands.put_nowait(None)
-        await self._close_future
+        await self._wait_close_notification()
         await self._wait_thread_dead()
         if self._terminal_receipt is None or self._terminal_receipt.cleanup_unknown:
             self._state = EpochWorkerState.CLEANUP_UNKNOWN
             raise EpochWorkerError("epoch worker cleanup outcome is unknown")
         self._finalize_closed()
+
+    async def _wait_close_notification(self):
+        while not self._close_future.done():
+            self._observe_terminal()
+            await asyncio.sleep(0.001)
 
     async def _wait_thread_dead_if_terminal(self) -> None:
         if self._state in {EpochWorkerState.UNAVAILABLE, EpochWorkerState.CLEANUP_UNKNOWN}:
@@ -417,6 +508,13 @@ class MinecraftEpochStoreWorker:
             await asyncio.sleep(0)
         if self._thread is not None:
             self._thread.join(0)
+        self._observe_terminal()
+
+    def _observe_terminal(self) -> None:
+        with self._terminal_lock:
+            terminal = self._terminal_receipt
+        if terminal is not None:
+            self._owner_terminal(terminal)
 
     async def _drain_owned_task(self, task: asyncio.Task) -> None:
         while not task.done():
@@ -438,33 +536,75 @@ class MinecraftEpochStoreWorker:
         terminal_unknown = False
         try:
             store = self._open_store()
-            self._post(self._owner_started)
+            if not self._post(self._owner_started):
+                raise EpochWorkerError("startup notification rejected")
             startup = False
             while True:
                 command = self._commands.get()
                 if command is None:
                     break
                 if not self._claim(command.identity):
-                    self._post(self._owner_complete, _Completion(command.identity, command.kind, obsolete=True))
+                    if not self._post(self._owner_complete, _Completion(command.identity, command.kind, obsolete=True)):
+                        break
                     continue
                 try:
                     completion = self._execute(store, command)
                 finally:
                     self._release_claim(command.identity)
-                self._post(self._owner_complete, completion)
+                if not self._post(self._owner_complete, completion):
+                    break
                 if completion.failed:
                     break
         except BaseException as error:
+            self._remember_fatal(error)
             terminal_unknown = not isinstance(error, Exception) or _cleanup_unknown_error(error)
+        terminal_unknown = self._close_store_thread(store, terminal_unknown)
+        receipt = self._typed_terminal(store, startup, terminal_unknown)
+        with self._terminal_lock:
+            self._terminal_receipt = receipt
+        accepted = self._post(self._owner_terminal, receipt)
+        with self._terminal_lock:
+            self._terminal_notification = "ACCEPTED" if accepted else "REJECTED"
+
+    def _close_store_thread(self, store, unknown):
         if store is not None:
             try:
                 store.close()
-            except BaseException:
-                terminal_unknown = True
-        receipt = _Terminal(startup=startup, cleanup_unknown=terminal_unknown)
-        self._post(self._owner_terminal, receipt)
+            except BaseException as error:
+                self._remember_fatal(error)
+                unknown = True
+        return unknown
+
+    def _remember_fatal(self, error):
+        if not isinstance(error, Exception) and self._fatal is None:
+            self._fatal = error
+
+    def _typed_terminal(self, store, startup, unknown):
+        retention = "NONE"
+        transaction = "NOT_REPORTED"
+        if self._config.mode == "OPEN_WITH_CUSTODY":
+            try:
+                evidence = store.cleanup_evidence() if store is not None else self._retained_receipt.snapshot()
+                unknown = evidence.state not in {"RELEASED", "TRANSFERRED"} or evidence.retained_resources != 0
+                transaction = evidence.transaction_unknown
+            except BaseException as error:
+                self._remember_fatal(error)
+                unknown = True
+            if unknown:
+                retention = "STORE" if store is not None else "OPEN_RECEIPT"
+            else:
+                self._retained_store = None
+                self._retained_receipt = None
+        return _Terminal(startup, unknown, retention, transaction)
 
     def _open_store(self) -> EpochStore:
+        if self._config.mode == "OPEN_WITH_CUSTODY":
+            self._retained_receipt = EpochOpenAttemptReceipt()
+            store = EpochStore.open_with_custody(
+                self._config.custody_policy, custody=self._config.custody, receipt=self._retained_receipt
+            )
+            self._retained_store = store
+            return store
         if self._config.mode == "OPEN":
             return EpochStore.open(self._config.directory, platform=self._config.platform)
         return EpochStore.provision(
@@ -512,15 +652,18 @@ class MinecraftEpochStoreWorker:
         except Exception:
             return _Completion(command.identity, command.kind, failed=True)
 
-    def _post(self, callback, *args) -> None:
+    def _post(self, callback, *args) -> bool:
         if self._loop is None or self._loop.is_closed():
-            return
+            return False
         try:
             self._loop.call_soon_threadsafe(callback, *args)
-        except RuntimeError:
-            return
+            return True
+        except BaseException:
+            return False
 
     def _owner_started(self) -> None:
+        if self._terminal_receipt is not None:
+            return
         self._state = EpochWorkerState.AVAILABLE
         if self._start_future is not None and not self._start_future.done():
             self._start_future.set_result(None)
@@ -563,7 +706,8 @@ class MinecraftEpochStoreWorker:
             job.future.set_result(None)
 
     def _owner_terminal(self, receipt: _Terminal) -> None:
-        self._terminal_receipt = receipt
+        if self._thread is not None and self._thread.is_alive():
+            return
         if receipt.cleanup_unknown:
             self._state = EpochWorkerState.CLEANUP_UNKNOWN
         elif receipt.startup:
@@ -577,6 +721,8 @@ class MinecraftEpochStoreWorker:
             self._close_future.set_result(None)
 
     def _settle_terminal_jobs(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
         for job in self._jobs.values():
             if job.phase not in {"COMPLETED", "DELIVERED", "CONSUMED"}:
                 job.failed = True
@@ -590,6 +736,8 @@ class MinecraftEpochStoreWorker:
 
     def _finalize_closed(self) -> None:
         if self._thread is not None and self._thread.is_alive():
+            raise EpochWorkerError("epoch worker cleanup outcome is unknown")
+        if self._thread is not None and (self._terminal_receipt is None or self._terminal_receipt.cleanup_unknown):
             raise EpochWorkerError("epoch worker cleanup outcome is unknown")
         self._settle_terminal_jobs()
         for job in self._jobs.values():
