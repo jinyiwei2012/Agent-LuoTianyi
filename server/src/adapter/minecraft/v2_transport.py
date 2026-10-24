@@ -21,6 +21,7 @@ from .current_roles import AuthenticatedControlRoleOwner, CurrentRoleError
 from .postauth_keys import AuthenticatedTranscript, PostAuthKeyError
 from .postauth_session import PostAuthHubSession, PostAuthSessionError, PostAuthSessionState
 from .transport import WebSocketPort
+from .v2_body_routes import V2BodyRouteError, V2BodyRouteOwner
 from .v2_startup import ProvisionedV2Peer, V2StartupError
 
 _SECURITY = "luosandbox.control-auth.v1"
@@ -93,6 +94,12 @@ class MinecraftV2AuthenticatedTransport:
         self._pending = PendingHandshakes(maximum=4)
         self._roles = selected_owner
         self._binding = binding_coordinator
+        self._body_routes = V2BodyRouteOwner(
+            role_owner=selected_owner,
+            monotonic_millis=self._monotonic_millis,
+            utc_now=self._trusted_utc,
+        )
+        self._sessions: dict[str, tuple[object, PostAuthHubSession]] = {}
         self._unauthenticated: set[str] = set()
         self._attempts = {install: _Bucket(1.0, 2.0) for install in installs}
         self._global_attempts = _Bucket(2.0, 4.0)
@@ -120,6 +127,7 @@ class MinecraftV2AuthenticatedTransport:
         owner_thread = threading.get_ident()
         cancellation: asyncio.CancelledError | None = None
         fatal: BaseException | None = None
+        cleanup_failed = False
         close_code, close_reason = 1008, "FEATURE_DISABLED"
         try:
             self._reserve_unauthenticated(connection_id)
@@ -199,10 +207,18 @@ class MinecraftV2AuthenticatedTransport:
             keys = peer.derive_session_keys(authenticated)
 
             def fence() -> None:
-                nonlocal lease
+                nonlocal cleanup_failed, fatal, lease
                 if lease is not None:
-                    self._withdraw_role(lease, cleanup_tasks)
-                    lease = None
+                    try:
+                        self._withdraw_role(lease, cleanup_tasks)
+                    except BaseException as error:
+                        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                            fatal = fatal or error
+                        else:
+                            cleanup_failed = True
+                        raise
+                    finally:
+                        lease = None
 
             def request_close() -> None:
                 close_requested.set()
@@ -235,7 +251,32 @@ class MinecraftV2AuthenticatedTransport:
                 task.add_done_callback(send_tasks.discard)
                 return task
 
-            def deny_application(_event) -> None:
+            def observe_application(event) -> None:
+                if lease is None or session is None or not self._roles.is_current(lease):
+                    raise V2TransportError("application session is not current")
+                association = self._sessions.get(lease.role)
+                if association != (lease, session) or session.state is not PostAuthSessionState.APPLICATION_READY:
+                    raise V2TransportError("application session is not ready")
+                frame = event.frame
+                if frame.message_kind == "BODY_BIND_NOTICE" and lease.role == "CLIENT_CONTROLLER":
+                    server_association = self._sessions.get("SERVER_AUTHORITY")
+                    if server_association is None:
+                        raise V2BodyRouteError("server route recipient is unavailable")
+                    server_lease, server_session = server_association
+                    if (
+                        not self._roles.is_current(server_lease)
+                        or server_session.state is not PostAuthSessionState.APPLICATION_READY
+                    ):
+                        raise V2BodyRouteError("server route recipient is unavailable")
+                    self._body_routes.route_notice(
+                        lease,
+                        frame,
+                        server_session.send_body_bind_route,
+                    )
+                    return
+                if frame.message_kind == "BODY_BOUND_CANDIDATE" and lease.role == "SERVER_AUTHORITY":
+                    self._body_routes.accept_candidate(lease, frame)
+                    return
                 raise V2TransportError("v2 application authority is disabled")
 
             session = PostAuthHubSession(
@@ -249,9 +290,10 @@ class MinecraftV2AuthenticatedTransport:
                 report_cleanup_unknown=report_cleanup_unknown,
                 fence=fence,
                 close=request_close,
-                observe=deny_application,
+                observe=observe_application,
             )
             session.start()
+            self._sessions[lease.role] = (lease, session)
             await self._drive_session(websocket, session, close_requested, callback_error)
         except asyncio.CancelledError as error:
             cancellation = error
@@ -278,32 +320,46 @@ class MinecraftV2AuthenticatedTransport:
                 try:
                     session.close()
                 except BaseException as error:
-                    if fatal is None and isinstance(error, (KeyboardInterrupt, SystemExit)):
-                        fatal = error
+                    if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                        fatal = fatal or error
+                    else:
+                        cleanup_failed = True
             elif keys is not None:
-                keys.close()
+                try:
+                    keys.close()
+                except BaseException as error:
+                    if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                        fatal = fatal or error
+                    else:
+                        cleanup_failed = True
             if lease is not None:
                 try:
                     self._withdraw_role(lease, cleanup_tasks)
                 except BaseException as error:
-                    if fatal is None:
-                        fatal = error
+                    if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                        fatal = fatal or error
+                    else:
+                        cleanup_failed = True
             if reservation is not None:
                 try:
                     self._roles.withdraw(reservation)
                 except BaseException as error:
-                    if fatal is None:
-                        fatal = error
+                    if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                        fatal = fatal or error
+                    else:
+                        cleanup_failed = True
             self._pending.discard(connection_id)
             self._unauthenticated.discard(connection_id)
             cleanup_cancel = await _cancel_and_drain(tuple(send_tasks))
             cleanup_cancel = cleanup_cancel or await _drain_tasks(tuple(cleanup_tasks))
             await _safe_close(websocket, close_code, close_reason)
             cancellation = cancellation or cleanup_cancel
-        if cancellation is not None:
-            raise cancellation
         if fatal is not None:
             raise fatal
+        if cancellation is not None:
+            raise cancellation
+        if cleanup_failed:
+            raise V2TransportError("v2 transport cleanup failed") from None
 
     async def _drive_session(
         self,
@@ -328,25 +384,46 @@ class MinecraftV2AuthenticatedTransport:
                         raise V2TransportError("authenticated frame exceeds limit")
                     session.receive(raw)
                 session.tick()
+                self._body_routes.prune()
         finally:
             if receive is not None:
                 cancellation = await _cancel_and_drain((receive,))
                 if cancellation is not None:
                     raise cancellation
 
-    def _withdraw_role(self, lease, cleanup_tasks: set[asyncio.Task]) -> None:
-        def after_remove(withdrawal) -> None:
-            if self._binding is None:
-                return
-            command = self._binding.fence_role_withdrawal(withdrawal)
-            if command is None:
-                return
-            task = asyncio.create_task(
-                self._binding.notify_revoke(command),
-                name="minecraft-v2-binding-revoke",
-            )
-            cleanup_tasks.add(task)
-            task.add_done_callback(cleanup_tasks.discard)
+    def _withdraw_role(self, lease, cleanup_tasks: set[asyncio.Task]) -> None:  # noqa: C901
+        def after_remove(withdrawal) -> None:  # noqa: C901
+            first_error = None
+            fatal = None
+            try:
+                association = self._sessions.get(lease.role)
+                if association is not None and association[0] is lease:
+                    self._sessions.pop(lease.role, None)
+                self._body_routes.invalidate_lease(lease)
+            except BaseException as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    fatal = error
+                else:
+                    first_error = error
+            try:
+                if self._binding is not None:
+                    command = self._binding.fence_role_withdrawal(withdrawal)
+                    if command is not None:
+                        task = asyncio.create_task(
+                            self._binding.notify_revoke(command),
+                            name="minecraft-v2-binding-revoke",
+                        )
+                        cleanup_tasks.add(task)
+                        task.add_done_callback(cleanup_tasks.discard)
+            except BaseException as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    fatal = fatal or error
+                elif first_error is None:
+                    first_error = error
+            if fatal is not None:
+                raise fatal
+            if first_error is not None:
+                raise first_error
 
         self._roles.withdraw(lease, after_remove=after_remove)
 

@@ -68,6 +68,7 @@ wire = importlib.import_module("src.adapter.minecraft.wire")
 typed_ingress = importlib.import_module("src.adapter.minecraft.typed_ingress")
 epoch_store = importlib.import_module("src.adapter.minecraft.epoch_store")
 control_binding = importlib.import_module("src.adapter.minecraft.control_binding")
+v2_body_routes = importlib.import_module("src.adapter.minecraft.v2_body_routes")
 v2_startup = importlib.import_module("src.adapter.minecraft.v2_startup")
 v2_transport = importlib.import_module("src.adapter.minecraft.v2_transport")
 
@@ -104,6 +105,7 @@ _MODULES = {
     "python:src/adapter/minecraft/typed_ingress.py": typed_ingress,
     "python:src/adapter/minecraft/epoch_store.py": epoch_store,
     "python:src/adapter/minecraft/control_binding.py": control_binding,
+    "python:src/adapter/minecraft/v2_body_routes.py": v2_body_routes,
     "python:src/adapter/minecraft/v2_transport.py": v2_transport,
 }
 
@@ -296,8 +298,11 @@ async def lifespan(app: FastAPI):
         fatal = error
     errors: list[str] = []
     sessions_drained = not transport.active_roles and transport.pending_count == 0
+    candidates_hidden = transport._body_routes.candidates() == ()
     if not sessions_drained:
         errors.append("SESSIONS_NOT_DRAINED")
+    if not candidates_hidden:
+        errors.append("ROUTE_CANDIDATES_STILL_VISIBLE")
     peer_failures = 0
     for peer in peers:
         try:
@@ -369,6 +374,27 @@ async def status() -> dict[str, object]:
         "loadedModulePaths": {
             name: str(path.resolve()) for name, path in paths.items()
         },
+    }
+
+
+@app.get("/minecraft/v2/test-route-status")
+async def route_status() -> dict[str, object]:
+    transport = app.state.transport
+    candidates = transport._body_routes.candidates()
+    expected = (
+        b'{"security":"luosandbox.control-auth.v1","kind":"BODY_BIND_NOTICE",'
+        b'"serverBootId":"50000000-0000-4000-8000-000000000001",'
+        b'"gameConnectionId":"60000000-0000-4000-8000-000000000001",'
+        b'"bodyId":"70000000-0000-4000-8000-000000000001",'
+        b'"gameNonce":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"}'
+    )
+    return {
+        "nonAuthoritativeCandidateCount": len(candidates),
+        "routeRawPayloadMatched": any(
+            record.payload == expected
+            for record in transport._body_routes._routes.values()
+        ),
+        "coordinatorPresent": transport._binding is not None,
     }
 
 

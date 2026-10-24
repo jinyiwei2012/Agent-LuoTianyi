@@ -273,3 +273,41 @@ def test_cancelled_completion_fences_without_retrying_next_entry():
     with pytest.raises(PostAuthSessionError):
         run_posted(posted)
     assert session.state is PostAuthSessionState.CLOSED and len(sent) == 1 and len(fenced) == len(closed) == 1
+
+
+def test_server_body_route_uses_ordered_queue_exact_metadata_and_payload():
+    session, auth, keys, now, sent, posted, futures, fenced, closed, observed, unknown = make(role="SERVER_AUTHORITY")
+    session.start()
+    session.receive(ack(auth, keys))
+    payload = notice(
+        transcript_data("CLIENT_CONTROLLER"), PostAuthSessionKeys(transcript_data("CLIENT_CONTROLLER"), PSK), 1
+    )
+    raw_payload = json.loads(payload)["payload"]
+    import base64
+
+    decoded = base64.urlsafe_b64decode(raw_payload + "=" * (-len(raw_payload) % 4))
+    session.send_body_bind_route(
+        "60000000-0000-4000-8000-000000000006",
+        "client-install",
+        "70000000-0000-4000-8000-000000000007",
+        decoded,
+    )
+    assert len(sent) == 1
+    futures[0].finish()
+    run_posted(posted)
+    frame = json.loads(sent[1])
+    assert frame["sequence"] == 1 and frame["messageKind"] == "BODY_BIND_ROUTE"
+    assert frame["routeId"] == "60000000-0000-4000-8000-000000000006"
+    assert frame["sourceInstallId"] == "client-install"
+    assert frame["sourceConnectionId"] == "70000000-0000-4000-8000-000000000007"
+    assert frame["recipientConnectionId"] == CONNECTION and frame["challengeExpiresAt"] == ""
+    assert base64.urlsafe_b64decode(frame["payload"] + "=" * (-len(frame["payload"]) % 4)) == decoded
+
+
+def test_body_route_wrong_role_and_precommit_failure_do_not_leave_sequence_or_queue():
+    session, auth, keys, now, sent, posted, futures, fenced, closed, observed, unknown = make()
+    session.start()
+    session.receive(ack(auth, keys))
+    with pytest.raises(PostAuthSessionError):
+        session.send_body_bind_route("bad", "client", CONNECTION, b"{}")
+    assert session.state is PostAuthSessionState.CLOSED and len(fenced) == len(closed) == 1

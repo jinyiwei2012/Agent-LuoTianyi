@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import ctypes
 import json
 import os
@@ -28,8 +29,13 @@ from src.adapter.minecraft.deployment_manifest import DeploymentManifest, Truste
 from src.adapter.minecraft.epoch_store import EpochCandidate
 from src.adapter.minecraft.postauth_frame import PostAuthFrame, TrustedFrameContext, encode_frame
 from src.adapter.minecraft.postauth_keys import AuthenticatedTranscript, PostAuthSessionKeys
+from src.adapter.minecraft.postauth_session import PostAuthSessionState
 from src.adapter.minecraft.v2_startup import provision_v2_peer
-from src.adapter.minecraft.v2_transport import _MAX_SAFE_AUTH_MILLIS, MinecraftV2AuthenticatedTransport
+from src.adapter.minecraft.v2_transport import (
+    _MAX_SAFE_AUTH_MILLIS,
+    MinecraftV2AuthenticatedTransport,
+    V2TransportError,
+)
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="v2 transport requires native verified NTFS evidence")
 
@@ -287,13 +293,23 @@ def _hello(peer, **changes):
 
 
 class Socket:
-    def __init__(self, peer, *, hello=None, wrong_proof=False, fail_send_at=None, business=False):
+    def __init__(
+        self,
+        peer,
+        *,
+        hello=None,
+        wrong_proof=False,
+        fail_send_at=None,
+        business=False,
+        candidate=False,
+    ):
         self.peer = peer
         self.messages = asyncio.Queue()
         self.messages.put_nowait(hello or _hello(peer))
         self.wrong_proof = wrong_proof
         self.fail_send_at = fail_send_at
         self.business = business
+        self.candidate = candidate
         self.sent = []
         self.closed = None
         self.headers = {}
@@ -367,20 +383,21 @@ class Socket:
             elif value["kind"] == "AUTHENTICATED_FRAME":
                 self.connection_id = value["connectionId"]
                 context = TrustedFrameContext(authenticated=self.authenticated, connection_id=self.connection_id)
-                ack = PostAuthFrame(
-                    connection_id=self.connection_id,
-                    challenge_id=self.authenticated.challenge_id,
-                    sequence=0,
-                    message_kind="HEARTBEAT",
-                    route_id="",
-                    source_install_id="",
-                    source_connection_id="",
-                    recipient_connection_id="",
-                    challenge_expires_at="",
-                    payload=b"{}",
-                )
-                await self.messages.put(encode_frame(ack, context, self.keys, "PEER_TO_HUB").decode("ascii"))
-                if self.business:
+                if value["messageKind"] == "SESSION_OPEN":
+                    ack = PostAuthFrame(
+                        connection_id=self.connection_id,
+                        challenge_id=self.authenticated.challenge_id,
+                        sequence=0,
+                        message_kind="HEARTBEAT",
+                        route_id="",
+                        source_install_id="",
+                        source_connection_id="",
+                        recipient_connection_id="",
+                        challenge_expires_at="",
+                        payload=b"{}",
+                    )
+                    await self.messages.put(encode_frame(ack, context, self.keys, "PEER_TO_HUB").decode("ascii"))
+                if self.business and value["messageKind"] == "SESSION_OPEN":
                     frame = PostAuthFrame(
                         connection_id=self.connection_id,
                         challenge_id=self.authenticated.challenge_id,
@@ -404,6 +421,34 @@ class Socket:
                         ).encode(),
                     )
                     await self.messages.put(encode_frame(frame, context, self.keys, "PEER_TO_HUB").decode("ascii"))
+                if value["messageKind"] == "BODY_BIND_ROUTE" and self.candidate:
+                    routed_payload = base64.urlsafe_b64decode(value["payload"] + "=" * (-len(value["payload"]) % 4))
+                    notice_value = json.loads(routed_payload)
+                    candidate_payload = json.dumps(
+                        {
+                            "security": "luosandbox.control-auth.v1",
+                            "kind": "BODY_BOUND",
+                            "serverBootId": notice_value["serverBootId"],
+                            "gameConnectionId": notice_value["gameConnectionId"],
+                            "bodyId": notice_value["bodyId"],
+                        },
+                        separators=(",", ":"),
+                    ).encode()
+                    candidate_frame = PostAuthFrame(
+                        connection_id=self.connection_id,
+                        challenge_id=self.authenticated.challenge_id,
+                        sequence=1,
+                        message_kind="BODY_BOUND_CANDIDATE",
+                        route_id=value["routeId"],
+                        source_install_id="",
+                        source_connection_id="",
+                        recipient_connection_id=self.connection_id,
+                        challenge_expires_at="2026-01-02T03:04:10.000Z",
+                        payload=candidate_payload,
+                    )
+                    await self.messages.put(
+                        encode_frame(candidate_frame, context, self.keys, "PEER_TO_HUB").decode("ascii")
+                    )
         finally:
             self.send_active -= 1
 
@@ -567,6 +612,165 @@ async def test_integrated_withdrawal_fences_before_revoke_then_socket_close(peer
     tasks[1].cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
     assert transport.active_roles == () and transport.pending_count == 0
+
+
+@pytest.mark.asyncio
+async def test_route_invalidation_failure_still_fences_coordinator_before_socket_close(peers, monkeypatch):
+    clock = Clock()
+    role_owner = AuthenticatedControlRoleOwner(tuple(peer.context for peer in peers), "hub-test-1")
+    commands, stage = BindingCommands(), IntegratedStage()
+    commands.block_revoke = True
+    coordinator = _coordinator(role_owner, commands=commands, stage=stage, store=BindingStore())
+    transport = MinecraftV2AuthenticatedTransport(
+        peers=peers,
+        hub_install_id="hub-test-1",
+        monotonic_millis=clock,
+        utc_now=lambda: NOW,
+        nonce=lambda: HUB_NONCE,
+        challenge_id=lambda: CHALLENGE_ID,
+        role_owner=role_owner,
+        binding_coordinator=coordinator,
+    )
+    sockets = [Socket(peer) for peer in peers]
+    sockets[0].block_close = True
+    tasks = [asyncio.create_task(transport.handle(socket)) for socket in sockets]
+    deadline = asyncio.get_running_loop().time() + 2
+    while len(transport.active_roles) != 2 and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0)
+    server_lease = role_owner.current("SERVER_AUTHORITY")
+    server = AuthenticatedRoleConnection(
+        connection_id=server_lease.connection_id,
+        handshake=server_lease.handshake,
+    )
+    controller_lease = role_owner.current("CLIENT_CONTROLLER")
+    await coordinator.prepare(
+        server,
+        VerifiedBodyBound(
+            server_boot_id="boot",
+            game_connection_id="game",
+            body_id=INTEGRATED_BODY,
+            client_install_id="client-test-1",
+            controller_connection_id=controller_lease.connection_id,
+            evidence_id="evidence",
+        ),
+    )
+    monkeypatch.setattr(
+        transport._body_routes,
+        "invalidate_lease",
+        lambda lease: (_ for _ in ()).throw(RuntimeError("route cleanup failed")),
+    )
+    tasks[0].cancel()
+    await commands.revoke_entered.wait()
+    assert role_owner.current("SERVER_AUTHORITY") is None
+    assert coordinator.pending_count == 0 and coordinator.active_snapshot() is None
+    assert coordinator.ingress is None and coordinator.quarantined
+    assert not sockets[0].close_entered.is_set()
+    commands.revoke_release.set()
+    await sockets[0].close_entered.wait()
+    sockets[0].close_release.set()
+    tasks[1].cancel()
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    assert any(isinstance(result, asyncio.CancelledError) for result in results)
+    assert transport.active_roles == () and transport.pending_count == 0
+
+
+@pytest.mark.asyncio
+async def test_protocol_close_reports_sanitized_route_cleanup_failure_after_all_cleanup(peers, monkeypatch):
+    clock = Clock()
+    role_owner = AuthenticatedControlRoleOwner(tuple(peer.context for peer in peers), "hub-test-1")
+    commands, stage = BindingCommands(), IntegratedStage()
+    commands.block_revoke = True
+    coordinator = _coordinator(role_owner, commands=commands, stage=stage, store=BindingStore())
+    transport = MinecraftV2AuthenticatedTransport(
+        peers=peers,
+        hub_install_id="hub-test-1",
+        monotonic_millis=clock,
+        utc_now=lambda: NOW,
+        nonce=lambda: HUB_NONCE,
+        challenge_id=lambda: CHALLENGE_ID,
+        role_owner=role_owner,
+        binding_coordinator=coordinator,
+    )
+    sockets = [Socket(peer) for peer in peers]
+    sockets[0].block_close = True
+    tasks = [asyncio.create_task(transport.handle(socket)) for socket in sockets]
+    deadline = asyncio.get_running_loop().time() + 2
+    while len(transport.active_roles) != 2 and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0)
+    server_lease = role_owner.current("SERVER_AUTHORITY")
+    server = AuthenticatedRoleConnection(
+        connection_id=server_lease.connection_id,
+        handshake=server_lease.handshake,
+    )
+    controller_lease = role_owner.current("CLIENT_CONTROLLER")
+    await coordinator.prepare(
+        server,
+        VerifiedBodyBound(
+            server_boot_id="boot",
+            game_connection_id="game",
+            body_id=INTEGRATED_BODY,
+            client_install_id="client-test-1",
+            controller_connection_id=controller_lease.connection_id,
+            evidence_id="evidence",
+        ),
+    )
+    attempts = []
+
+    def fail_invalidation(lease):
+        attempts.append(lease)
+        raise RuntimeError("raw cleanup backend detail")
+
+    monkeypatch.setattr(transport._body_routes, "invalidate_lease", fail_invalidation)
+    await sockets[0].messages.put("{}")
+    await commands.revoke_entered.wait()
+    assert role_owner.current("SERVER_AUTHORITY") is None
+    assert coordinator.pending_count == 0 and coordinator.active_snapshot() is None
+    assert coordinator.ingress is None and coordinator.quarantined
+    assert not sockets[0].close_entered.is_set() and attempts == [server_lease]
+    commands.revoke_release.set()
+    await sockets[0].close_entered.wait()
+    sockets[0].close_release.set()
+    with pytest.raises(V2TransportError, match="^v2 transport cleanup failed$") as raised:
+        await tasks[0]
+    assert raised.value.__cause__ is None
+    assert "raw cleanup backend detail" not in str(raised.value)
+    tasks[1].cancel()
+    await asyncio.gather(tasks[1], return_exceptions=True)
+    assert attempts.count(server_lease) == 1
+    assert sockets[0].closed == (1008, "FEATURE_DISABLED")
+    assert transport.active_roles == () and transport.pending_count == 0
+
+
+@pytest.mark.asyncio
+async def test_actual_transport_routes_notice_to_server_and_accepts_only_candidate_dto(peers):
+    clock = Clock()
+    transport = _transport(peers, clock)
+    server = Socket(peers[0], candidate=True)
+    controller = Socket(peers[1], business=True)
+    server_task = asyncio.create_task(transport.handle(server))
+    deadline = asyncio.get_running_loop().time() + 2
+    while (
+        "SERVER_AUTHORITY" not in transport._sessions
+        or transport._sessions["SERVER_AUTHORITY"][1].state is not PostAuthSessionState.APPLICATION_READY
+    ) and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0)
+    controller_task = asyncio.create_task(transport.handle(controller))
+    while not transport._body_routes.candidates() and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0)
+    candidates = transport._body_routes.candidates()
+    assert len(candidates) == 1 and candidates[0].body_id == "11111111-2222-4333-8444-555555555553"
+    route_frames = [item for item in server.sent if item.get("messageKind") == "BODY_BIND_ROUTE"]
+    assert len(route_frames) == 1
+    route = route_frames[0]
+    assert route["sourceInstallId"] == "client-test-1"
+    assert route["sourceConnectionId"] == controller.connection_id
+    assert route["recipientConnectionId"] == server.connection_id
+    assert route["challengeExpiresAt"] == ""
+    assert controller.closed is None and transport._binding is None
+    server_task.cancel()
+    controller_task.cancel()
+    await asyncio.gather(server_task, controller_task, return_exceptions=True)
+    assert transport.active_roles == () and transport._body_routes.candidates() == ()
 
 
 @pytest.mark.asyncio

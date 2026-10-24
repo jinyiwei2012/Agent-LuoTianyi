@@ -182,14 +182,44 @@ class PostAuthHubSession:
         self._owner_call()
         self._fail_closed()
 
-    def _admit(self, kind: str, payload: bytes, direction: str, now: int) -> None:
+    def send_body_bind_route(
+        self,
+        route_id: str,
+        source_install_id: str,
+        source_connection_id: str,
+        payload: bytes,
+    ) -> None:
+        self._owner_call()
+        try:
+            now = self._now()
+            if (
+                self._state is not PostAuthSessionState.APPLICATION_READY
+                or self._authenticated.context.peer_role != "SERVER_AUTHORITY"
+            ):
+                raise PostAuthSessionError("server route session is not ready")
+            self._check_liveness(now)
+            self._admit(
+                "BODY_BIND_ROUTE",
+                payload,
+                "HUB_TO_PEER",
+                now,
+                route_id=route_id,
+                source_install_id=source_install_id,
+                source_connection_id=source_connection_id,
+                recipient_connection_id=self._context.connection_id or "",
+            )
+        except BaseException:
+            self._fail_closed()
+            raise
+
+    def _admit(self, kind: str, payload: bytes, direction: str, now: int, **metadata: str) -> None:
         self._check_liveness(now)
-        entry = self._encode_entry(kind, payload, direction)
+        entry = self._encode_entry(kind, payload, direction, **metadata)
         self._outbound.append(entry)
         self._next_outbound = _increment(self._next_outbound)
         self._drain()
 
-    def _encode_entry(self, kind: str, payload: bytes, direction: str) -> _Entry:
+    def _encode_entry(self, kind: str, payload: bytes, direction: str, **metadata: str) -> _Entry:
         if len(self._outbound) >= _QUEUE_CAPACITY or self._next_outbound > _I63_MAX:
             raise PostAuthSessionError("outbound queue unavailable")
         frame = PostAuthFrame(
@@ -197,11 +227,11 @@ class PostAuthHubSession:
             challenge_id=self._authenticated.challenge_id,
             sequence=self._next_outbound,
             message_kind=kind,
-            route_id="",
-            source_install_id="",
-            source_connection_id="",
-            recipient_connection_id="",
-            challenge_expires_at="",
+            route_id=metadata.get("route_id", ""),
+            source_install_id=metadata.get("source_install_id", ""),
+            source_connection_id=metadata.get("source_connection_id", ""),
+            recipient_connection_id=metadata.get("recipient_connection_id", ""),
+            challenge_expires_at=metadata.get("challenge_expires_at", ""),
             payload=payload,
         )
         raw = encode_frame(frame, self._context, self._keys, direction)
