@@ -23,6 +23,19 @@
 
 改动代码前先读 [《代码地图》](docs/代码地图.md)（模块职责、边界、关键设计理由与测试入口）；领域术语见 [CONTEXT.md](CONTEXT.md)；路线图见 [docs/TODO.md](docs/TODO.md)；当前实现类文档见 [server/docs/dev/](server/docs/dev/)。
 
+## 提交前本地 CI 闸门（强制）
+
+推送分支、更新 PR 或创建 PR 之前，必须先在本地跑完与 `.github/workflows/ci.yml` 相同的离线检查并全部通过；不得把“等 CI 结果”当作第一道验证。
+
+- 一键执行：`python scripts/local_ci.py --jobs all`（使用已安装项目依赖的 Python 3.10，例如本机 `C:\Users\Administrator\.conda\envs\agent\python.exe`）。
+- 按改动范围执行：`--jobs auto` 会以 `upstream/dev` 的合并基点为基线选择作业；也可显式指定，如 `--jobs desktop-tests`。
+- 作业与 CI 一一对应：`changes`（改动范围与文档引用）、`server-lint`、`server-tests`、`desktop-tests`、`cli-tests`、`app-checks`、`admin-build`。
+- 本机前置条件：Python 3.10；`pip install -e server[dev] httpx`；`ruff 0.14.10` 与 `black 26.5.1`；Node 22（先 `npm ci`）；`ffmpeg`；`lychee 0.24.2`（已安装于 `%USERPROFILE%\.local\bin`，脚本会自动发现；缺失或版本不符时，纯文档改动的链接检查按“未验证”处理）。
+- 版本必须对齐 CI：Python、ruff、black、Node 版本与 CI 不一致时，本地通过不能等同于 CI 通过，须按 CI 版本复跑或在 PR 中注明差异。
+- 本机缺少 `lychee` 时，纯文档改动的 Markdown 链接检查无法复刻，必须在 PR 中写“未在本地验证”，不得写成通过。
+- 平台差异（Windows 对比 CI 的 `ubuntu-24.04`）导致的失败不得忽略：先在本地定位，确认属于环境差异才可放行，并在 PR 的验证一节写明。
+- 本地全绿只是前置拦截，仍须等待远端 CI 的真实结果，不能用本地结果替代远端证据。
+
 ## 仓库现状
 
 > 2026-11-06 快照；易过期的细节以分支、Issue、PR 为准，引用前先复核，不要当作长期事实。
