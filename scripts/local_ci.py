@@ -43,6 +43,9 @@ CLI_DIR = ROOT / "cli-client"
 APP_DIR = ROOT / "app"
 ADMIN_DIR = SERVER_DIR / "res" / "admin_ui"
 
+# 本地检查产物统一放这里，避免污染工作区；CI 在临时环境中直接写仓库路径。
+RESULTS_DIR = ROOT / ".ci-results"
+
 
 def env() -> dict[str, str]:
     merged = os.environ.copy()
@@ -151,49 +154,53 @@ def job_server_lint() -> None:
 
 def job_server_tests() -> None:
     ensure_server_config()
+    report = RESULTS_DIR / "server-test-results.xml"
     run(
         [PY, "-m", "pytest", "tests",
          "-m", "not external and not real_llm",
          "--ignore=tests/e2e/external",
-         "-q", "--tb=short", "--junitxml=test-results.xml"],
+         "-q", "--tb=short", f"--junitxml={report}"],
         SERVER_DIR,
     )
-    run([PY, "../.github/scripts/check_pytest_results.py", "test-results.xml"], SERVER_DIR)
+    run([PY, "../.github/scripts/check_pytest_results.py", str(report)], SERVER_DIR)
 
 
 def job_desktop_tests() -> None:
+    report = RESULTS_DIR / "desktop-test-results.xml"
     run(
         [PY, "-m", "pytest", "tests",
          "--ignore=tests/test_login.py",
          "--ignore=tests/test_communication.py",
          "--ignore=tests/test_ws_concurrent.py",
          "--ignore=tests/test_audio_base64.py",
-         "-q", "--tb=short", "--junitxml=test-results.xml"],
+         "-q", "--tb=short", f"--junitxml={report}"],
         CLIENT_DIR,
         extra_env={"QT_QPA_PLATFORM": "offscreen"},
     )
-    run([PY, "../.github/scripts/check_pytest_results.py", "test-results.xml"], CLIENT_DIR)
+    run([PY, "../.github/scripts/check_pytest_results.py", str(report)], CLIENT_DIR)
 
 
 def job_cli_tests() -> None:
+    report = RESULTS_DIR / "cli-test-results.xml"
     run(
-        [PY, "-m", "pytest", "tests", "-q", "--tb=short", "--junitxml=test-results.xml"],
+        [PY, "-m", "pytest", "tests", "-q", "--tb=short", f"--junitxml={report}"],
         CLI_DIR,
     )
-    run([PY, "../.github/scripts/check_pytest_results.py", "test-results.xml"], CLI_DIR)
+    run([PY, "../.github/scripts/check_pytest_results.py", str(report)], CLI_DIR)
 
 
 def job_app_checks() -> None:
     ensure_server_config()
+    report = RESULTS_DIR / "app-test-results.json"
     run(["npm", "run", "lint"], APP_DIR)
     run(["npx", "--no-install", "tsc", "--noEmit"], APP_DIR)
     run(
-        ["npx", "--no-install", "jest", "--runInBand", "--json", "--outputFile=test-results.json"],
+        ["npx", "--no-install", "jest", "--runInBand", "--json", f"--outputFile={report}"],
         APP_DIR,
         # 与 CI 一致：指定启动本机回环服务端的 Python，否则相关用例会被静默 skip。
         extra_env={"CALL_E2E_PYTHON": PY},
     )
-    results = json.loads((APP_DIR / "test-results.json").read_text(encoding="utf-8"))
+    results = json.loads(report.read_text(encoding="utf-8"))
     if (
         not results.get("success")
         or results.get("numTotalTests", 0) == 0
@@ -207,7 +214,11 @@ def job_app_checks() -> None:
 def job_admin_build(skip_install: bool) -> None:
     if not skip_install:
         run(["npm", "ci", "--prefer-offline", "--no-audit", "--no-fund"], ADMIN_DIR)
-    run(["npm", "run", "build"], ADMIN_DIR)
+    # CI 直接写入仓库内的 admin_static；本地改用临时输出目录，避免改写被跟踪的构建产物。
+    run(
+        ["npm", "run", "build", "--", "--outDir", str(RESULTS_DIR / "admin-build"), "--emptyOutDir"],
+        ADMIN_DIR,
+    )
 
 
 JOBS = {
@@ -279,6 +290,7 @@ def main() -> None:
 
     check_toolchain()
     base = find_base(args.base)
+    RESULTS_DIR.mkdir(exist_ok=True)
 
     if args.jobs == "auto":
         selected = auto_jobs(base)

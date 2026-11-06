@@ -47,3 +47,6 @@ config/bili_cookie.txt
 .slim/worktrees/
 .slim/worktrees.json
 .slim/deepwork/
+
+# 本地 CI 检查报告（scripts/local_ci.py）
+.ci-results/
