@@ -632,6 +632,40 @@ async def test_v2_activate_rechecks_ticket_after_guard(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_v2_activate_generation_only_change_rejects_and_keeps_state(tmp_path):
+    commands = Commands()
+    binding, routes, accepted, server, _, worker = await v2_fixture(tmp_path, commands)
+    dispatch = await binding.prepare_v2(routes, accepted.receipt)
+    prepare = dispatch.command
+    await binding.dispatch_v2_prepare(dispatch)
+    await binding.admit_v2_ready(server, VerifiedBindingReady(binding=prepare.binding, evidence_id="ready"))
+    ticket = binding._v2_tickets[prepare.binding.session_id]
+    pending = binding._pending[prepare.binding.session_id]
+    binds = []
+    original_bind = binding._stage.bind_minecraft_observations
+    binding._stage.bind_minecraft_observations = lambda scope: binds.append(scope)
+
+    def bump_generation():
+        binding._generation += 1
+
+    before = binding._generation
+    binding._monotonic_now = MutatingClock(bump_generation, at_call=1)
+    with pytest.raises(ControlBindingError, match="not current"):
+        await binding.activate_v2(server, VerifiedBindingActive(binding=prepare.binding, evidence_id="active"))
+    assert binding.active is None and binding.ingress is None
+    assert binds == []
+    assert binding._generation == before + 1
+    assert binding.pending_count == 1 and binding._pending.get(prepare.binding.session_id) is pending
+    assert ticket.state.value == "STALE_OR_UNKNOWN" and ticket.ready is None
+    assert pending.commit_io_pending is False
+    assert pending.phase is BindingPhase.COMMIT
+    assert commands.revoked == []
+    binding._stage.bind_minecraft_observations = original_bind
+    binding._fence_local("QUARANTINE")
+    await worker.close()
+
+
+@pytest.mark.asyncio
 async def test_v2_commit_send_rechecks_after_guard(tmp_path):
     commands = Commands()
     binding, routes, accepted, server, _, worker = await v2_fixture(tmp_path, commands)
