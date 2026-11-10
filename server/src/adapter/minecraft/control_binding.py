@@ -26,6 +26,7 @@ from src.adapter.minecraft.epoch_store import (
     VerifiedReadyContext,
 )
 from src.adapter.minecraft.epoch_worker import (
+    EpochCommitRequest,
     EpochJobHandle,
     EpochPreflightRequest,
     EpochPreflightSnapshot,
@@ -267,6 +268,7 @@ class _PendingBinding:
     v2: bool = False
     preflight: EpochPreflightSnapshot | None = None
     preflight_handle: EpochJobHandle | None = None
+    commit_io_pending: bool = False
     route_receipt: BodyRouteAdmissionReceipt | None = None
     route_context: BodyRoutePreflightContext | None = None
 
@@ -283,6 +285,7 @@ class _V2Ticket:
     ready: VerifiedBindingReady | None = None
     dispatch: V2PrepareDispatch | None = None
     command: BindingPrepare | None = None
+    commit: BindingCommit | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -553,6 +556,8 @@ class MinecraftControlBindingCoordinator:
         if not self._v2_ticket_current(ticket):
             await self._fail_v2_ticket(ticket, ControlBindingError("v2 prepare delivery is stale"))
         ticket.state = V2DispatchState.DELIVERED_CURRENT
+        if ticket.ready is not None:
+            await self._settle_v2_ready(ticket)
         return command
 
     def receive_v2_ready(self, server: AuthenticatedRoleConnection, ready: VerifiedBindingReady) -> None:
@@ -574,6 +579,110 @@ class MinecraftControlBindingCoordinator:
             self._fence_local("QUARANTINE")
             raise ControlBindingError("duplicate v2 READY")
         ticket.ready = ready
+
+    async def admit_v2_ready(
+        self,
+        server: AuthenticatedRoleConnection,
+        ready: VerifiedBindingReady,
+    ) -> BindingCommit | None:
+        """Record a READY and settle it once its ticket is already delivered."""
+        self._role_owner.assert_owner()
+        self.receive_v2_ready(server, ready)
+        ticket = self._v2_tickets.get(ready.binding.session_id)
+        if ticket is None or ticket.ready is not ready:
+            return None
+        if ticket.state is V2DispatchState.DELIVERED_CURRENT:
+            return await self._settle_v2_ready(ticket)
+        return None
+
+    async def _settle_v2_ready(self, ticket: _V2Ticket) -> BindingCommit:  # noqa: C901
+        """Run the store-owner READY CAS, then dispatch COMMIT once."""
+        self._role_owner.assert_owner()
+        pending = ticket.pending
+        ready = ticket.ready
+        if ready is None or ticket.state is not V2DispatchState.DELIVERED_CURRENT:
+            raise ControlBindingError("v2 READY is not dispatchable")
+        if ticket.commit is not None:
+            return ticket.commit
+        if pending.phase is not BindingPhase.PREPARE or not self._v2_ticket_current(ticket):
+            await self._fence_v2_ticket(ticket, "v2 READY is stale")
+        worker = self._epoch_worker
+        snapshot = pending.preflight
+        if worker is None or snapshot is None:
+            raise ControlBindingError("v2 control activation is disabled")
+        if not worker.validates_preflight(
+            snapshot,
+            provision_id=self._policy.provision_id,
+            body_id=self._policy.body_id,
+            coordinator_generation=ticket.generation,
+            route_id=ticket.route_id,
+            server_connection_id=ticket.server_lease.connection_id,
+            controller_connection_id=ticket.controller_lease.connection_id,
+        ):
+            await self._fence_v2_ticket(ticket, "v2 preflight is stale")
+        pending.commit_io_pending = True
+        committed_snapshot = None
+        try:
+            handle = worker.submit_commit(
+                EpochCommitRequest(
+                    preflight=snapshot,
+                    evidence_id=ready.evidence_id,
+                    pending_identity=pending,
+                    coordinator_generation=ticket.generation,
+                    route_id=ticket.route_id,
+                    server_connection_id=ticket.server_lease.connection_id,
+                    controller_connection_id=ticket.controller_lease.connection_id,
+                )
+            )
+            await worker.wait(handle)
+            committed_snapshot = worker.take_commit(handle)
+        except asyncio.CancelledError as cancellation:
+            ticket.state = V2DispatchState.STALE_OR_UNKNOWN
+            ticket.ready = None
+            command = self._fence_local("QUARANTINE")
+            await self._best_effort_revoke(command)
+            raise cancellation
+        except Exception:
+            await self._fence_v2_ticket(ticket, "v2 epoch commit failed")
+        finally:
+            pending.commit_io_pending = False
+        if committed_snapshot is None:
+            await self._fence_v2_ticket(ticket, "v2 epoch commit failed")
+        if not self._v2_ticket_current(ticket) or pending.phase is not BindingPhase.PREPARE:
+            await self._fence_v2_ticket(ticket, "v2 epoch commit is stale")
+        if (
+            committed_snapshot.pending_identity is not pending
+            or committed_snapshot.coordinator_generation != ticket.generation
+            or committed_snapshot.last_epoch != pending.binding.session_epoch
+        ):
+            await self._fence_v2_ticket(ticket, "v2 epoch commit mismatch")
+        pending.phase = BindingPhase.COMMIT
+        pending.committed = CommittedEpoch(
+            committed_snapshot.provision_id,
+            committed_snapshot.body_id,
+            committed_snapshot.last_epoch,
+            committed_snapshot.generation,
+        )
+        command = BindingCommit(binding=pending.binding)
+        try:
+            await self._commands.send(command)
+        except asyncio.CancelledError as cancellation:
+            await self._cancelled_pending_fence(pending, "QUARANTINE", cancellation)
+        except Exception as error:
+            await self._fence_pending(pending, "QUARANTINE")
+            raise ControlBindingError("v2 commit delivery is uncertain") from error
+        if not self._guard_current(pending, BindingPhase.COMMIT):
+            raise ControlBindingError("v2 commit delivery completed after authority changed")
+        ticket.commit = command
+        return command
+
+    async def _fence_v2_ticket(self, ticket: _V2Ticket, message: str) -> None:
+        ticket.state = V2DispatchState.STALE_OR_UNKNOWN
+        ticket.ready = None
+        if self._v2_ticket_current_owned(ticket):
+            command = self._fence_local("QUARANTINE")
+            await self._best_effort_revoke(command)
+        raise ControlBindingError(message)
 
     def _v2_ticket_current(self, ticket: _V2Ticket) -> bool:
         return (
@@ -759,7 +868,14 @@ class MinecraftControlBindingCoordinator:
         await self._begin_operation()
         pending_value = self._pending.get(active.binding.session_id)
         if pending_value is not None and pending_value.v2:
-            raise ControlBindingError("v2 ACTIVE is disabled")
+            ticket = self._v2_tickets.get(active.binding.session_id)
+            if (
+                ticket is None
+                or ticket.commit is None
+                or pending_value.phase is not BindingPhase.COMMIT
+                or not self._v2_ticket_current(ticket)
+            ):
+                raise ControlBindingError("v2 ACTIVE is not current")
         if self._active is not None and self._active.binding == active.binding:
             self._require_current(server, _SERVER)
             if self._ingress is None or self.active_snapshot() is None:
@@ -796,6 +912,7 @@ class MinecraftControlBindingCoordinator:
         )
         pending.phase = BindingPhase.ACTIVE
         self._pending.pop(pending.binding.session_id, None)
+        self._v2_tickets.pop(pending.binding.session_id, None)
         self._ingress = ingress
         self._quarantined = False
         self._generation += 1

@@ -325,7 +325,7 @@ async def v2_fixture(tmp_path, commands=None):
 
 
 @pytest.mark.asyncio
-async def test_v2_headless_admission_dispatch_and_early_ready_never_commit(tmp_path):
+async def test_v2_headless_admission_early_ready_commits_after_send_without_activation(tmp_path):
     commands = BlockingCommands()
     binding, routes, accepted, server, _, worker = await v2_fixture(tmp_path, commands)
     dispatch = await binding.prepare_v2(routes, accepted.receipt)
@@ -337,14 +337,85 @@ async def test_v2_headless_admission_dispatch_and_early_ready_never_commit(tmp_p
     await commands.send_entered.wait()
     binding.receive_v2_ready(server, VerifiedBindingReady(binding=prepare.binding, evidence_id="early"))
     ticket = binding._v2_tickets[prepare.binding.session_id]
+    pending = binding._pending[prepare.binding.session_id]
     assert ticket.ready is not None and ticket.state.value == "DISPATCHING"
-    assert binding._pending[prepare.binding.session_id].phase is BindingPhase.PREPARE
+    assert pending.phase is BindingPhase.PREPARE
     commands.send_release.set()
     assert await task == prepare
     with pytest.raises(ControlBindingError):
         await binding.dispatch_v2_prepare(dispatch)
     assert ticket.state.value == "DELIVERED_CURRENT"
+    assert pending.phase is BindingPhase.COMMIT and pending.commit_io_pending is False
+    assert pending.committed is not None
+    assert pending.committed.last_epoch == prepare.binding.session_epoch
+    assert [type(command) for command in commands.sent] == [BindingPrepare, BindingCommit]
+    assert ticket.commit is not None
     assert binding.active is None and binding.ingress is None
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_v2_ready_after_dispatch_commits_and_requires_explicit_active(tmp_path):
+    commands = Commands()
+    binding, routes, accepted, server, _, worker = await v2_fixture(tmp_path, commands)
+    dispatch = await binding.prepare_v2(routes, accepted.receipt)
+    prepare = dispatch.command
+    assert await binding.dispatch_v2_prepare(dispatch) == prepare
+    pending = binding._pending[prepare.binding.session_id]
+    assert pending.phase is BindingPhase.PREPARE and worker.outstanding_count == 1
+    commit = await binding.admit_v2_ready(server, VerifiedBindingReady(binding=prepare.binding, evidence_id="ready"))
+    assert commit is not None and commit.binding == prepare.binding
+    assert [type(command) for command in commands.sent] == [BindingPrepare, BindingCommit]
+    assert pending.phase is BindingPhase.COMMIT and pending.commit_io_pending is False
+    assert worker.outstanding_count == 0
+    assert binding.active is None and binding.ingress is None
+    active = VerifiedBindingActive(binding=prepare.binding, evidence_id="active")
+    ingress = await binding.activate(server, active)
+    assert ingress is not None and binding.active is not None
+    assert await binding.activate(server, active) is ingress
+    assert binding.pending_count == 0
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_v2_ready_settlement_rechecks_obsolete_preflight(tmp_path):
+    binding, routes, accepted, server, _, worker = await v2_fixture(tmp_path)
+    dispatch = await binding.prepare_v2(routes, accepted.receipt)
+    prepare = dispatch.command
+    await binding.dispatch_v2_prepare(dispatch)
+    pending = binding._pending[prepare.binding.session_id]
+    worker.mark_obsolete(pending.preflight)
+    with pytest.raises(ControlBindingError, match="preflight is stale"):
+        await binding.admit_v2_ready(server, VerifiedBindingReady(binding=prepare.binding, evidence_id="ready"))
+    assert binding.quarantined and binding.pending_count == 0
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_v2_commit_send_failure_fences_after_durable_cas(tmp_path):
+    commands = Commands()
+    binding, routes, accepted, server, _, worker = await v2_fixture(tmp_path, commands)
+    dispatch = await binding.prepare_v2(routes, accepted.receipt)
+    prepare = dispatch.command
+    await binding.dispatch_v2_prepare(dispatch)
+    commands.fail_send = True
+    with pytest.raises(ControlBindingError, match="uncertain"):
+        await binding.admit_v2_ready(server, VerifiedBindingReady(binding=prepare.binding, evidence_id="ready"))
+    assert binding.quarantined and binding.pending_count == 0
+    assert binding.active is None
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_v2_activate_before_commit_is_rejected(tmp_path):
+    binding, routes, accepted, server, _, worker = await v2_fixture(tmp_path)
+    dispatch = await binding.prepare_v2(routes, accepted.receipt)
+    prepare = dispatch.command
+    await binding.dispatch_v2_prepare(dispatch)
+    with pytest.raises(ControlBindingError, match="not current"):
+        await binding.activate(server, VerifiedBindingActive(binding=prepare.binding, evidence_id="active"))
+    assert binding.active is None and binding.pending_count == 1
+    binding._fence_local("QUARANTINE")
     await worker.close()
 
 
