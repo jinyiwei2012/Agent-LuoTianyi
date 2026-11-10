@@ -69,6 +69,53 @@ class BlockingCommands(Commands):
             await self.revoke_release.wait()
 
 
+class BlockingWorker:
+    """Delegate to a real worker but hold the Nth wait open for interleaving."""
+
+    def __init__(self, worker, *, block_from=2):
+        self.worker = worker
+        self.waits = 0
+        self.block_from = block_from
+        self.wait_entered = asyncio.Event()
+        self.wait_release = asyncio.Event()
+
+    @property
+    def state(self):
+        return self.worker.state
+
+    @property
+    def outstanding_count(self):
+        return self.worker.outstanding_count
+
+    def submit_preflight(self, request):
+        return self.worker.submit_preflight(request)
+
+    def take_preflight(self, handle):
+        return self.worker.take_preflight(handle)
+
+    def validates_preflight(self, snapshot, **kwargs):
+        return self.worker.validates_preflight(snapshot, **kwargs)
+
+    def submit_commit(self, request):
+        return self.worker.submit_commit(request)
+
+    def take_commit(self, handle):
+        return self.worker.take_commit(handle)
+
+    def mark_obsolete(self, value):
+        return self.worker.mark_obsolete(value)
+
+    async def wait(self, handle):
+        self.waits += 1
+        if self.waits >= self.block_from:
+            self.wait_entered.set()
+            await self.wait_release.wait()
+        await self.worker.wait(handle)
+
+    async def close(self):
+        await self.worker.close()
+
+
 class Store:
     def __init__(self):
         self.last_epoch = 0
@@ -402,6 +449,67 @@ async def test_v2_commit_send_failure_fences_after_durable_cas(tmp_path):
     with pytest.raises(ControlBindingError, match="uncertain"):
         await binding.admit_v2_ready(server, VerifiedBindingReady(binding=prepare.binding, evidence_id="ready"))
     assert binding.quarantined and binding.pending_count == 0
+    assert binding.active is None
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_v2_disconnect_during_commit_io_pending_fences_and_leaves_epoch_gap(tmp_path):
+    commands = Commands()
+    binding, routes, accepted, server, _, worker = await v2_fixture(tmp_path, commands)
+    blocking = BlockingWorker(worker)
+    binding._epoch_worker = blocking
+    dispatch = await binding.prepare_v2(routes, accepted.receipt)
+    prepare = dispatch.command
+    await binding.dispatch_v2_prepare(dispatch)
+    pending = binding._pending[prepare.binding.session_id]
+    task = asyncio.create_task(
+        binding.admit_v2_ready(server, VerifiedBindingReady(binding=prepare.binding, evidence_id="ready"))
+    )
+    await blocking.wait_entered.wait()
+    assert pending.commit_io_pending is True
+    assert worker.outstanding_count == 1
+    lease = binding.role_owner.current("CLIENT_CONTROLLER")
+    withdrawal = binding.role_owner.withdraw(lease)
+    revoke = binding.fence_role_withdrawal(withdrawal)
+    assert binding.quarantined and binding.pending_count == 0
+    blocking.wait_release.set()
+    with pytest.raises(ControlBindingError):
+        await task
+    await binding.notify_revoke(revoke)
+    assert [type(item) for item in commands.sent] == [BindingPrepare]
+    assert binding.active is None and binding.ingress is None
+    assert binding._epoch_worker is blocking
+    handle = worker.submit_preflight(
+        EpochPreflightRequest(
+            provision_id=PROVISION,
+            body_id=BODY,
+            coordinator_generation=0,
+            route_id="b0000000-0000-4000-8000-00000000000b",
+            server_connection_id=SERVER_CONNECTION,
+            controller_connection_id=CLIENT_CONNECTION,
+        )
+    )
+    await worker.wait(handle)
+    snapshot = worker.take_preflight(handle)
+    assert snapshot.expected_last_epoch == prepare.binding.session_epoch
+    assert snapshot.next_epoch == prepare.binding.session_epoch + 1
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_v2_duplicate_ready_after_commit_fences_without_second_commit(tmp_path):
+    commands = Commands()
+    binding, routes, accepted, server, _, worker = await v2_fixture(tmp_path, commands)
+    dispatch = await binding.prepare_v2(routes, accepted.receipt)
+    prepare = dispatch.command
+    await binding.dispatch_v2_prepare(dispatch)
+    await binding.admit_v2_ready(server, VerifiedBindingReady(binding=prepare.binding, evidence_id="ready"))
+    assert [type(item) for item in commands.sent] == [BindingPrepare, BindingCommit]
+    with pytest.raises(ControlBindingError, match="duplicate"):
+        await binding.admit_v2_ready(server, VerifiedBindingReady(binding=prepare.binding, evidence_id="again"))
+    assert binding.quarantined and binding.pending_count == 0
+    assert [type(item) for item in commands.sent] == [BindingPrepare, BindingCommit]
     assert binding.active is None
     await worker.close()
 
