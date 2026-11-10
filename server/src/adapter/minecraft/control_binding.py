@@ -672,6 +672,15 @@ class MinecraftControlBindingCoordinator:
         )
         command = BindingCommit(binding=pending.binding)
         await self._begin_operation()
+        if (
+            not self._v2_ticket_current(ticket)
+            or pending.phase is not BindingPhase.COMMIT
+            or ticket.commit is not None
+            or self._generation != ticket.generation
+        ):
+            ticket.state = V2DispatchState.STALE_OR_UNKNOWN
+            ticket.ready = None
+            raise ControlBindingError("v2 commit send is stale")
         try:
             await self._commands.send(command)
         except asyncio.CancelledError as cancellation:
@@ -917,14 +926,26 @@ class MinecraftControlBindingCoordinator:
             or not self._v2_ticket_current(ticket)
         ):
             raise ControlBindingError("v2 ACTIVE is not current")
-        return await self._activate(server, active)
+        return await self._activate(server, active, v2_ticket=ticket)
 
     async def _activate(
         self,
         server: AuthenticatedRoleConnection,
         active: VerifiedBindingActive,
+        *,
+        v2_ticket: _V2Ticket | None = None,
     ) -> TypedMinecraftObservationIngress:
         await self._begin_operation()
+        if v2_ticket is not None and (
+            not self._v2_ticket_current(v2_ticket)
+            or self._v2_tickets.get(active.binding.session_id) is not v2_ticket
+            or v2_ticket.commit is None
+            or self._pending.get(active.binding.session_id) is not v2_ticket.pending
+            or v2_ticket.pending.phase is not BindingPhase.COMMIT
+        ):
+            v2_ticket.state = V2DispatchState.STALE_OR_UNKNOWN
+            v2_ticket.ready = None
+            raise ControlBindingError("v2 ACTIVE is not current")
         if self._active is not None and self._active.binding == active.binding:
             self._require_current(server, _SERVER)
             if self._ingress is None or self.active_snapshot() is None:

@@ -575,12 +575,74 @@ async def test_v2_unknown_session_ready_fences_current_ticket(tmp_path):
 
 @pytest.mark.asyncio
 async def test_legacy_prepare_never_reuses_v2_pending(tmp_path):
-    binding, routes, accepted, server, _, worker = await v2_fixture(tmp_path)
-    await binding.prepare_v2(routes, accepted.receipt)
+    commands = Commands()
+    binding, routes, accepted, server, _, worker = await v2_fixture(tmp_path, commands)
+    dispatch = await binding.prepare_v2(routes, accepted.receipt)
+    pending = binding._pending[dispatch.command.binding.session_id]
     with pytest.raises(ControlBindingError, match="disabled"):
-        await binding.prepare(server, body_bound())
+        await binding.prepare(server, pending.body_bound)
+    assert [type(item) for item in commands.sent] == []
     assert binding.pending_count == 1
     binding._fence_local("QUARANTINE")
+    await worker.close()
+
+
+class MutatingClock:
+    """Return a valid time but change coordinator state on the Nth call."""
+
+    def __init__(self, mutate, *, at_call):
+        self.mutate = mutate
+        self.at_call = at_call
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        if self.calls == self.at_call:
+            self.mutate()
+        return 10.0
+
+
+def local_state_drop(binding):
+    """Simulate a reentrant port that removes local authority without cleanup."""
+
+    def drop():
+        binding._active = None
+        binding._ingress = None
+        binding._pending.clear()
+        binding._v2_tickets.clear()
+        binding._quarantined = True
+        binding._generation += 1
+
+    return drop
+
+
+@pytest.mark.asyncio
+async def test_v2_activate_rechecks_ticket_after_guard(tmp_path):
+    commands = Commands()
+    binding, routes, accepted, server, _, worker = await v2_fixture(tmp_path, commands)
+    dispatch = await binding.prepare_v2(routes, accepted.receipt)
+    prepare = dispatch.command
+    await binding.dispatch_v2_prepare(dispatch)
+    await binding.admit_v2_ready(server, VerifiedBindingReady(binding=prepare.binding, evidence_id="ready"))
+    binding._monotonic_now = MutatingClock(local_state_drop(binding), at_call=1)
+    with pytest.raises(ControlBindingError, match="not current"):
+        await binding.activate_v2(server, VerifiedBindingActive(binding=prepare.binding, evidence_id="active"))
+    assert binding.active is None
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_v2_commit_send_rechecks_after_guard(tmp_path):
+    commands = Commands()
+    binding, routes, accepted, server, _, worker = await v2_fixture(tmp_path, commands)
+    dispatch = await binding.prepare_v2(routes, accepted.receipt)
+    prepare = dispatch.command
+    await binding.dispatch_v2_prepare(dispatch)
+    binding._monotonic_now = MutatingClock(local_state_drop(binding), at_call=3)
+    with pytest.raises(ControlBindingError, match="send is stale"):
+        await binding.admit_v2_ready(server, VerifiedBindingReady(binding=prepare.binding, evidence_id="ready"))
+    assert [type(item) for item in commands.sent] == [BindingPrepare]
+    assert binding.quarantined and binding.active is None
     await worker.close()
 
 
