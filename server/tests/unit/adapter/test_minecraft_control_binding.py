@@ -417,9 +417,11 @@ async def test_v2_ready_after_dispatch_commits_and_requires_explicit_active(tmp_
     assert worker.outstanding_count == 0
     assert binding.active is None and binding.ingress is None
     active = VerifiedBindingActive(binding=prepare.binding, evidence_id="active")
-    ingress = await binding.activate(server, active)
+    with pytest.raises(ControlBindingError, match="headless"):
+        await binding.activate(server, active)
+    ingress = await binding.activate_v2(server, active)
     assert ingress is not None and binding.active is not None
-    assert await binding.activate(server, active) is ingress
+    assert await binding.activate_v2(server, active) is ingress
     assert binding.pending_count == 0
     await worker.close()
 
@@ -453,8 +455,23 @@ async def test_v2_commit_send_failure_fences_after_durable_cas(tmp_path):
     await worker.close()
 
 
+class SecondSendBlockingCommands(Commands):
+    def __init__(self):
+        super().__init__()
+        self.sends = 0
+        self.commit_entered = asyncio.Event()
+        self.commit_release = asyncio.Event()
+
+    async def send(self, command):
+        self.sends += 1
+        self.sent.append(command)
+        if self.sends >= 2:
+            self.commit_entered.set()
+            await self.commit_release.wait()
+
+
 @pytest.mark.asyncio
-async def test_v2_disconnect_during_commit_io_pending_fences_and_leaves_epoch_gap(tmp_path):
+async def test_v2_disconnect_during_commit_io_pending_fences_and_releases_slot(tmp_path):
     commands = Commands()
     binding, routes, accepted, server, _, worker = await v2_fixture(tmp_path, commands)
     blocking = BlockingWorker(worker)
@@ -468,7 +485,6 @@ async def test_v2_disconnect_during_commit_io_pending_fences_and_leaves_epoch_ga
     )
     await blocking.wait_entered.wait()
     assert pending.commit_io_pending is True
-    assert worker.outstanding_count == 1
     lease = binding.role_owner.current("CLIENT_CONTROLLER")
     withdrawal = binding.role_owner.withdraw(lease)
     revoke = binding.fence_role_withdrawal(withdrawal)
@@ -480,6 +496,37 @@ async def test_v2_disconnect_during_commit_io_pending_fences_and_leaves_epoch_ga
     assert [type(item) for item in commands.sent] == [BindingPrepare]
     assert binding.active is None and binding.ingress is None
     assert binding._epoch_worker is blocking
+    assert pending.commit_io_pending is False
+    for _ in range(200):
+        if worker.outstanding_count == 0:
+            break
+        await asyncio.sleep(0.01)
+    assert worker.outstanding_count == 0
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_v2_disconnect_during_commit_send_leaves_unused_epoch_gap(tmp_path):
+    commands = SecondSendBlockingCommands()
+    binding, routes, accepted, server, _, worker = await v2_fixture(tmp_path, commands)
+    dispatch = await binding.prepare_v2(routes, accepted.receipt)
+    prepare = dispatch.command
+    await binding.dispatch_v2_prepare(dispatch)
+    pending = binding._pending[prepare.binding.session_id]
+    task = asyncio.create_task(
+        binding.admit_v2_ready(server, VerifiedBindingReady(binding=prepare.binding, evidence_id="ready"))
+    )
+    await commands.commit_entered.wait()
+    assert pending.phase is BindingPhase.COMMIT and pending.commit_io_pending is False
+    lease = binding.role_owner.current("CLIENT_CONTROLLER")
+    withdrawal = binding.role_owner.withdraw(lease)
+    revoke = binding.fence_role_withdrawal(withdrawal)
+    commands.commit_release.set()
+    with pytest.raises(ControlBindingError, match="authority changed"):
+        await task
+    await binding.notify_revoke(revoke)
+    assert [type(item) for item in commands.sent] == [BindingPrepare, BindingCommit]
+    assert binding.quarantined and binding.active is None and binding.ingress is None
     handle = worker.submit_preflight(
         EpochPreflightRequest(
             provision_id=PROVISION,
@@ -494,6 +541,46 @@ async def test_v2_disconnect_during_commit_io_pending_fences_and_leaves_epoch_ga
     snapshot = worker.take_preflight(handle)
     assert snapshot.expected_last_epoch == prepare.binding.session_epoch
     assert snapshot.next_epoch == prepare.binding.session_epoch + 1
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_v2_ready_after_expiry_fences_without_commit(tmp_path):
+    commands = Commands()
+    binding, routes, accepted, server, _, worker = await v2_fixture(tmp_path, commands)
+    dispatch = await binding.prepare_v2(routes, accepted.receipt)
+    prepare = dispatch.command
+    await binding.dispatch_v2_prepare(dispatch)
+    binding._monotonic_now = lambda: 60.0
+    with pytest.raises(ControlBindingError, match="expired"):
+        await binding.admit_v2_ready(server, VerifiedBindingReady(binding=prepare.binding, evidence_id="ready"))
+    assert [type(item) for item in commands.sent] == [BindingPrepare]
+    assert binding.quarantined and binding.pending_count == 0
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_v2_unknown_session_ready_fences_current_ticket(tmp_path):
+    commands = Commands()
+    binding, routes, accepted, server, _, worker = await v2_fixture(tmp_path, commands)
+    dispatch = await binding.prepare_v2(routes, accepted.receipt)
+    prepare = dispatch.command
+    await binding.dispatch_v2_prepare(dispatch)
+    foreign = replace(prepare.binding, session_id="c0000000-0000-4000-8000-00000000000c")
+    with pytest.raises(ControlBindingError, match="does not match current ticket"):
+        binding.receive_v2_ready(server, VerifiedBindingReady(binding=foreign, evidence_id="foreign"))
+    assert binding.quarantined and binding.pending_count == 0
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_prepare_never_reuses_v2_pending(tmp_path):
+    binding, routes, accepted, server, _, worker = await v2_fixture(tmp_path)
+    await binding.prepare_v2(routes, accepted.receipt)
+    with pytest.raises(ControlBindingError, match="disabled"):
+        await binding.prepare(server, body_bound())
+    assert binding.pending_count == 1
+    binding._fence_local("QUARANTINE")
     await worker.close()
 
 
@@ -521,7 +608,7 @@ async def test_v2_activate_before_commit_is_rejected(tmp_path):
     prepare = dispatch.command
     await binding.dispatch_v2_prepare(dispatch)
     with pytest.raises(ControlBindingError, match="not current"):
-        await binding.activate(server, VerifiedBindingActive(binding=prepare.binding, evidence_id="active"))
+        await binding.activate_v2(server, VerifiedBindingActive(binding=prepare.binding, evidence_id="active"))
     assert binding.active is None and binding.pending_count == 1
     binding._fence_local("QUARANTINE")
     await worker.close()

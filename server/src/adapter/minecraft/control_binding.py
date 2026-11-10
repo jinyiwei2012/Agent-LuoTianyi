@@ -268,6 +268,7 @@ class _PendingBinding:
     v2: bool = False
     preflight: EpochPreflightSnapshot | None = None
     preflight_handle: EpochJobHandle | None = None
+    commit_handle: EpochJobHandle | None = None
     commit_io_pending: bool = False
     route_receipt: BodyRouteAdmissionReceipt | None = None
     route_context: BodyRoutePreflightContext | None = None
@@ -563,7 +564,10 @@ class MinecraftControlBindingCoordinator:
     def receive_v2_ready(self, server: AuthenticatedRoleConnection, ready: VerifiedBindingReady) -> None:
         self._require_current(server, _SERVER)
         ticket = self._v2_tickets.get(ready.binding.session_id)
-        if ticket is None or not self._v2_ticket_current(ticket):
+        if ticket is None:
+            self._fence_local("QUARANTINE")
+            raise ControlBindingError("v2 READY does not match current ticket")
+        if not self._v2_ticket_current(ticket):
             raise ControlBindingError("v2 READY does not match current ticket")
         if ticket.pending.binding != ready.binding:
             ticket.state = V2DispatchState.STALE_OR_UNKNOWN
@@ -604,6 +608,7 @@ class MinecraftControlBindingCoordinator:
             raise ControlBindingError("v2 READY is not dispatchable")
         if ticket.commit is not None:
             return ticket.commit
+        await self._begin_operation()
         if pending.phase is not BindingPhase.PREPARE or not self._v2_ticket_current(ticket):
             await self._fence_v2_ticket(ticket, "v2 READY is stale")
         worker = self._epoch_worker
@@ -623,7 +628,7 @@ class MinecraftControlBindingCoordinator:
         pending.commit_io_pending = True
         committed_snapshot = None
         try:
-            handle = worker.submit_commit(
+            pending.commit_handle = worker.submit_commit(
                 EpochCommitRequest(
                     preflight=snapshot,
                     evidence_id=ready.evidence_id,
@@ -634,8 +639,9 @@ class MinecraftControlBindingCoordinator:
                     controller_connection_id=ticket.controller_lease.connection_id,
                 )
             )
-            await worker.wait(handle)
-            committed_snapshot = worker.take_commit(handle)
+            await worker.wait(pending.commit_handle)
+            committed_snapshot = worker.take_commit(pending.commit_handle)
+            pending.commit_handle = None
         except asyncio.CancelledError as cancellation:
             ticket.state = V2DispatchState.STALE_OR_UNKNOWN
             ticket.ready = None
@@ -648,6 +654,7 @@ class MinecraftControlBindingCoordinator:
             pending.commit_io_pending = False
         if committed_snapshot is None:
             await self._fence_v2_ticket(ticket, "v2 epoch commit failed")
+        await self._begin_operation()
         if not self._v2_ticket_current(ticket) or pending.phase is not BindingPhase.PREPARE:
             await self._fence_v2_ticket(ticket, "v2 epoch commit is stale")
         if (
@@ -664,6 +671,7 @@ class MinecraftControlBindingCoordinator:
             committed_snapshot.generation,
         )
         command = BindingCommit(binding=pending.binding)
+        await self._begin_operation()
         try:
             await self._commands.send(command)
         except asyncio.CancelledError as cancellation:
@@ -671,7 +679,14 @@ class MinecraftControlBindingCoordinator:
         except Exception as error:
             await self._fence_pending(pending, "QUARANTINE")
             raise ControlBindingError("v2 commit delivery is uncertain") from error
-        if not self._guard_current(pending, BindingPhase.COMMIT):
+        if (
+            not self._v2_ticket_current(ticket)
+            or ticket.commit is not None
+            or pending.phase is not BindingPhase.COMMIT
+            or self._generation != ticket.generation
+        ):
+            ticket.state = V2DispatchState.STALE_OR_UNKNOWN
+            ticket.ready = None
             raise ControlBindingError("v2 commit delivery completed after authority changed")
         ticket.commit = command
         return command
@@ -709,6 +724,15 @@ class MinecraftControlBindingCoordinator:
             and self._pending.get(ticket.session_id) is ticket.pending
             and self._generation == ticket.generation
         )
+
+    def _obsolete_commit(self, handle: EpochJobHandle | None) -> None:
+        """Mark an in-flight COMMIT job obsolete; a settled job is not an error."""
+        if self._epoch_worker is None or handle is None:
+            return
+        try:
+            self._epoch_worker.mark_obsolete(handle)
+        except EpochWorkerError:
+            pass
 
     def _obsolete_preflight(self, handle, snapshot) -> None:
         if self._epoch_worker is None or (handle is None and snapshot is None):
@@ -750,6 +774,8 @@ class MinecraftControlBindingCoordinator:
         ):
             raise ControlBindingError("body-bound evidence does not match current controller")
         for pending in self._pending.values():
+            if pending.v2:
+                continue
             if (
                 pending.phase is BindingPhase.PREPARE
                 and pending.body_bound == body_bound
@@ -865,17 +891,40 @@ class MinecraftControlBindingCoordinator:
         server: AuthenticatedRoleConnection,
         active: VerifiedBindingActive,
     ) -> TypedMinecraftObservationIngress:
-        await self._begin_operation()
+        """Legacy entry: v2 pendings stay owned by the headless ticket path."""
         pending_value = self._pending.get(active.binding.session_id)
         if pending_value is not None and pending_value.v2:
-            ticket = self._v2_tickets.get(active.binding.session_id)
-            if (
-                ticket is None
-                or ticket.commit is None
-                or pending_value.phase is not BindingPhase.COMMIT
-                or not self._v2_ticket_current(ticket)
-            ):
-                raise ControlBindingError("v2 ACTIVE is not current")
+            raise ControlBindingError("v2 ACTIVE requires headless ticket handling")
+        return await self._activate(server, active)
+
+    async def activate_v2(
+        self,
+        server: AuthenticatedRoleConnection,
+        active: VerifiedBindingActive,
+    ) -> TypedMinecraftObservationIngress:
+        """Explicit v2 ACTIVE for the exact committed ticket generation."""
+        self._role_owner.assert_owner()
+        if self._active is not None and self._active.binding == active.binding:
+            return await self._activate(server, active)
+        ticket = self._v2_tickets.get(active.binding.session_id)
+        pending_value = self._pending.get(active.binding.session_id)
+        if (
+            ticket is None
+            or pending_value is None
+            or not pending_value.v2
+            or ticket.commit is None
+            or pending_value.phase is not BindingPhase.COMMIT
+            or not self._v2_ticket_current(ticket)
+        ):
+            raise ControlBindingError("v2 ACTIVE is not current")
+        return await self._activate(server, active)
+
+    async def _activate(
+        self,
+        server: AuthenticatedRoleConnection,
+        active: VerifiedBindingActive,
+    ) -> TypedMinecraftObservationIngress:
+        await self._begin_operation()
         if self._active is not None and self._active.binding == active.binding:
             self._require_current(server, _SERVER)
             if self._ingress is None or self.active_snapshot() is None:
@@ -1062,6 +1111,11 @@ class MinecraftControlBindingCoordinator:
         if binding is None and self._pending:
             binding = next(iter(self._pending.values())).binding
         handoffs = [(pending.preflight_handle, pending.preflight) for pending in self._pending.values() if pending.v2]
+        commit_handles = [
+            pending.commit_handle
+            for pending in self._pending.values()
+            if pending.v2 and pending.commit_handle is not None
+        ]
         for ticket in self._v2_tickets.values():
             ticket.state = V2DispatchState.STALE_OR_UNKNOWN
             ticket.ready = None
@@ -1082,12 +1136,7 @@ class MinecraftControlBindingCoordinator:
         self._v2_tickets.clear()
         self._quarantined = True
         self._generation += 1
-        cleanup_error = None
-        for handle, snapshot in handoffs:
-            try:
-                self._obsolete_preflight(handle, snapshot)
-            except BaseException as error:
-                cleanup_error = cleanup_error or error
+        cleanup_error = self._obsolete_handoffs(handoffs, commit_handles)
         if observation is not None:
             try:
                 self._stage.unbind_minecraft_observations(observation.observation_scope)
@@ -1096,6 +1145,21 @@ class MinecraftControlBindingCoordinator:
         if cleanup_error is not None:
             raise cleanup_error
         return None if binding is None else BindingRevoke(binding=binding, reason=reason)
+
+    def _obsolete_handoffs(self, handoffs, commit_handles) -> BaseException | None:
+        """Best-effort obsolete of every live v2 handoff; first error wins."""
+        cleanup_error = None
+        for handle, snapshot in handoffs:
+            try:
+                self._obsolete_preflight(handle, snapshot)
+            except BaseException as error:
+                cleanup_error = cleanup_error or error
+        for handle in commit_handles:
+            try:
+                self._obsolete_commit(handle)
+            except BaseException as error:
+                cleanup_error = cleanup_error or error
+        return cleanup_error
 
     async def _best_effort_revoke(self, command: BindingRevoke | None) -> None:
         if command is None:

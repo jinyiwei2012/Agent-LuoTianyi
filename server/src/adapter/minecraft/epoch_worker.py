@@ -386,6 +386,11 @@ class MinecraftEpochStoreWorker:
         self._owner()
         job = self._job(handle)
         while not job.future.done():
+            if self._jobs.get(handle._identity) is not job:
+                # The job was obsoleted (or closed) while this waiter was live;
+                # its future will never settle, and any later take_* must fail
+                # closed on a missing job rather than hang the caller.
+                return
             await asyncio.sleep(0.001)
             self._observe_terminal()
         await asyncio.shield(job.future)
